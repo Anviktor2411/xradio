@@ -1,0 +1,7 @@
+build/
+lib/
+SDK/
+__pycache__/
+*.pyc
+*.xpl
+*.o

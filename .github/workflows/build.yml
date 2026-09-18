@@ -1,0 +1,55 @@
+name: build
+
+# Builds the plugin for all three platforms and uploads a ready-to-install
+# XRadio folder as a build artifact.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux
+            platdir: lin_x64
+          - os: windows-latest
+            name: windows
+            platdir: win_x64
+          - os: macos-latest
+            name: macos
+            platdir: mac_x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch XPMP2
+        shell: bash
+        run: |
+          git clone --depth 1 --branch v3.6.1 \
+            https://github.com/TwinFan/XPMP2.git lib/XPMP2
+
+      - name: Configure
+        shell: bash
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        shell: bash
+        run: cmake --build build --config Release -j 2
+
+      - name: Check the plugin was produced
+        shell: bash
+        run: ls -la build/XRadio/${{ matrix.platdir }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XRadio-${{ matrix.name }}
+          path: build/XRadio
+          if-no-files-found: error

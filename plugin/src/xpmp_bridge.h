@@ -1,0 +1,57 @@
+// Thin wrapper around XPMP2 so main.cpp does not have to know the library.
+//
+// When XRADIO_USE_XPMP2 is off (no lib/XPMP2 checked out yet) every function
+// here compiles to a no-op, so the plugin still builds and shows the text
+// traffic list.
+#pragma once
+
+#include <cstdint>
+#include <string>
+
+namespace xr {
+
+struct RemoteState {
+    uint32_t    sid      = 0;
+    std::string callsign;
+    std::string acIcao;
+    double      lat      = 0.0;
+    double      lon      = 0.0;
+    float       altFt    = 0.f;
+    float       heading  = 0.f;   // degrees true
+    float       pitch    = 0.f;
+    float       roll     = 0.f;
+    float       gsKt     = 0.f;
+    float       gear     = 0.f;   // 0..1
+    float       flap     = 0.f;   // 0..1
+    uint8_t     lights   = 0;     // xr::LT_* bits
+    bool        onGround = false;
+    bool        txActive = false;
+};
+
+namespace csl {
+
+// Returns true if XPMP2 was compiled in AND initialised successfully.
+bool available();
+
+// Called once from XPluginStart. `pluginRoot` is the folder holding the
+// platform subdirectories, i.e. .../Resources/plugins/XRadio.
+// On failure the reason lands in `err` and the plugin keeps running without
+// 3D traffic.
+bool init(const std::string& pluginRoot, const std::string& defaultIcao, std::string* err);
+
+void enable();    // XPluginEnable: start drawing, take over AI planes
+void disable();   // XPluginDisable: remove all aircraft, release AI planes
+void shutdown();  // XPluginStop
+
+// Create-or-update the aircraft for this session id.
+void upsert(const RemoteState& s);
+
+// Remove one aircraft, or all of them.
+void remove(uint32_t sid);
+void removeAll();
+
+// How many CSL models were loaded, for the status window.
+int cslModelCount();
+
+}  // namespace csl
+}  // namespace xr

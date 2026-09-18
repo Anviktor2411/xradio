@@ -1,0 +1,69 @@
+"""XRadio wire protocol -- Python side.
+
+Mirrors plugin/src/protocol.h exactly. Little-endian, byte-packed ('<' prefix
+means no alignment padding, which matches #pragma pack(1) on the C++ side).
+"""
+
+import struct
+
+MAGIC = 0x31435258  # b"XRC1" little-endian
+PROTO_VERSION = 1
+
+# packet types
+PT_LOGIN = 1
+PT_LOGIN_ACK = 2
+PT_POSITION = 3
+PT_TRAFFIC = 4
+PT_TEXT = 5
+PT_VOICE = 6
+PT_PING = 7
+PT_PONG = 8
+PT_LOGOUT = 9
+
+TX_NONE, TX_COM1, TX_COM2 = 0, 1, 2
+RX_COM1, RX_COM2 = 1, 2
+
+MAX_PACKET = 1400
+
+HEADER = struct.Struct("<IBBHI")          # magic, type, version, payloadLen, sessionId
+LOGIN = struct.Struct("<16s8sHH")         # callsign, acIcao, protoVer, reserved
+LOGIN_ACK = struct.Struct("<II")          # sessionId, serverTimeMs
+POSITION = struct.Struct("<2d7f2I4B")     # see PositionPayload
+TRAFFIC_HDR = struct.Struct("<HH")        # count, reserved
+TRAFFIC_ENTRY = struct.Struct("<I16s8s2d7f4B")
+TEXT_HDR = struct.Struct("<II16sH")       # freqKhz, fromSession, from, textLen
+VOICE_HDR = struct.Struct("<IIHH")        # freqKhz, fromSession, seq, opusLen
+
+# Sanity: these sizes are asserted against the C++ structs in tools/check_sizes.py
+assert HEADER.size == 12
+assert LOGIN.size == 28
+assert POSITION.size == 56
+assert TRAFFIC_ENTRY.size == 76
+
+
+def pack(ptype: int, session_id: int, payload: bytes = b"") -> bytes:
+    """Wrap a payload in a protocol header."""
+    return HEADER.pack(MAGIC, ptype, PROTO_VERSION, len(payload), session_id) + payload
+
+
+def unpack_header(data: bytes):
+    """Return (type, version, payload_len, session_id, payload) or None if invalid."""
+    if len(data) < HEADER.size:
+        return None
+    magic, ptype, version, plen, sid = HEADER.unpack_from(data, 0)
+    if magic != MAGIC:
+        return None
+    payload = data[HEADER.size:HEADER.size + plen]
+    if len(payload) != plen:
+        return None
+    return ptype, version, plen, sid, payload
+
+
+def cstr(raw: bytes) -> str:
+    """Decode a null-padded fixed-width C string."""
+    return raw.split(b"\x00", 1)[0].decode("utf-8", "replace")
+
+
+def pad(s: str, size: int) -> bytes:
+    """Encode to a null-padded fixed-width C string."""
+    return s.encode("utf-8")[:size - 1].ljust(size, b"\x00")
