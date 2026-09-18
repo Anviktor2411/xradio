@@ -11,6 +11,60 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Protocol and routing tests. Fast, so they run alongside the builds.
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Server protocol and routing tests
+        run: python3 tools/test_server.py
+
+      - name: C++ and Python wire structs agree
+        run: |
+          g++ -std=c++17 -Iplugin/src tools/check_sizes.cpp -o /tmp/check_sizes
+          /tmp/check_sizes > /tmp/cpp_sizes.txt
+          python3 - <<'PY' > /tmp/py_sizes.txt
+          import sys; sys.path.insert(0, 'server')
+          import protocol as P
+          for n in ("HEADER", "LOGIN", "LOGIN_ACK", "POSITION",
+                    "TRAFFIC_HDR", "TRAFFIC_ENTRY", "TEXT_HDR", "VOICE_HDR"):
+              print(n, getattr(P, n).size)
+          PY
+          diff /tmp/cpp_sizes.txt /tmp/py_sizes.txt
+          echo "struct layouts match"
+
+      # Build the real plugin against a stub X-Plane and run it, so the client
+      # half of the protocol is covered too -- not just server-to-server.
+      # AddressSanitizer is on, because the parser eats untrusted UDP.
+      - name: Build the plugin harness
+        run: |
+          g++ -std=c++17 -g -O1 -fsanitize=address,undefined \
+            -DXPLM200=1 -DXPLM210=1 -DXPLM300=1 -DXPLM301=1 -DXPLM303=1 \
+            -DXPLM400=1 -DLIN=1 \
+            -Iplugin/src -Itools/fake_sdk/XPLM -Itools/harness \
+            plugin/src/main.cpp plugin/src/net.cpp plugin/src/xpmp_bridge.cpp \
+            tools/harness/xplm_stub.cpp tools/harness/main.cpp \
+            -o /tmp/plugin_harness
+
+      - name: Plugin talks to a real server
+        run: |
+          python3 server/server.py --port 49400 > /tmp/srv.log 2>&1 &
+          sleep 1
+          python3 tools/fake_client.py --port 49400 --callsign PEER01 \
+            --lat 57.86 --lon 27.03 --talk > /tmp/peer.log 2>&1 &
+          sleep 1
+          ASAN_OPTIONS=detect_leaks=0 /tmp/plugin_harness 127.0.0.1 49400 CIRUN
+          kill %1 %2 2>/dev/null || true
+
+      - name: Plugin survives a hostile server
+        run: |
+          python3 tools/harness/fuzz_server.py --port 49401 > /tmp/fuzz.log 2>&1 &
+          sleep 1
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
+            /tmp/plugin_harness 127.0.0.1 49401 FUZZCL
+          kill %1 2>/dev/null || true
+
   build:
     strategy:
       fail-fast: false
@@ -117,7 +171,7 @@ jobs:
         shell: bash
         run: |
           find dist -maxdepth 3 | sort
-          for f in win_x64/win.xpl mac_x64/mac.xpl lin_x64/lin.xpl; do
+          for f in win_x64/XRadio.xpl mac_x64/XRadio.xpl lin_x64/XRadio.xpl; do
             test -f "dist/XRadio/$f" || { echo "MISSING: $f"; exit 1; }
           done
           echo "All three platforms packaged."
