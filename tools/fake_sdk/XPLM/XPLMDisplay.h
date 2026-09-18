@@ -33,4 +33,7 @@ void XPLMSetWindowResizingLimits(XPLMWindowID, int, int, int, int);
 void XPLMSetWindowIsVisible(XPLMWindowID, int);
 int  XPLMGetWindowIsVisible(XPLMWindowID);
 void XPLMGetScreenBoundsGlobal(int*, int*, int*, int*);
+void XPLMBringWindowToFront(XPLMWindowID);
+void XPLMTakeKeyboardFocus(XPLMWindowID);
+int  XPLMHasKeyboardFocus(XPLMWindowID);
 typedef int (*XPLMCommandCallback_f)(XPLMCommandRef, XPLMCommandPhase, void*);

@@ -13,6 +13,14 @@ typedef void* XPLMDataRef;
 typedef void* XPLMCommandRef;
 typedef void* XPLMFlightLoopID;
 typedef int  XPLMKeyFlags;
+enum { xplm_ShiftFlag = 1, xplm_OptionAltFlag = 2, xplm_ControlFlag = 4,
+       xplm_DownFlag = 8, xplm_UpFlag = 16 };
+
+#define XPLM_VK_BACK    0x08
+#define XPLM_VK_TAB     0x09
+#define XPLM_VK_RETURN  0x0D
+#define XPLM_VK_ESCAPE  0x1B
+#define XPLM_VK_ENTER   0x6C
 typedef int  XPLMFontID;
 
 enum { xplmFont_Basic = 0, xplmFont_Proportional = 18 };

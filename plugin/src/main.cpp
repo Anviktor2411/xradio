@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
+#include <cctype>
 #include <cstring>
 #include <map>
 #include <string>
@@ -83,9 +84,13 @@ void resolveConfigPath() {
     g_cfgPath = std::string(prefs) + XPLMGetDirectorySeparator() + "xradio.cfg";
 }
 
-void writeDefaultConfig() {
+// Writes g_cfg to disk. Used for the first-run defaults and by Settings.
+bool saveConfig() {
     FILE* f = fopen(g_cfgPath.c_str(), "w");
-    if (!f) return;
+    if (!f) {
+        logMsg("cannot write %s", g_cfgPath.c_str());
+        return false;
+    }
     fprintf(f,
             "# XRadio configuration\n"
             "host = %s\n"
@@ -94,13 +99,14 @@ void writeDefaultConfig() {
             "actype = %s\n",
             g_cfg.host.c_str(), g_cfg.port, g_cfg.callsign.c_str(), g_cfg.acIcao.c_str());
     fclose(f);
-    logMsg("wrote default config to %s", g_cfgPath.c_str());
+    logMsg("saved config to %s", g_cfgPath.c_str());
+    return true;
 }
 
 void loadConfig() {
     resolveConfigPath();
     FILE* f = fopen(g_cfgPath.c_str(), "r");
-    if (!f) { writeDefaultConfig(); return; }
+    if (!f) { saveConfig(); return; }
 
     char line[512];
     while (fgets(line, sizeof(line), f)) {
@@ -531,6 +537,12 @@ void drawWindow(XPLMWindowID win, void*) {
 
     XPLMDrawString(g_connected ? green : amber, x, y, (char*)g_status.c_str(),
                    nullptr, xplmFont_Proportional);
+    y -= 16;
+    char who[160];
+    snprintf(who, sizeof(who), "%s as %s (%s)   Plugins > XRadio > Settings to change",
+             g_sock.endpoint().empty() ? "no server" : g_sock.endpoint().c_str(),
+             g_cfg.callsign.c_str(), g_cfg.acIcao.c_str());
+    XPLMDrawString(white, x, y, who, nullptr, xplmFont_Basic);
     y -= 18;
 
     char hdr[128];
@@ -602,24 +614,213 @@ void createWindow() {
     XPLMSetWindowResizingLimits(g_window, 320, 200, 900, 900);
 }
 
+// Drop the current session and log in again with whatever g_cfg says now.
+void reconnect() {
+    g_connected = false;
+    g_sessionId = 0;
+    g_remote.clear();
+    xr::csl::removeAll();
+    std::string err;
+    g_sock.close();
+    if (!g_sock.open(g_cfg.host, (uint16_t)g_cfg.port, &err)) {
+        g_status = "socket error: " + err;
+        logMsg("%s", g_status.c_str());
+    } else {
+        sendLogin();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// settings window -- edit host / port / callsign / type inside the sim
+// ---------------------------------------------------------------------------
+XPLMWindowID g_settingsWin = nullptr;
+Config       g_edit;               // working copy while the window is open
+int          g_focusField = -1;    // which field has keyboard focus, -1 none
+std::string  g_settingsNote;       // one-line feedback under the buttons
+
+struct Field {
+    const char*  label;
+    std::string* value;
+    size_t       maxLen;
+    bool         digitsOnly;
+};
+
+// The port field is stored as text while editing so the user can clear it.
+std::string g_editPort;
+
+Field fields[] = {
+    {"Server host",   &g_edit.host,     63, false},
+    {"Port",          &g_editPort,       5, true },
+    {"Callsign",      &g_edit.callsign, 15, false},
+    {"Aircraft type", &g_edit.acIcao,    7, false},
+};
+const int kNumFields = (int)(sizeof(fields) / sizeof(fields[0]));
+
+// Geometry shared by draw and click handling.
+const int kRowH      = 26;
+const int kFirstRowY = 52;    // below the window top
+const int kValueX    = 130;   // where the editable text starts
+
+int rowY(int top, int i) { return top - kFirstRowY - i * kRowH; }
+int buttonRowY(int top)  { return rowY(top, kNumFields) - 8; }
+
+std::string upper(std::string s) {
+    for (auto& c : s) c = (char)toupper((unsigned char)c);
+    return s;
+}
+
+void openSettings() {
+    g_edit     = g_cfg;
+    g_editPort = std::to_string(g_cfg.port);
+    g_focusField = 0;
+    g_settingsNote.clear();
+    XPLMSetWindowIsVisible(g_settingsWin, 1);
+    XPLMBringWindowToFront(g_settingsWin);
+    XPLMTakeKeyboardFocus(g_settingsWin);
+}
+
+void closeSettings() {
+    g_focusField = -1;
+    if (XPLMHasKeyboardFocus(g_settingsWin)) XPLMTakeKeyboardFocus(nullptr);
+    XPLMSetWindowIsVisible(g_settingsWin, 0);
+}
+
+void applySettings() {
+    const std::string host = trim(g_edit.host);
+    const int port = atoi(g_editPort.c_str());
+    if (host.empty())               { g_settingsNote = "Host cannot be empty";   return; }
+    if (port < 1 || port > 65535)   { g_settingsNote = "Port must be 1-65535";  return; }
+    if (trim(g_edit.callsign).empty()) { g_settingsNote = "Callsign cannot be empty"; return; }
+
+    g_cfg.host     = host;
+    g_cfg.port     = port;
+    g_cfg.callsign = upper(trim(g_edit.callsign));
+    g_cfg.acIcao   = upper(trim(g_edit.acIcao));
+    if (g_cfg.acIcao.empty()) g_cfg.acIcao = "C172";
+
+    saveConfig();
+    closeSettings();
+    reconnect();
+}
+
+void drawSettings(XPLMWindowID win, void*) {
+    int l, t, r, b;
+    XPLMGetWindowGeometry(win, &l, &t, &r, &b);
+    float white[] = {1.f, 1.f, 1.f};
+    float grey[]  = {0.7f, 0.7f, 0.7f};
+    float green[] = {0.4f, 1.f, 0.4f};
+    float amber[] = {1.f, 0.8f, 0.3f};
+
+    XPLMDrawString(white, l + 10, t - 24, (char*)"Click a field, type, Enter to save. Tab moves on.",
+                   nullptr, xplmFont_Proportional);
+
+    for (int i = 0; i < kNumFields; ++i) {
+        const int y = rowY(t, i);
+        const bool focused = (i == g_focusField);
+        XPLMDrawString(focused ? white : grey, l + 10, y, (char*)fields[i].label,
+                       nullptr, xplmFont_Proportional);
+        std::string v = *fields[i].value;
+        // a blinking cursor on the field being edited
+        if (focused && ((int)(g_elapsed * 2.f) % 2 == 0)) v += "_";
+        char line[96];
+        snprintf(line, sizeof(line), "%s%s", focused ? "> " : "  ", v.c_str());
+        XPLMDrawString(focused ? green : white, l + kValueX, y, line,
+                       nullptr, xplmFont_Proportional);
+    }
+
+    const int by = buttonRowY(t);
+    XPLMDrawString(green, l + 10,  by, (char*)"[ Save & reconnect ]", nullptr, xplmFont_Proportional);
+    XPLMDrawString(grey,  l + 200, by, (char*)"[ Cancel ]",           nullptr, xplmFont_Proportional);
+
+    if (!g_settingsNote.empty()) {
+        XPLMDrawString(amber, l + 10, by - 22, (char*)g_settingsNote.c_str(),
+                       nullptr, xplmFont_Proportional);
+    }
+}
+
+int settingsClick(XPLMWindowID win, int x, int y, XPLMMouseStatus status, void*) {
+    if (status != xplm_MouseDown) return 1;
+    int l, t, r, b;
+    XPLMGetWindowGeometry(win, &l, &t, &r, &b);
+
+    for (int i = 0; i < kNumFields; ++i) {
+        const int ry = rowY(t, i);
+        if (y >= ry - 6 && y <= ry + 16) {
+            g_focusField = i;
+            XPLMTakeKeyboardFocus(win);
+            return 1;
+        }
+    }
+    const int by = buttonRowY(t);
+    if (y >= by - 6 && y <= by + 16) {
+        if (x >= l + 10 && x < l + 190)       applySettings();
+        else if (x >= l + 200 && x < l + 290) closeSettings();
+    }
+    return 1;
+}
+
+void settingsKey(XPLMWindowID, char key, XPLMKeyFlags flags, char vk, void*, int losingFocus) {
+    if (losingFocus) { g_focusField = -1; return; }
+    if (!(flags & xplm_DownFlag)) return;
+    if (g_focusField < 0 || g_focusField >= kNumFields) return;
+
+    Field& f = fields[g_focusField];
+    std::string& v = *f.value;
+    const unsigned char uvk = (unsigned char)vk;
+    const unsigned char c   = (unsigned char)key;
+
+    if (uvk == XPLM_VK_BACK || c == 8) {
+        if (!v.empty()) v.pop_back();
+    } else if (uvk == XPLM_VK_RETURN || uvk == XPLM_VK_ENTER || c == '\r' || c == '\n') {
+        applySettings();
+    } else if (uvk == XPLM_VK_ESCAPE || c == 27) {
+        closeSettings();
+    } else if (uvk == XPLM_VK_TAB || c == '\t') {
+        g_focusField = (g_focusField + 1) % kNumFields;
+    } else if (c >= 32 && c < 127 && v.size() < f.maxLen) {
+        if (f.digitsOnly && !isdigit(c)) return;
+        if (c == ' ' && g_focusField != 0) return;   // no spaces in callsign / type
+        v += (char)c;
+    }
+}
+
+void createSettingsWindow() {
+    int sl, st, sr, sb;
+    XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);
+
+    XPLMCreateWindow_t p{};
+    p.structSize            = sizeof(p);
+    p.left                  = sl + 600;
+    p.top                   = st - 100;
+    p.right                 = sl + 960;
+    p.bottom                = st - 320;
+    p.visible               = 0;
+    p.drawWindowFunc        = drawSettings;
+    p.handleMouseClickFunc  = settingsClick;
+    p.handleRightClickFunc  = [](XPLMWindowID, int, int, XPLMMouseStatus, void*) { return 1; };
+    p.handleMouseWheelFunc  = [](XPLMWindowID, int, int, int, int, void*) { return 1; };
+    p.handleKeyFunc         = settingsKey;
+    p.handleCursorFunc      = [](XPLMWindowID, int, int, void*) -> XPLMCursorStatus {
+        return xplm_CursorDefault;
+    };
+    p.layer                 = xplm_WindowLayerFloatingWindows;
+    p.decorateAsFloatingWindow = xplm_WindowDecorationRoundRectangle;
+
+    g_settingsWin = XPLMCreateWindowEx(&p);
+    XPLMSetWindowTitle(g_settingsWin, "XRadio Settings");
+    XPLMSetWindowResizingLimits(g_settingsWin, 360, 220, 600, 400);
+}
+
 void menuHandler(void*, void* item) {
     intptr_t which = (intptr_t)item;
     if (which == 0 && g_window) {
         XPLMSetWindowIsVisible(g_window, !XPLMGetWindowIsVisible(g_window));
     } else if (which == 1) {
-        loadConfig();
-        g_connected = false;
-        g_sessionId = 0;
-        g_remote.clear();
-        std::string err;
-        g_sock.close();
-        if (!g_sock.open(g_cfg.host, (uint16_t)g_cfg.port, &err)) {
-            g_status = "socket error: " + err;
-            logMsg("%s", g_status.c_str());
-        } else {
-            sendLogin();
-        }
+        openSettings();
     } else if (which == 2) {
+        loadConfig();
+        reconnect();
+    } else if (which == 3) {
         sendText("Hello from " + g_cfg.callsign);
     }
 }
@@ -640,6 +841,7 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     loadConfig();
     findRefs();
     createWindow();
+    createSettingsWindow();
 
     std::string cslErr;
     if (!xr::csl::init(pluginRootDir(), g_cfg.acIcao, &cslErr)) {
@@ -651,9 +853,10 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
 
     int idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "XRadio", nullptr, 0);
     g_menu = XPLMCreateMenu("XRadio", XPLMFindPluginsMenu(), idx, menuHandler, nullptr);
-    XPLMAppendMenuItem(g_menu, "Show / hide window", (void*)0, 0);
-    XPLMAppendMenuItem(g_menu, "Reload config & reconnect", (void*)1, 0);
-    XPLMAppendMenuItem(g_menu, "Send test message", (void*)2, 0);
+    XPLMAppendMenuItem(g_menu, "Show / hide window",   (void*)0, 0);
+    XPLMAppendMenuItem(g_menu, "Settings...",          (void*)1, 0);
+    XPLMAppendMenuItem(g_menu, "Reconnect",            (void*)2, 0);
+    XPLMAppendMenuItem(g_menu, "Send test message",    (void*)3, 0);
 
     XPLMCreateFlightLoop_t fl{};
     fl.structSize   = sizeof(fl);
@@ -696,7 +899,8 @@ PLUGIN_API void XPluginDisable(void) {
 PLUGIN_API void XPluginStop(void) {
     xr::csl::shutdown();
     if (g_loop)   { XPLMDestroyFlightLoop(g_loop); g_loop = nullptr; }
-    if (g_window) { XPLMDestroyWindow(g_window);   g_window = nullptr; }
+    if (g_window)      { XPLMDestroyWindow(g_window);      g_window = nullptr; }
+    if (g_settingsWin) { XPLMDestroyWindow(g_settingsWin); g_settingsWin = nullptr; }
     if (g_cmdPtt) { XPLMUnregisterCommandHandler(g_cmdPtt, pttHandler, 1, nullptr); }
     if (g_menu)   { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
 }

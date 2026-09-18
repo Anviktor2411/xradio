@@ -165,8 +165,13 @@ common types. When no model matches, XPMP2 falls back to the `actype` from
 
 ## Configuration
 
-On first run the plugin writes
-`X-Plane 12/Output/preferences/xradio.cfg`:
+Easiest way: **Plugins → XRadio → Settings...** in the sim. Click a field,
+type, Tab to move on, Enter to save. Saving writes the config file and
+reconnects immediately — no restart, no text editor. Escape or Cancel backs
+out without changing anything.
+
+The same values live in `X-Plane 12/Output/preferences/xradio.cfg`, written on
+first run:
 
 ```ini
 host = your.server.address
@@ -176,8 +181,8 @@ actype = C172
 ```
 
 `actype` is the ICAO type code that decides which CSL model other pilots see
-you as. After editing, choose
-*Plugins → XRadio → Reload config & reconnect* in X-Plane.
+you as. If you edit the file by hand while X-Plane is running, pick up the
+changes with *Plugins → XRadio → Reconnect*.
 
 **PTT key:** in X-Plane's *Keyboard* or *Joystick* settings, search for the
 command `xradio/ptt` and bind it to a key or joystick button.
@@ -196,6 +201,8 @@ command `xradio/ptt` and bind it to a key or joystick button.
 - Dead reckoning between the 5 Hz position updates, so other aircraft move
   smoothly instead of stepping forward five times a second
 - PTT command (currently only flags the TX state)
+- In-sim settings window for server, port, callsign and aircraft type, with
+  validation and immediate reconnect
 - Builds on Windows, macOS and Linux; CI checks all three
 
 ### Two ranges, on purpose

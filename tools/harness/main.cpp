@@ -36,9 +36,13 @@ int main(int argc, char** argv) {
     harness::g_verbose = (getenv("XR_VERBOSE") != nullptr);
 
     // The plugin writes its config next to the prefs path the stub reports.
-    system("mkdir -p /tmp/xradio-harness");
+    // Start it pointed at the WRONG port on purpose: the settings window is
+    // then the only thing that can make the connection succeed, so the
+    // connect check below also proves the settings path works end to end.
+    if (system("mkdir -p /tmp/xradio-harness") != 0) return 1;
+    const int wrongPort = atoi(port) + 1;
     FILE* f = fopen("/tmp/xradio-harness/xradio.cfg", "w");
-    fprintf(f, "host = %s\nport = %s\ncallsign = %s\nactype = C172\n", host, port, cs);
+    fprintf(f, "host = %s\nport = %d\ncallsign = WRONG1\nactype = C172\n", host, wrongPort);
     fclose(f);
 
     double lat = 57.85, lon = 27.02;
@@ -61,6 +65,84 @@ int main(int argc, char** argv) {
         fprintf(stderr, "XPluginEnable failed\n");
         return 1;
     }
+
+    // ---- settings window: fix the port and callsign through the UI ----
+    harness::tick(0.2f);
+    auto before = harness::draw();
+    if (!harness::drawnContains(before, "logging in")) {
+        fprintf(stderr, "FAIL: expected to be logging in (to the wrong port) at start\n");
+        return 1;
+    }
+
+    harness::menu(1);                                   // Plugins > XRadio > Settings...
+    if (!harness::windowVisible(2)) {
+        fprintf(stderr, "FAIL: settings window did not open\n");
+        return 1;
+    }
+    auto sw = harness::drawWindow(2);
+    if (!harness::drawnContains(sw, "Server host") || !harness::drawnContains(sw, "Port")) {
+        fprintf(stderr, "FAIL: settings window is missing its fields\n");
+        return 1;
+    }
+
+    int top = 0, left = 0;
+    harness::windowTop(2, &top, &left);
+    auto rowY = [&](int i) { return top - 52 - i * 26; };
+
+    // Port field: click it, wipe it, type the right one.
+    harness::click(2, left + 60, rowY(1));
+    for (int i = 0; i < 8; ++i) harness::pressVk(2, 0x08);   // XPLM_VK_BACK
+    harness::typeText(2, port);
+    sw = harness::drawWindow(2);
+    if (!harness::drawnContains(sw, std::string("> ") + port)) {
+        fprintf(stderr, "FAIL: typed port not shown in the field\n");
+        for (auto& l : sw) fprintf(stderr, "   %s\n", l.c_str());
+        return 1;
+    }
+
+    // Callsign: Tab to it (from port), wipe, type ours in lower case --
+    // the plugin should upper-case it on save.
+    harness::pressVk(2, 0x09);                                // XPLM_VK_TAB
+    for (int i = 0; i < 20; ++i) harness::pressVk(2, 0x08);
+    std::string lower = cs;
+    for (auto& ch : lower) ch = (char)tolower((unsigned char)ch);
+    harness::typeText(2, lower);
+
+    // Validation: an empty host must be refused, not saved.
+    harness::click(2, left + 60, rowY(0));
+    for (int i = 0; i < 70; ++i) harness::pressVk(2, 0x08);
+    harness::pressVk(2, 0x0D);                                // XPLM_VK_RETURN
+    if (!harness::windowVisible(2)) {
+        fprintf(stderr, "FAIL: settings accepted an empty host\n");
+        return 1;
+    }
+    sw = harness::drawWindow(2);
+    if (!harness::drawnContains(sw, "Host cannot be empty")) {
+        fprintf(stderr, "FAIL: no validation message for empty host\n");
+        return 1;
+    }
+    harness::typeText(2, host);
+    harness::pressVk(2, 0x0D);                                // save & reconnect
+
+    if (harness::windowVisible(2)) {
+        fprintf(stderr, "FAIL: settings window stayed open after save\n");
+        return 1;
+    }
+    // The saved file must carry the corrected values, callsign upper-cased.
+    {
+        FILE* cf = fopen("/tmp/xradio-harness/xradio.cfg", "r");
+        std::string all;
+        char buf[256];
+        while (cf && fgets(buf, sizeof(buf), cf)) all += buf;
+        if (cf) fclose(cf);
+        const std::string wantPort = std::string("port = ") + port;
+        const std::string wantCs   = std::string("callsign = ") + cs;
+        if (all.find(wantPort) == std::string::npos || all.find(wantCs) == std::string::npos) {
+            fprintf(stderr, "FAIL: config on disk not updated:\n%s", all.c_str());
+            return 1;
+        }
+    }
+    printf("settings: port fixed through the UI, callsign upper-cased, empty host refused\n");
 
     bool connected = false;
     bool sawTraffic = false;

@@ -28,7 +28,17 @@ std::map<std::string, double> g_values;
 std::vector<std::string>      g_drawn;
 std::vector<std::string>      g_log;
 XPLMFlightLoop_f              g_loopFunc   = nullptr;
-XPLMDrawWindow_f              g_drawFunc   = nullptr;
+XPLMDrawWindow_f              g_drawFunc   = nullptr;   // first window (main)
+
+struct Win {
+    XPLMDrawWindow_f       draw  = nullptr;
+    XPLMHandleMouseClick_f click = nullptr;
+    XPLMHandleKey_f        key   = nullptr;
+    int  l = 0, t = 800, r = 500, b = 0;
+    bool visible = true;
+};
+std::vector<Win> g_wins;                  // index+1 is the XPLMWindowID
+XPLMWindowID     g_focus = nullptr;
 XPLMCommandCallback_f         g_pttHandler = nullptr;
 XPLMMenuHandler_f             g_menuFunc   = nullptr;
 bool                          g_verbose    = false;
@@ -46,6 +56,48 @@ std::vector<std::string> draw() {
     g_drawn.clear();
     if (g_drawFunc) g_drawFunc((XPLMWindowID)1, nullptr);
     return g_drawn;
+}
+
+// --- second window (settings) helpers ------------------------------------
+static Win* win(int id) {
+    return (id >= 1 && id <= (int)g_wins.size()) ? &g_wins[id - 1] : nullptr;
+}
+
+std::vector<std::string> drawWindow(int id) {
+    g_drawn.clear();
+    if (Win* w = win(id); w && w->draw) w->draw((XPLMWindowID)(intptr_t)id, nullptr);
+    return g_drawn;
+}
+
+bool windowVisible(int id) { Win* w = win(id); return w && w->visible; }
+
+void click(int id, int x, int y) {
+    Win* w = win(id);
+    if (!w || !w->click) return;
+    w->click((XPLMWindowID)(intptr_t)id, x, y, xplm_MouseDown, nullptr);
+    w->click((XPLMWindowID)(intptr_t)id, x, y, xplm_MouseUp, nullptr);
+}
+
+void typeText(int id, const std::string& text) {
+    Win* w = win(id);
+    if (!w || !w->key) return;
+    for (char c : text) {
+        w->key((XPLMWindowID)(intptr_t)id, c, xplm_DownFlag, 0, nullptr, 0);
+        w->key((XPLMWindowID)(intptr_t)id, c, xplm_UpFlag,   0, nullptr, 0);
+    }
+}
+
+void pressVk(int id, int vk) {
+    Win* w = win(id);
+    if (!w || !w->key) return;
+    w->key((XPLMWindowID)(intptr_t)id, 0, xplm_DownFlag, (char)vk, nullptr, 0);
+    w->key((XPLMWindowID)(intptr_t)id, 0, xplm_UpFlag,   (char)vk, nullptr, 0);
+}
+
+void windowTop(int id, int* t, int* l) {
+    Win* w = win(id);
+    if (t) *t = w ? w->t : 0;
+    if (l) *l = w ? w->l : 0;
 }
 
 void ptt(bool down) {
@@ -109,17 +161,38 @@ void XPLMDestroyFlightLoop(XPLMFlightLoopID) { harness::g_loopFunc = nullptr; }
 void XPLMScheduleFlightLoop(XPLMFlightLoopID, float, int) {}
 
 XPLMWindowID XPLMCreateWindowEx(XPLMCreateWindow_t* p) {
-    harness::g_drawFunc = p->drawWindowFunc;
-    return (XPLMWindowID)1;
+    harness::Win w;
+    w.draw = p->drawWindowFunc;
+    w.click = p->handleMouseClickFunc;
+    w.key = p->handleKeyFunc;
+    w.l = p->left; w.t = p->top; w.r = p->right; w.b = p->bottom;
+    w.visible = p->visible != 0;
+    harness::g_wins.push_back(w);
+    if (harness::g_wins.size() == 1) harness::g_drawFunc = p->drawWindowFunc;
+    return (XPLMWindowID)(intptr_t)harness::g_wins.size();
 }
-void XPLMDestroyWindow(XPLMWindowID) { harness::g_drawFunc = nullptr; }
-void XPLMGetWindowGeometry(XPLMWindowID, int* l, int* t, int* r, int* b) {
-    *l = 0; *t = 800; *r = 500; *b = 0;
+void XPLMDestroyWindow(XPLMWindowID id) {
+    if ((intptr_t)id == 1) harness::g_drawFunc = nullptr;
+}
+void XPLMGetWindowGeometry(XPLMWindowID id, int* l, int* t, int* r, int* b) {
+    auto* w = ((intptr_t)id >= 1 && (intptr_t)id <= (intptr_t)harness::g_wins.size())
+              ? &harness::g_wins[(intptr_t)id - 1] : nullptr;
+    *l = w ? w->l : 0; *t = w ? w->t : 800; *r = w ? w->r : 500; *b = w ? w->b : 0;
 }
 void XPLMSetWindowTitle(XPLMWindowID, const char*) {}
 void XPLMSetWindowResizingLimits(XPLMWindowID, int, int, int, int) {}
-void XPLMSetWindowIsVisible(XPLMWindowID, int) {}
-int  XPLMGetWindowIsVisible(XPLMWindowID) { return 1; }
+void XPLMSetWindowIsVisible(XPLMWindowID id, int v) {
+    if ((intptr_t)id >= 1 && (intptr_t)id <= (intptr_t)harness::g_wins.size())
+        harness::g_wins[(intptr_t)id - 1].visible = v != 0;
+}
+int  XPLMGetWindowIsVisible(XPLMWindowID id) {
+    if ((intptr_t)id >= 1 && (intptr_t)id <= (intptr_t)harness::g_wins.size())
+        return harness::g_wins[(intptr_t)id - 1].visible ? 1 : 0;
+    return 0;
+}
+void XPLMBringWindowToFront(XPLMWindowID) {}
+void XPLMTakeKeyboardFocus(XPLMWindowID id) { harness::g_focus = id; }
+int  XPLMHasKeyboardFocus(XPLMWindowID id) { return harness::g_focus == id ? 1 : 0; }
 void XPLMGetScreenBoundsGlobal(int* l, int* t, int* r, int* b) {
     *l = 0; *t = 1080; *r = 1920; *b = 0;
 }
