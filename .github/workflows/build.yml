@@ -1,8 +1,8 @@
 name: build
 
-# Builds the plugin for all three platforms, then merges them into a single
-# cross-platform XRadio folder that can be dropped straight into
-# X-Plane 12/Resources/plugins/.
+# Tests the plugin without X-Plane, builds it for all three platforms, then
+# merges them into a single cross-platform XRadio folder that can be dropped
+# straight into X-Plane 12/Resources/plugins/.
 
 on:
   push:
@@ -10,12 +10,24 @@ on:
   pull_request:
   workflow_dispatch:
 
+env:
+  XPMP2_TAG: v3.6.1
+  OPUS_TAG: v1.5.2
+  MINIAUDIO_TAG: "0.11.25"
+
 jobs:
-  # Protocol and routing tests. Fast, so they run alongside the builds.
+  # ---------------------------------------------------------------------------
+  # The real plugin code linked against a stub X-Plane, run as ordinary
+  # executables under AddressSanitizer: against a real server, against a
+  # hostile one, through the voice codec, and under odd monitor layouts.
+  # ---------------------------------------------------------------------------
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      - name: Fetch dependencies
+        run: ./tools/fetch_deps.sh
 
       - name: Server protocol and routing tests
         run: python3 tools/test_server.py
@@ -34,27 +46,32 @@ jobs:
           diff /tmp/cpp_sizes.txt /tmp/py_sizes.txt
           echo "struct layouts match"
 
-      # Build the real plugin against a stub X-Plane and run it, so the client
-      # half of the protocol is covered too -- not just server-to-server.
-      # AddressSanitizer is on, because the parser eats untrusted UDP.
-      - name: Build the plugin harness
+      - name: Build the test executables
         run: |
-          g++ -std=c++17 -g -O1 -fsanitize=address,undefined \
-            -DXPLM200=1 -DXPLM210=1 -DXPLM300=1 -DXPLM301=1 -DXPLM303=1 \
-            -DXPLM400=1 -DLIN=1 \
-            -Iplugin/src -Itools/fake_sdk/XPLM -Itools/harness \
-            plugin/src/main.cpp plugin/src/net.cpp plugin/src/xpmp_bridge.cpp \
-            tools/harness/xplm_stub.cpp tools/harness/main.cpp \
-            -o /tmp/plugin_harness
+          cmake -B build-tests -DCMAKE_BUILD_TYPE=Debug \
+            -DXRADIO_BUILD_TESTS=ON -DXRADIO_USE_XPMP2=OFF \
+            -DXPLANE_SDK="$PWD/tools/fake_sdk"
+          cmake --build build-tests -j 2
 
-      - name: Plugin talks to a real server
+      - name: Position smoothing (reproduces the stutter, proves the fix)
+        run: ASAN_OPTIONS=detect_leaks=0 ./build-tests/smoothing_test
+
+      - name: Voice pipeline (Opus, jitter buffer, mixer)
+        run: ASAN_OPTIONS=detect_leaks=0 ./build-tests/voice_test
+
+      - name: Window placement across monitor layouts
+        run: ASAN_OPTIONS=detect_leaks=0 ./build-tests/placement_test
+
+      - name: Plugin talks to a real server, voice round trip via a peer
         run: |
           python3 server/server.py --port 49400 > /tmp/srv.log 2>&1 &
           sleep 1
           python3 tools/fake_client.py --port 49400 --callsign PEER01 \
-            --lat 57.86 --lon 27.03 --talk > /tmp/peer.log 2>&1 &
+            --lat 57.86 --lon 27.03 --talk --parrot > /tmp/peer.log 2>&1 &
           sleep 1
-          ASAN_OPTIONS=detect_leaks=0 /tmp/plugin_harness 127.0.0.1 49400 CIRUN
+          ASAN_OPTIONS=detect_leaks=0 ./build-tests/plugin_harness 127.0.0.1 49400 CIRUN
+          echo "--- server ---"; grep -E "login|voice|text" /tmp/srv.log || true
+          echo "--- peer ---";   grep -E "voice" /tmp/peer.log || true
           kill %1 %2 2>/dev/null || true
 
       - name: Plugin survives a hostile server
@@ -62,9 +79,11 @@ jobs:
           python3 tools/harness/fuzz_server.py --port 49401 > /tmp/fuzz.log 2>&1 &
           sleep 1
           ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
-            /tmp/plugin_harness 127.0.0.1 49401 FUZZCL
+            ./build-tests/plugin_harness 127.0.0.1 49401 FUZZCL
+          tail -1 /tmp/fuzz.log
           kill %1 2>/dev/null || true
 
+  # ---------------------------------------------------------------------------
   build:
     strategy:
       fail-fast: false
@@ -85,11 +104,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch XPMP2
+      - name: Fetch dependencies
         shell: bash
-        run: |
-          git clone --depth 1 --branch v3.6.1 \
-            https://github.com/TwinFan/XPMP2.git lib/XPMP2
+        run: ./tools/fetch_deps.sh
 
       - name: Configure
         shell: bash
@@ -155,7 +172,9 @@ jobs:
           path: dist
           if-no-files-found: error
 
+  # ---------------------------------------------------------------------------
   # Merge the three platform builds into one folder that works everywhere.
+  # ---------------------------------------------------------------------------
   package:
     needs: build
     runs-on: ubuntu-latest
