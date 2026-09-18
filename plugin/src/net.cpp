@@ -1,5 +1,6 @@
 #include "net.h"
 
+#include <cstdio>    // snprintf -- MSVC does not pull this in via <cstring>
 #include <cstring>
 
 #ifdef _WIN32
@@ -76,7 +77,7 @@ bool UdpSocket::open(const std::string& host, uint16_t port, std::string* err) {
     addrLen_ = (int)res->ai_addrlen;
     freeaddrinfo(res);
 
-    fd_ = f;
+    fd_ = (decltype(fd_))f;   // int on POSIX, long long on Windows
     endpoint_ = host + ":" + portStr;
     return true;
 }

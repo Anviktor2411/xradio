@@ -98,6 +98,7 @@ def run(args):
                 P.TX_COM1 if args.talk else P.TX_NONE,      # txRadio
                 P.RX_COM1)), dest)                          # rxMask
 
+            # Text names its own frequency and does not need the PTT held.
             if args.talk and time.time() >= next_text:
                 msg = f"{args.callsign} position report".encode()
                 sock.sendto(P.pack(P.PT_TEXT, sid, P.TEXT_HDR.pack(

@@ -28,6 +28,7 @@ TRAFFIC_RANGE_NM = 80.0     # how far away other aircraft are still sent
 SESSION_TIMEOUT_S = 15.0    # drop a client we have not heard from
 TX_HOLD_S = 0.4             # how long txActive stays set after the last voice frame
 MAX_ENTRIES_PER_PACKET = 16  # 16 * 76 + 16 < 1400 bytes
+MAX_TEXT_BYTES = 200        # cap relayed text so one client cannot spam huge frames
 
 
 @dataclass
@@ -78,6 +79,11 @@ class Session:
         return 0
 
 
+def _clean(s: str, maxlen: int) -> str:
+    """Keep printable ASCII only: these strings end up on other pilots' screens."""
+    return "".join(c for c in s if 32 <= ord(c) < 127)[:maxlen].strip()
+
+
 def distance_nm(a: Session, b: Session) -> float:
     """Great-circle distance in nautical miles (haversine)."""
     r_nm = 3440.065
@@ -119,11 +125,11 @@ class XRadioServer(asyncio.DatagramProtocol):
         parsed = P.unpack_header(data)
         if parsed is None:
             return                      # not ours, or truncated -- ignore silently
-        ptype, version, _plen, _sid, payload = parsed
+        ptype, version, _plen, sid, payload = parsed
         if version != P.PROTO_VERSION:
             return
         try:
-            self._dispatch(ptype, payload, addr)
+            self._dispatch(ptype, sid, payload, addr)
         except Exception:               # never let one bad packet kill the server
             LOG.exception("error handling packet type %s from %s", ptype, addr)
 
@@ -137,13 +143,18 @@ class XRadioServer(asyncio.DatagramProtocol):
         return int((time.monotonic() - self._t0) * 1000)
 
     # -- packet handlers ----------------------------------------------------
-    def _dispatch(self, ptype, payload, addr):
+    def _dispatch(self, ptype, sid, payload, addr):
         if ptype == P.PT_LOGIN:
             return self._on_login(payload, addr)
 
         s = self.sessions.get(addr)
         if s is None:
             return                      # everything else requires a login first
+        # The session id is only ever sent to the address that logged in, so
+        # requiring it here means an off-path spoofer has to guess it before
+        # it can drive traffic at someone.
+        if sid != s.sid:
+            return
         s.last_seen = time.monotonic()
 
         if ptype == P.PT_POSITION:
@@ -165,6 +176,9 @@ class XRadioServer(asyncio.DatagramProtocol):
             LOG.warning("rejecting %s: protocol v%s", addr, proto_ver)
             return
 
+        callsign = _clean(P.cstr(callsign_raw), 15)
+        ac_icao = _clean(P.cstr(icao_raw), 7)
+
         old = self.sessions.pop(addr, None)
         if old:
             self.by_sid.pop(old.sid, None)
@@ -174,8 +188,8 @@ class XRadioServer(asyncio.DatagramProtocol):
         s = Session(
             sid=sid,
             addr=addr,
-            callsign=P.cstr(callsign_raw) or f"UNK{sid}",
-            ac_icao=P.cstr(icao_raw) or "ZZZZ",
+            callsign=callsign or f"UNK{sid}",
+            ac_icao=ac_icao or "ZZZZ",
             last_seen=time.monotonic(),
         )
         self.sessions[addr] = s
@@ -186,20 +200,53 @@ class XRadioServer(asyncio.DatagramProtocol):
     def _on_position(self, s: Session, payload):
         if len(payload) < P.POSITION.size:
             return
-        (s.lat, s.lon, s.alt_m, s.heading, s.pitch, s.roll, s.gs_ms,
-         s.gear, s.flap, s.com1, s.com2,
-         s.lights, s.on_ground, s.tx_radio, s.rx_mask) = P.POSITION.unpack_from(payload, 0)
+        (lat, lon, alt_m, heading, pitch, roll, gs_ms,
+         gear, flap, com1, com2,
+         lights, on_ground, tx_radio, rx_mask) = P.POSITION.unpack_from(payload, 0)
+
+        # A client can send anything. NaN or a wild coordinate would be relayed
+        # to everyone else and poison their renderer, and it breaks the
+        # distance maths here too, so a bad report is dropped at the door.
+        if not (math.isfinite(lat) and -90.0 <= lat <= 90.0):
+            return
+        if not (math.isfinite(lon) and -180.0 <= lon <= 180.0):
+            return
+        if not (math.isfinite(alt_m) and -1000.0 <= alt_m <= 40000.0):
+            return
+        if not all(math.isfinite(v) for v in (heading, pitch, roll, gs_ms, gear, flap)):
+            return
+        if not 0.0 <= gs_ms <= 1500.0:
+            return
+
+        s.lat, s.lon, s.alt_m = lat, lon, alt_m
+        s.heading = heading % 360.0
+        s.pitch, s.roll = pitch, roll
+        s.gs_ms = gs_ms
+        s.gear = min(1.0, max(0.0, gear))
+        s.flap = min(1.0, max(0.0, flap))
+        s.com1, s.com2 = com1, com2
+        s.lights, s.on_ground = lights, on_ground
+        s.tx_radio, s.rx_mask = tx_radio, rx_mask
         s.has_position = True
 
     def _on_text(self, s: Session, payload):
         if len(payload) < P.TEXT_HDR.size:
             return
-        _freq, _from_sid, _from, text_len = P.TEXT_HDR.unpack_from(payload, 0)
-        text = payload[P.TEXT_HDR.size:P.TEXT_HDR.size + text_len]
+        want_freq, _from_sid, _from, text_len = P.TEXT_HDR.unpack_from(payload, 0)
+        text = payload[P.TEXT_HDR.size:P.TEXT_HDR.size + min(text_len, MAX_TEXT_BYTES)]
+        if not text:
+            return
 
-        freq = s.tx_freq()
+        # Text does not need the PTT held down, so it is sent on whichever
+        # radio the client names -- but only if that radio is really tuned
+        # there, so nobody can transmit on a frequency they are not on.
+        freq = 0
+        if want_freq and want_freq in (s.com1, s.com2):
+            freq = want_freq
+        elif want_freq == 0:
+            freq = s.tx_freq() or s.com1
         if freq == 0:
-            return                      # not transmitting on anything
+            return
         out_payload = P.TEXT_HDR.pack(freq, s.sid, P.pad(s.callsign, 16), len(text)) + text
         for peer in self._listeners(s, freq):
             self._send(peer.addr, P.PT_TEXT, peer.sid, out_payload)

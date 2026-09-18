@@ -1,8 +1,12 @@
+#define _USE_MATH_DEFINES   // MSVC needs this before <cmath> for M_PI
+
 #include "xpmp_bridge.h"
 #include "protocol.h"
 
 #include "XPLMUtilities.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -72,12 +76,49 @@ public:
         strncpy(acInfoTexts.icaoAcType, icaoType.c_str(), sizeof(acInfoTexts.icaoAcType) - 1);
     }
 
-    // Target state, written by the flight loop before X-Plane draws.
+    // Last state received from the server.
     RemoteState st;
 
+    // Dead reckoning: positions arrive at 5 Hz but this is called every drawn
+    // frame, so without extrapolation other aircraft visibly step forward 5
+    // times a second. We advance along the last known velocity vector and
+    // stop extrapolating if the updates dry up, so a dropped connection
+    // freezes the aircraft instead of flying it off across the scenery.
+    float sinceNet   = 0.f;   // seconds since the last network update
+    float vsFtPerSec = 0.f;   // vertical speed, derived from successive alts
+    bool  haveVs     = false;
+
+    static constexpr float kMaxExtrapolationS = 2.0f;
+
+    void ApplyNetworkUpdate(const RemoteState& s) {
+        if (sinceNet > 0.01f && sinceNet < kMaxExtrapolationS) {
+            vsFtPerSec = (s.altFt - st.altFt) / sinceNet;
+            haveVs = true;
+        }
+        st = s;
+        sinceNet = 0.f;
+    }
+
     // XPMP2 calls this once per drawn frame.
-    void UpdatePosition(float, int) override {
-        SetLocation(st.lat, st.lon, st.altFt, st.onGround);
+    void UpdatePosition(float elapsedSinceLastCall, int) override {
+        sinceNet += elapsedSinceLastCall;
+        const float dt = std::min(sinceNet, kMaxExtrapolationS);
+
+        double lat = st.lat, lon = st.lon;
+        float  alt = st.altFt;
+
+        if (st.gsKt > 1.f) {
+            const double distM  = (double)st.gsKt * 0.514444 * dt;
+            const double hdgRad = (double)st.heading * M_PI / 180.0;
+            const double cosLat = cos(st.lat * M_PI / 180.0);
+            lat += (distM * cos(hdgRad)) / 111320.0;
+            if (fabs(cosLat) > 1e-6) {
+                lon += (distM * sin(hdgRad)) / (111320.0 * cosLat);
+            }
+            if (haveVs && !st.onGround) alt += vsFtPerSec * dt;
+        }
+
+        SetLocation(lat, lon, alt, st.onGround);
         drawInfo.pitch   = st.pitch;
         drawInfo.roll    = st.roll;
         drawInfo.heading = st.heading;
@@ -132,7 +173,9 @@ XPMPPlaneID modeSFor(uint32_t sid) {
 
 }  // namespace
 
-bool available() { return g_ready; }
+// Only true once aircraft can actually be drawn -- init alone is not enough,
+// XPMPMultiplayerEnable has to have taken the AI planes as well.
+bool available() { return g_ready && g_enabled; }
 
 bool init(const std::string& pluginRoot, const std::string& defaultIcao, std::string* err) {
     if (g_ready) return true;
@@ -196,7 +239,8 @@ void upsert(const RemoteState& s) {
     if (it == g_planes.end()) {
         try {
             auto ac = std::make_unique<XRAircraft>(s.acIcao, s.callsign, modeSFor(s.sid));
-            ac->st = s;
+            ac->st = s;             // seed directly: no previous sample to derive from
+            ac->sinceNet = 0.f;
             g_planes[s.sid] = std::move(ac);
             logMsg("added %s (%s) sid=%u", s.callsign.c_str(), s.acIcao.c_str(),
                    (unsigned)s.sid);
@@ -205,7 +249,7 @@ void upsert(const RemoteState& s) {
         }
         return;
     }
-    it->second->st = s;
+    it->second->ApplyNetworkUpdate(s);
 }
 
 void remove(uint32_t sid) {

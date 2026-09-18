@@ -130,30 +130,50 @@ struct Refs {
     XPLMDataRef ltNav, ltBeacon, ltStrobe, ltLanding, ltTaxi;
 } g_ref;
 
+int g_missingRefs = 0;
+
+// Resolve a dataref and say so in Log.txt if X-Plane does not know the name.
+// Reading a null ref is harmless (the getters below return 0), but silently
+// sending zeros for every flap position is the kind of bug that takes an
+// evening to find, so make it loud.
+XPLMDataRef findRef(const char* name) {
+    XPLMDataRef r = XPLMFindDataRef(name);
+    if (!r) {
+        ++g_missingRefs;
+        logMsg("WARNING: dataref not found: %s", name);
+    }
+    return r;
+}
+
 void findRefs() {
-    g_ref.lat      = XPLMFindDataRef("sim/flightmodel/position/latitude");
-    g_ref.lon      = XPLMFindDataRef("sim/flightmodel/position/longitude");
-    g_ref.elev     = XPLMFindDataRef("sim/flightmodel/position/elevation");
-    g_ref.psi      = XPLMFindDataRef("sim/flightmodel/position/psi");
-    g_ref.theta    = XPLMFindDataRef("sim/flightmodel/position/theta");
-    g_ref.phi      = XPLMFindDataRef("sim/flightmodel/position/phi");
-    g_ref.gs       = XPLMFindDataRef("sim/flightmodel/position/groundspeed");
-    g_ref.gear     = XPLMFindDataRef("sim/flightmodel2/gear/deploy_ratio");
-    g_ref.flap     = XPLMFindDataRef("sim/cockpit2/controls/flap_ratio");
-    g_ref.onGround = XPLMFindDataRef("sim/flightmodel/failures/onground_any");
+    g_ref.lat      = findRef("sim/flightmodel/position/latitude");
+    g_ref.lon      = findRef("sim/flightmodel/position/longitude");
+    g_ref.elev     = findRef("sim/flightmodel/position/elevation");
+    g_ref.psi      = findRef("sim/flightmodel/position/psi");
+    g_ref.theta    = findRef("sim/flightmodel/position/theta");
+    g_ref.phi      = findRef("sim/flightmodel/position/phi");
+    g_ref.gs       = findRef("sim/flightmodel/position/groundspeed");
+    g_ref.gear     = findRef("sim/flightmodel2/gear/deploy_ratio");
+    g_ref.flap     = findRef("sim/cockpit2/controls/flap_ratio");
+    g_ref.onGround = findRef("sim/flightmodel/failures/onground_any");
 
     // 8.33 kHz variant reports the frequency in kHz, e.g. 118000 == 118.000 MHz
-    g_ref.com1        = XPLMFindDataRef("sim/cockpit2/radios/actuators/com1_frequency_hz_833");
-    g_ref.com2        = XPLMFindDataRef("sim/cockpit2/radios/actuators/com2_frequency_hz_833");
-    g_ref.audioComSel = XPLMFindDataRef("sim/cockpit2/radios/actuators/audio_com_selection");
-    g_ref.rxCom1      = XPLMFindDataRef("sim/cockpit2/radios/actuators/audio_selection_com1");
-    g_ref.rxCom2      = XPLMFindDataRef("sim/cockpit2/radios/actuators/audio_selection_com2");
+    g_ref.com1        = findRef("sim/cockpit2/radios/actuators/com1_frequency_hz_833");
+    g_ref.com2        = findRef("sim/cockpit2/radios/actuators/com2_frequency_hz_833");
+    g_ref.audioComSel = findRef("sim/cockpit2/radios/actuators/audio_com_selection");
+    g_ref.rxCom1      = findRef("sim/cockpit2/radios/actuators/audio_selection_com1");
+    g_ref.rxCom2      = findRef("sim/cockpit2/radios/actuators/audio_selection_com2");
 
-    g_ref.ltNav     = XPLMFindDataRef("sim/cockpit2/switches/navigation_lights_on");
-    g_ref.ltBeacon  = XPLMFindDataRef("sim/cockpit2/switches/beacon_on");
-    g_ref.ltStrobe  = XPLMFindDataRef("sim/cockpit2/switches/strobe_lights_on");
-    g_ref.ltLanding = XPLMFindDataRef("sim/cockpit2/switches/landing_lights_on");
-    g_ref.ltTaxi    = XPLMFindDataRef("sim/cockpit2/switches/taxi_light_on");
+    g_ref.ltNav     = findRef("sim/cockpit2/switches/navigation_lights_on");
+    g_ref.ltBeacon  = findRef("sim/cockpit2/switches/beacon_on");
+    g_ref.ltStrobe  = findRef("sim/cockpit2/switches/strobe_lights_on");
+    g_ref.ltLanding = findRef("sim/cockpit2/switches/landing_lights_on");
+    g_ref.ltTaxi    = findRef("sim/cockpit2/switches/taxi_light_on");
+
+    if (g_missingRefs) {
+        logMsg("%d dataref(s) missing -- those values will be sent as zero",
+               g_missingRefs);
+    }
 }
 
 float  fd(XPLMDataRef r) { return r ? XPLMGetDataf(r) : 0.f; }
@@ -181,6 +201,7 @@ struct Remote {
 };
 
 std::map<uint32_t, Remote> g_remote;
+int g_rejected = 0;   // traffic entries dropped as implausible
 
 // ---------------------------------------------------------------------------
 // plugin state
@@ -279,14 +300,44 @@ void sendText(const std::string& text) {
     uint16_t len = (uint16_t)std::min<size_t>(text.size(), 200);
     int off = writeHeader(buf, xr::PT_TEXT, (uint16_t)(sizeof(xr::TextHeader) + len));
 
+    // Text does not use the PTT, so name the radio explicitly: whichever COM
+    // the audio panel has selected for transmit. The server checks we really
+    // are tuned there before relaying.
     xr::TextHeader th{};
-    th.freqKhz     = 0;                  // the server fills this from our TX radio
+    th.freqKhz     = (uint32_t)id(id(g_ref.audioComSel) == 7 ? g_ref.com2 : g_ref.com1);
     th.fromSession = g_sessionId;
     strncpy(th.from, g_cfg.callsign.c_str(), sizeof(th.from) - 1);
     th.textLen     = len;
     memcpy(buf + off, &th, sizeof(th));
     memcpy(buf + off + sizeof(th), text.data(), len);
     g_sock.send(buf, off + (int)sizeof(th) + len);
+}
+
+// Everything below arrives over UDP from a server we do not control, so it is
+// checked before it reaches the renderer. Feeding NaN or a wild coordinate to
+// XPMP2's SetLocation is not something the sim recovers from gracefully.
+bool sane(const xr::TrafficEntry& e) {
+    if (!std::isfinite(e.lat) || e.lat < -90.0  || e.lat > 90.0)  return false;
+    if (!std::isfinite(e.lon) || e.lon < -180.0 || e.lon > 180.0) return false;
+    if (!std::isfinite(e.altMslM) || e.altMslM < -1000.f || e.altMslM > 40000.f) return false;
+    if (!std::isfinite(e.headingTrue) || !std::isfinite(e.pitch) ||
+        !std::isfinite(e.roll))                                   return false;
+    if (!std::isfinite(e.gsMs) || e.gsMs < 0.f || e.gsMs > 1500.f) return false;
+    if (!std::isfinite(e.gearRatio) || !std::isfinite(e.flapRatio)) return false;
+    return true;
+}
+
+float clamp01(float v) { return v < 0.f ? 0.f : (v > 1.f ? 1.f : v); }
+
+// Fixed-width C strings off the wire may be unterminated and may hold anything
+// at all, and they end up drawn in the window and on aircraft labels.
+std::string sanitizeText(const char* raw, size_t maxLen) {
+    std::string out;
+    for (size_t i = 0; i < maxLen && raw[i] != '\0'; ++i) {
+        const unsigned char c = (unsigned char)raw[i];
+        out += (c >= 32 && c < 127) ? (char)c : '?';
+    }
+    return out;
 }
 
 void handleTraffic(const uint8_t* payload, int len) {
@@ -301,13 +352,17 @@ void handleTraffic(const uint8_t* payload, int len) {
         memcpy(&e, payload + off, sizeof(e));
         off += (int)sizeof(e);
 
-        char cs[17] = {0}, ic[9] = {0};
-        memcpy(cs, e.callsign, 16);
-        memcpy(ic, e.acIcao, 8);
+        if (!sane(e)) {
+            ++g_rejected;
+            continue;               // drop this aircraft, keep the rest
+        }
+
+        const std::string cs = sanitizeText(e.callsign, sizeof(e.callsign));
+        const std::string ic = sanitizeText(e.acIcao, sizeof(e.acIcao));
 
         Remote& r   = g_remote[e.sessionId];
         r.sid       = e.sessionId;
-        r.callsign  = cs;
+        r.callsign  = cs.empty() ? std::string("?") : cs;
         r.acIcao    = ic;
         r.lat       = e.lat;
         r.lon       = e.lon;
@@ -316,8 +371,8 @@ void handleTraffic(const uint8_t* payload, int len) {
         r.pitch     = e.pitch;
         r.roll      = e.roll;
         r.gsMs      = e.gsMs;
-        r.gear      = e.gearRatio;
-        r.flap      = e.flapRatio;
+        r.gear      = clamp01(e.gearRatio);
+        r.flap      = clamp01(e.flapRatio);
         r.lights    = e.lights;
         r.onGround  = e.onGround;
         r.txActive  = e.txActive;
@@ -360,12 +415,18 @@ void handleText(const uint8_t* payload, int len) {
     int textLen = std::min<int>(th.textLen, len - (int)sizeof(th));
     if (textLen < 0) return;
 
-    char from[17] = {0};
-    memcpy(from, th.from, 16);
-    std::string msg(reinterpret_cast<const char*>(payload + sizeof(th)), textLen);
+    // A server is not obliged to respect the same limits we send with, so the
+    // receive side does its own clamping rather than trusting the header.
+    const int kMaxShown = 200;
+    if (textLen > kMaxShown) textLen = kMaxShown;
+
+    const std::string from = sanitizeText(th.from, sizeof(th.from));
+    const std::string msg  = sanitizeText(
+        reinterpret_cast<const char*>(payload + sizeof(th)), (size_t)textLen);
 
     char line[320];
-    snprintf(line, sizeof(line), "[%.3f] %s: %s", th.freqKhz / 1000.0, from, msg.c_str());
+    snprintf(line, sizeof(line), "[%.3f] %s: %s",
+             (double)(th.freqKhz % 1000000u) / 1000.0, from.c_str(), msg.c_str());
     addChat(line);
 }
 
@@ -481,11 +542,12 @@ void drawWindow(XPLMWindowID win, void*) {
 
     char title[96];
     if (xr::csl::available()) {
-        snprintf(title, sizeof(title), "Traffic (%d)  ·  %d CSL models",
-                 (int)g_remote.size(), xr::csl::cslModelCount());
+        snprintf(title, sizeof(title), "Traffic (%d)  ·  %d CSL models%s",
+                 (int)g_remote.size(), xr::csl::cslModelCount(),
+                 g_rejected ? "  · bad data rejected" : "");
     } else {
-        snprintf(title, sizeof(title), "Traffic (%d)  ·  no 3D models",
-                 (int)g_remote.size());
+        snprintf(title, sizeof(title), "Traffic (%d)  ·  no 3D models%s",
+                 (int)g_remote.size(), g_rejected ? "  · bad data rejected" : "");
     }
     XPLMDrawString(white, x, y, title, nullptr, xplmFont_Proportional);
     y -= 16;
