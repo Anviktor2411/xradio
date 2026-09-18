@@ -1,7 +1,8 @@
 name: build
 
-# Builds the plugin for all three platforms and uploads a ready-to-install
-# XRadio folder as a build artifact.
+# Builds the plugin for all three platforms, then merges them into a single
+# cross-platform XRadio folder that can be dropped straight into
+# X-Plane 12/Resources/plugins/.
 
 on:
   push:
@@ -57,10 +58,72 @@ jobs:
           mkdir -p dist
           cp -r build/XRadio dist/XRadio
           cp README.md LICENSE dist/XRadio/
-          ls -R dist | head -20
+          mkdir -p dist/XRadio/Resources/CSL
+          cat > dist/XRadio/Resources/CSL/README.txt <<'EOF'
+          CSL models go here
+          ==================
+
+          XRadio draws other pilots using CSL models in OBJ8 format. Without
+          any models installed the plugin still runs, but other aircraft stay
+          invisible and Log.txt notes that no models were found.
+
+          Installing a package
+          --------------------
+          Unpack it so each package sits in its own subfolder here, with its
+          xsb_aircraft.txt at the top of that subfolder:
+
+            Resources/CSL/Bluebell/BB_Airbus/xsb_aircraft.txt
+            Resources/CSL/Bluebell/BB_Boeing/xsb_aircraft.txt
+            Resources/CSL/MyOwnModels/xsb_aircraft.txt
+
+          XRadio scans this whole tree at startup, so several packages can
+          live side by side. Restart X-Plane after adding models.
+
+          Where to get them
+          -----------------
+          Bluebell is free and open, and covers most common types:
+            https://github.com/oktalist/BluebellCSL
+
+          Any CSL package built for XPMP2, LiveTraffic or xPilot works here.
+
+          Matching
+          --------
+          Which model another pilot appears as comes from the "actype" line
+          in their xradio.cfg (an ICAO type code such as C172 or A20N). When
+          no installed model matches that type, XPMP2 falls back to a related
+          type, and failing that to a default model.
+          EOF
+          ls -R dist | head -30
 
       - uses: actions/upload-artifact@v4
         with:
           name: XRadio-${{ matrix.name }}
+          path: dist
+          if-no-files-found: error
+
+  # Merge the three platform builds into one folder that works everywhere.
+  package:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Collect the platform builds
+        uses: actions/download-artifact@v4
+        with:
+          pattern: XRadio-*
+          merge-multiple: true
+          path: dist
+
+      - name: Verify all three platforms are present
+        shell: bash
+        run: |
+          find dist -maxdepth 3 | sort
+          for f in win_x64/win.xpl mac_x64/mac.xpl lin_x64/lin.xpl; do
+            test -f "dist/XRadio/$f" || { echo "MISSING: $f"; exit 1; }
+          done
+          echo "All three platforms packaged."
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XRadio-all-platforms
           path: dist
           if-no-files-found: error
