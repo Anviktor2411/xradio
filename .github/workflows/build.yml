@@ -48,8 +48,19 @@ jobs:
         shell: bash
         run: ls -la build/XRadio/${{ matrix.platdir }}
 
+      # Stage into dist/ so the artifact zip contains an XRadio/ folder.
+      # upload-artifact drops the top directory when `path` points straight
+      # at it, which would scatter win_x64/ and Resources/ into plugins/.
+      - name: Stage package
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp -r build/XRadio dist/XRadio
+          cp README.md LICENSE dist/XRadio/
+          ls -R dist | head -20
+
       - uses: actions/upload-artifact@v4
         with:
           name: XRadio-${{ matrix.name }}
-          path: build/XRadio
+          path: dist
           if-no-files-found: error
