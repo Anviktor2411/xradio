@@ -8,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include "mathconst.h"
 
 #ifndef XRADIO_USE_VOICE
 // ---------------------------------------------------------------------------
@@ -139,7 +140,7 @@ struct Biquad {
 Biquad g_hp, g_lp;
 
 void designHighpass(Biquad& q, float fc) {
-    const float w = 2.f * (float)M_PI * fc / (float)kSampleRate;
+    const float w = 2.f * (float)kPi * fc / (float)kSampleRate;
     const float c = cosf(w), s = sinf(w), alpha = s / (2.f * 0.7071f);
     const float a0 = 1.f + alpha;
     q.b0 = (1.f + c) / 2.f / a0; q.b1 = -(1.f + c) / a0; q.b2 = (1.f + c) / 2.f / a0;
@@ -147,7 +148,7 @@ void designHighpass(Biquad& q, float fc) {
 }
 
 void designLowpass(Biquad& q, float fc) {
-    const float w = 2.f * (float)M_PI * fc / (float)kSampleRate;
+    const float w = 2.f * (float)kPi * fc / (float)kSampleRate;
     const float c = cosf(w), s = sinf(w), alpha = s / (2.f * 0.7071f);
     const float a0 = 1.f + alpha;
     q.b0 = (1.f - c) / 2.f / a0; q.b1 = (1.f - c) / a0; q.b2 = (1.f - c) / 2.f / a0;

@@ -1,7 +1,6 @@
-#define _USE_MATH_DEFINES   // MSVC needs this before <cmath> for M_PI
-
 #include "xpmp_bridge.h"
 #include "protocol.h"
+#include "mathconst.h"
 #include "smoothing.h"
 
 #include "XPLMUtilities.h"

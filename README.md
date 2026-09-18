@@ -56,8 +56,15 @@ A systemd unit is provided in `server/xradio.service`.
 ## Tests
 
 ```bash
+./tools/check_portability.sh          # instant: MSVC-only pitfalls
 python3 tools/test_server.py          # server: protocol and routing
 ```
+
+`check_portability.sh` catches the mistakes that pass on Linux and macOS and
+fail on Windows ten minutes later — `M_PI` (POSIX, not standard C++, and MSVC
+only defines it when `_USE_MATH_DEFINES` precedes `<cmath>`), unguarded POSIX
+headers, variable-length arrays, `std::min` without `<algorithm>`. Use
+`xr::kPi` from `plugin/src/mathconst.h` rather than `M_PI`.
 
 Starts a real server on a spare port and drives it over real UDP, covering the
 wire format, login, traffic filtering, frequency and range routing, hostile

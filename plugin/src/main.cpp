@@ -6,10 +6,9 @@
 // (voice.cpp), everything else is queued for the main thread. Also sends the
 // frames the microphone produces.
 
-#define _USE_MATH_DEFINES   // MSVC needs this before <cmath> for M_PI
-
 #include "net.h"
 #include "protocol.h"
+#include "mathconst.h"
 #include "voice.h"
 #include "xpmp_bridge.h"
 
@@ -644,8 +643,8 @@ int pttHandler(XPLMCommandRef, XPLMCommandPhase phase, void*) {
 // ---------------------------------------------------------------------------
 double distanceNm(double lat1, double lon1, double lat2, double lon2) {
     const double R = 3440.065;
-    double p1 = lat1 * M_PI / 180.0, p2 = lat2 * M_PI / 180.0;
-    double dp = p2 - p1, dl = (lon2 - lon1) * M_PI / 180.0;
+    double p1 = lat1 * xr::kPi / 180.0, p2 = lat2 * xr::kPi / 180.0;
+    double dp = p2 - p1, dl = (lon2 - lon1) * xr::kPi / 180.0;
     double a = sin(dp / 2) * sin(dp / 2) + cos(p1) * cos(p2) * sin(dl / 2) * sin(dl / 2);
     return 2 * R * asin(std::min(1.0, sqrt(a)));
 }

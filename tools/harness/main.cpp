@@ -14,6 +14,7 @@
 #include <cstring>
 #include <string>
 #include <thread>
+#include "mathconst.h"
 
 extern "C" {
 int  XPluginStart(char*, char*, char*);
@@ -153,7 +154,7 @@ int main(int argc, char** argv) {
     // and the peer on the other end of the server talks in real seconds too.
     for (int i = 0; i < 70; ++i) {           // 70 * 0.2 s = 14 s
         // dead-reckon east so the server sees us moving
-        lon += (gsMs * 0.2) / (111320.0 * cos(lat * M_PI / 180.0));
+        lon += (gsMs * 0.2) / (111320.0 * cos(lat * xr::kPi / 180.0));
         setPos(lat, lon, altM, 90.0f, gsMs);
 
         if (i == 20) harness::ptt(true);      // key for 2 s: 100 voice frames

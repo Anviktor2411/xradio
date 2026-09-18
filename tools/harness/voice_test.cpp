@@ -3,6 +3,7 @@
 // directly through the test hooks, the way the audio devices would.
 #include "voice.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -10,6 +11,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "mathconst.h"
 
 using namespace xr::voice;
 
@@ -26,7 +28,7 @@ static void check(const std::string& name, bool ok, const std::string& detail = 
 static std::vector<int16_t> tone(int ms, double hz = 1000.0) {
     std::vector<int16_t> out((size_t)(kSampleRate * ms / 1000));
     for (size_t i = 0; i < out.size(); ++i) {
-        out[i] = (int16_t)(16000.0 * sin(2.0 * M_PI * hz * (double)i / kSampleRate));
+        out[i] = (int16_t)(16000.0 * sin(2.0 * xr::kPi * hz * (double)i / kSampleRate));
     }
     return out;
 }

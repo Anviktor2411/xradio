@@ -13,6 +13,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "mathconst.h"
 
 using xr::PoseSample;
 using xr::Pose;
@@ -35,14 +36,14 @@ struct Truth {
 
     PoseSample at(double t) const {
         // integrate the arc analytically: heading = t * rate
-        const double w = turnRateDeg * M_PI / 180.0;
+        const double w = turnRateDeg * xr::kPi / 180.0;
         const double r = speedMs / w;
         const double north = r * std::sin(w * t);
         const double east  = r * (1.0 - std::cos(w * t));
         PoseSample s;
         s.t = t;
         s.lat = lat0 + north / 111320.0;
-        s.lon = lon0 + east / (111320.0 * std::cos(lat0 * M_PI / 180.0));
+        s.lon = lon0 + east / (111320.0 * std::cos(lat0 * xr::kPi / 180.0));
         s.altFt = (float)(alt0Ft + vsFps * t);
         s.heading = (float)std::fmod(turnRateDeg * t, 360.0);
         s.track = s.heading;             // no wind in this scenario
@@ -56,15 +57,15 @@ struct Truth {
 
 static double metres(const Truth& tr, double lat1, double lon1, double lat2, double lon2) {
     const double dy = (lat2 - lat1) * 111320.0;
-    const double dx = (lon2 - lon1) * 111320.0 * std::cos(tr.lat0 * M_PI / 180.0);
+    const double dx = (lon2 - lon1) * 111320.0 * std::cos(tr.lat0 * xr::kPi / 180.0);
     return std::sqrt(dx * dx + dy * dy);
 }
 
 // Signed progress along the true direction of travel, in metres.
 static double along(const Truth& tr, const Pose& from, const Pose& to, double trackDeg) {
     const double dy = (to.lat - from.lat) * 111320.0;
-    const double dx = (to.lon - from.lon) * 111320.0 * std::cos(tr.lat0 * M_PI / 180.0);
-    const double tr_ = trackDeg * M_PI / 180.0;
+    const double dx = (to.lon - from.lon) * 111320.0 * std::cos(tr.lat0 * xr::kPi / 180.0);
+    const double tr_ = trackDeg * xr::kPi / 180.0;
     return dx * std::sin(tr_) + dy * std::cos(tr_);
 }
 
@@ -110,9 +111,9 @@ struct NaiveDeadReckoning {
         since += dt;
         Pose p; p.lat = last.lat; p.lon = last.lon; p.altFt = last.altFt; p.heading = last.heading;
         const double distM = last.gsKt * 0.514444 * since;
-        const double tr = last.track * M_PI / 180.0;
+        const double tr = last.track * xr::kPi / 180.0;
         p.lat += distM * std::cos(tr) / 111320.0;
-        p.lon += distM * std::sin(tr) / (111320.0 * std::cos(last.lat * M_PI / 180.0));
+        p.lon += distM * std::sin(tr) / (111320.0 * std::cos(last.lat * xr::kPi / 180.0));
         return p;
     }
 };

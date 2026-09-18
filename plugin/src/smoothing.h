@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstdint>
 #include <deque>
+#include "mathconst.h"
 
 namespace xr {
 
@@ -169,8 +170,8 @@ private:
         Pose p = poseOf(s);
         if (s.gsKt > 1.f && dt > 0) {
             const double distM  = (double)s.gsKt * 0.514444 * dt;
-            const double trkRad = (double)s.track * M_PI / 180.0;
-            const double cosLat = std::cos(s.lat * M_PI / 180.0);
+            const double trkRad = (double)s.track * kPi / 180.0;
+            const double cosLat = std::cos(s.lat * kPi / 180.0);
             p.lat += (distM * std::cos(trkRad)) / 111320.0;
             if (std::fabs(cosLat) > 1e-6) {
                 p.lon += (distM * std::sin(trkRad)) / (111320.0 * cosLat);
