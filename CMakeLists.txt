@@ -86,9 +86,19 @@ else()   # Linux
     find_package(Threads REQUIRED)
     target_compile_definitions(XRadio PRIVATE LIN=1)
     target_compile_options(XRadio PRIVATE -fvisibility=hidden)
-    # XPLM symbols are resolved by X-Plane itself when the plugin is loaded.
     target_link_libraries(XRadio PRIVATE dl Threads::Threads)
-    target_link_options(XRadio PRIVATE -shared -rdynamic -nodefaultlibs)
+    # Do NOT add -shared here: CMake already passes it for a SHARED library,
+    # and a second one can push the link into producing an executable
+    # ("cannot find entry symbol _start").
+    #
+    # Do NOT use -nodefaultlibs either. The old X-Plane sample flags assume a
+    # C plugin; with C++ it drops libstdc++ and libc from the link and every
+    # std::string and strcpy reference comes back undefined. Statically
+    # linking the C++ runtime instead also means the plugin does not care
+    # which libstdc++ the host happens to ship.
+    target_link_options(XRadio PRIVATE -rdynamic -static-libgcc -static-libstdc++)
+    # XPLM symbols stay unresolved on purpose: X-Plane supplies them at load
+    # time, so --no-undefined must not be used on this platform.
     set(XR_PLATDIR "lin_x64")
     set_target_properties(XRadio PROPERTIES OUTPUT_NAME "lin")
 endif()
