@@ -59,7 +59,11 @@ if(XRADIO_USE_XPMP2)
 endif()
 
 # --- per-platform -----------------------------------------------------------
-set_target_properties(XRadio PROPERTIES PREFIX "" SUFFIX ".xpl")
+# X-Plane's SDK 3.0 layout looks for <plugin folder>/<platform>_x64/<plugin
+# folder>.xpl -- the binary is named after the plugin, NOT win.xpl. Get this
+# wrong and X-Plane skips the folder silently, with nothing in Log.txt.
+set_target_properties(XRadio PROPERTIES
+    PREFIX "" SUFFIX ".xpl" OUTPUT_NAME "XRadio")
 
 if(WIN32)
     target_compile_definitions(XRadio PRIVATE IBM=1 _CRT_SECURE_NO_WARNINGS NOMINMAX)
@@ -67,7 +71,6 @@ if(WIN32)
                  PATHS "${XPLANE_SDK}/Libraries/Win" REQUIRED)
     target_link_libraries(XRadio PRIVATE ${XPLM_LIBRARY} wsock32 ws2_32 iphlpapi)
     set(XR_PLATDIR "win_x64")
-    set_target_properties(XRadio PROPERTIES OUTPUT_NAME "win")
 
 elseif(APPLE)
     target_compile_definitions(XRadio PRIVATE APL=1)
@@ -80,7 +83,6 @@ elseif(APPLE)
     # X-Plane loads .xpl bundles; -undefined error keeps link errors honest.
     target_link_options(XRadio PRIVATE -undefined error)
     set(XR_PLATDIR "mac_x64")
-    set_target_properties(XRadio PROPERTIES OUTPUT_NAME "mac")
 
 else()   # Linux
     find_package(Threads REQUIRED)
@@ -100,7 +102,6 @@ else()   # Linux
     # XPLM symbols stay unresolved on purpose: X-Plane supplies them at load
     # time, so --no-undefined must not be used on this platform.
     set(XR_PLATDIR "lin_x64")
-    set_target_properties(XRadio PROPERTIES OUTPUT_NAME "lin")
 endif()
 
 # --- output layout ----------------------------------------------------------

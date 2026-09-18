@@ -116,9 +116,9 @@ The result follows X-Plane's fat-plugin layout:
 
 ```
 build/XRadio/
-  win_x64/win.xpl        # produced on Windows
-  mac_x64/mac.xpl        # produced on macOS
-  lin_x64/lin.xpl        # produced on Linux
+  win_x64/XRadio.xpl     # produced on Windows
+  mac_x64/XRadio.xpl     # produced on macOS
+  lin_x64/XRadio.xpl     # produced on Linux
   Resources/             # XPMP2 data files (related.txt, Doc8643.txt, ...)
 ```
 
@@ -131,6 +131,11 @@ Actions workflow (`.github/workflows/build.yml`) does this for you: every push
 builds all three and uploads the results as artifacts.
 
 The macOS build is a universal binary (arm64 + x86_64).
+
+The `.xpl` must be named after the plugin folder — `XRadio/win_x64/XRadio.xpl`,
+not `win_x64/win.xpl`. That is the SDK 3.0 rule; with the wrong name X-Plane
+skips the folder without writing anything to `Log.txt`, so it looks as though
+the plugin does not exist.
 
 ### Building without 3D models
 
