@@ -39,6 +39,11 @@ struct Win {
 };
 std::vector<Win> g_wins;                  // index+1 is the XPLMWindowID
 XPLMWindowID     g_focus = nullptr;
+
+// Screen / monitor geometry the test can distort to reproduce odd setups.
+int  g_screenL = 0, g_screenT = 1080, g_screenR = 1920, g_screenB = 0;
+struct Mon { int l, t, r, b; };
+std::vector<Mon> g_monitors;
 XPLMCommandCallback_f         g_pttHandler = nullptr;
 XPLMMenuHandler_f             g_menuFunc   = nullptr;
 bool                          g_verbose    = false;
@@ -92,6 +97,28 @@ void pressVk(int id, int vk) {
     if (!w || !w->key) return;
     w->key((XPLMWindowID)(intptr_t)id, 0, xplm_DownFlag, (char)vk, nullptr, 0);
     w->key((XPLMWindowID)(intptr_t)id, 0, xplm_UpFlag,   (char)vk, nullptr, 0);
+}
+
+// Forget every window, so a test can run XPluginStart more than once
+// without inspecting a previous run's geometry by mistake.
+void resetWindows() {
+    g_wins.clear();
+    g_drawFunc = nullptr;
+    g_focus = nullptr;
+}
+
+void setScreen(int l, int t, int r, int b) {
+    g_screenL = l; g_screenT = t; g_screenR = r; g_screenB = b;
+}
+void clearMonitors() { g_monitors.clear(); }
+void addMonitor(int l, int t, int r, int b) { g_monitors.push_back({l, t, r, b}); }
+
+void windowRect(int id, int* l, int* t, int* r, int* b) {
+    Win* w = win(id);
+    if (l) *l = w ? w->l : 0;
+    if (t) *t = w ? w->t : 0;
+    if (r) *r = w ? w->r : 0;
+    if (b) *b = w ? w->b : 0;
 }
 
 void windowTop(int id, int* t, int* l) {
@@ -194,7 +221,18 @@ void XPLMBringWindowToFront(XPLMWindowID) {}
 void XPLMTakeKeyboardFocus(XPLMWindowID id) { harness::g_focus = id; }
 int  XPLMHasKeyboardFocus(XPLMWindowID id) { return harness::g_focus == id ? 1 : 0; }
 void XPLMGetScreenBoundsGlobal(int* l, int* t, int* r, int* b) {
-    *l = 0; *t = 1080; *r = 1920; *b = 0;
+    *l = harness::g_screenL; *t = harness::g_screenT;
+    *r = harness::g_screenR; *b = harness::g_screenB;
+}
+void XPLMGetAllMonitorBoundsGlobal(XPLMReceiveMonitorBoundsGlobal_f cb, void* ref) {
+    int i = 0;
+    for (auto& m : harness::g_monitors) cb(i++, m.l, m.t, m.r, m.b, ref);
+}
+void XPLMSetWindowGeometry(XPLMWindowID id, int l, int t, int r, int b) {
+    if ((intptr_t)id >= 1 && (intptr_t)id <= (intptr_t)harness::g_wins.size()) {
+        auto& w = harness::g_wins[(intptr_t)id - 1];
+        w.l = l; w.t = t; w.r = r; w.b = b;
+    }
 }
 
 void XPLMDrawString(float*, int, int, char* s, int*, XPLMFontID) {

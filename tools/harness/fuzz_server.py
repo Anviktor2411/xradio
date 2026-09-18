@@ -72,6 +72,23 @@ def nasty_packets(sid, rnd):
 
     yield "login_ack: payload too short", raw(P.PT_LOGIN_ACK, sid, b"\x01\x02")
     yield "voice: junk payload", raw(P.PT_VOICE, sid, b"\x00" * 40)
+    yield "voice: opusLen says 65535, few bytes", \
+        raw(P.PT_VOICE, sid, P.VOICE_HDR.pack(122800, 3, 1, 0xFFFF) + b"\xfc\xff\xfe")
+    yield "voice: opusLen 0", raw(P.PT_VOICE, sid, P.VOICE_HDR.pack(122800, 3, 2, 0))
+    yield "voice: header cut short", raw(P.PT_VOICE, sid, P.VOICE_HDR.pack(122800, 3, 3, 10)[:6])
+    yield "voice: random bytes as an Opus frame", \
+        raw(P.PT_VOICE, sid, P.VOICE_HDR.pack(122800, 3, 4, 120) +
+            bytes(rnd.randrange(256) for _ in range(120)))
+    yield "voice: 1300-byte frame", \
+        raw(P.PT_VOICE, sid, P.VOICE_HDR.pack(122800, 3, 5, 1300) + b"\x80" * 1300)
+    yield "voice: sequence going backwards", \
+        raw(P.PT_VOICE, sid, P.VOICE_HDR.pack(122800, 3, 0, 3) + b"\xfc\xff\xfe")
+    # A stream per session id costs the client a decoder: try to make it
+    # allocate a thousand of them.
+    for k in range(50):
+        yield f"voice: session id {1000 + k}", \
+            raw(P.PT_VOICE, sid, P.VOICE_HDR.pack(122800, 1000 + k + rnd.randrange(100000), 1, 3)
+                + b"\xfc\xff\xfe")
     yield "unknown packet type 200", raw(200, sid, b"junk")
     yield "header only, zero payload", raw(P.PT_TRAFFIC, sid, b"")
     yield "single byte", b"\x58"

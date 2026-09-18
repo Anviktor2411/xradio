@@ -5,6 +5,7 @@
 // Flies a straight line, reports what the plugin's own window would display,
 // and exits non-zero if the plugin failed to connect.
 #include "harness.h"
+#include "voice.h"
 
 #include <chrono>
 #include <cmath>
@@ -155,9 +156,9 @@ int main(int argc, char** argv) {
         lon += (gsMs * 0.2) / (111320.0 * cos(lat * M_PI / 180.0));
         setPos(lat, lon, altM, 90.0f, gsMs);
 
-        if (i == 20) harness::ptt(true);
-        if (i == 25) harness::ptt(false);
-        if (i == 30) harness::menu(2);        // "Send test message"
+        if (i == 20) harness::ptt(true);      // key for 2 s: 100 voice frames
+        if (i == 30) harness::ptt(false);
+        if (i == 32) harness::menu(4);        // "Send test message"
 
         harness::tick(0.2f);
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -174,14 +175,44 @@ int main(int argc, char** argv) {
             }
         }
 
-        if (i == 69 || (connected && sawTraffic && sawChat)) {
-            printf("\n--- what the plugin window shows ---\n");
+        // Snapshot the window once while keyed (mic meter, RX line) and once
+        // at the end. Never bail out early: the PTT window must run its course.
+        if (i == 27 || i == 69) {
+            printf("\n--- what the plugin window shows (t=%.1fs) ---\n", i * 0.2);
             for (const auto& l : lines) printf("  %s\n", l.c_str());
-            if (connected && sawTraffic && sawChat) break;
         }
     }
 
     printf("\nconnected=%d traffic=%d chat=%d\n", connected, sawTraffic, sawChat);
+
+    // ---- voice: did keying the PTT actually put frames on the wire, and did
+    // the peer's echo come back through our decoder? ----
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));   // let the echo land
+    const auto vs = xr::voice::stats();
+    printf("voice: %s\n", xr::voice::status().c_str());
+    printf("voice: encoded=%llu received=%llu played=%llu concealed=%llu\n",
+           (unsigned long long)vs.framesEncoded, (unsigned long long)vs.framesReceived,
+           (unsigned long long)vs.framesPlayed, (unsigned long long)vs.framesConcealed);
+    bool voiceOk = true;
+    if (!xr::voice::available()) {
+        fprintf(stderr, "FAIL: voice pipeline did not initialise\n");
+        voiceOk = false;
+    }
+    if (vs.framesEncoded < 50) {
+        fprintf(stderr, "FAIL: PTT held for 2 s should encode ~100 frames, got %llu\n",
+                (unsigned long long)vs.framesEncoded);
+        voiceOk = false;
+    }
+    if (vs.framesReceived < 20) {
+        fprintf(stderr, "FAIL: the peer echoed our voice but only %llu frames came back\n",
+                (unsigned long long)vs.framesReceived);
+        voiceOk = false;
+    }
+    if (vs.framesPlayed < 5) {
+        fprintf(stderr, "FAIL: echoed frames were received but never played (%llu)\n",
+                (unsigned long long)vs.framesPlayed);
+        voiceOk = false;
+    }
 
     XPluginDisable();
     XPluginStop();
@@ -189,6 +220,7 @@ int main(int argc, char** argv) {
     if (!connected) { fprintf(stderr, "FAIL: never connected\n"); return 1; }
     if (!sawTraffic) { fprintf(stderr, "FAIL: never saw traffic\n"); return 1; }
     if (!sawChat)    { fprintf(stderr, "FAIL: never received a radio message\n"); return 1; }
+    if (!voiceOk)    { fprintf(stderr, "FAIL: voice round trip\n"); return 1; }
     printf("harness OK\n");
     return 0;
 }

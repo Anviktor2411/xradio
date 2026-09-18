@@ -29,6 +29,7 @@ SESSION_TIMEOUT_S = 15.0    # drop a client we have not heard from
 TX_HOLD_S = 0.4             # how long txActive stays set after the last voice frame
 MAX_ENTRIES_PER_PACKET = 16  # 16 * 76 + 16 < 1400 bytes
 MAX_TEXT_BYTES = 200        # cap relayed text so one client cannot spam huge frames
+MAX_VOICE_BYTES = 512       # one 20 ms Opus frame at 24 kbit/s is ~60 bytes
 
 
 @dataclass
@@ -256,15 +257,26 @@ class XRadioServer(asyncio.DatagramProtocol):
     def _on_voice(self, s: Session, payload):
         if len(payload) < P.VOICE_HDR.size:
             return
-        _freq, _from_sid, seq, opus_len = P.VOICE_HDR.unpack_from(payload, 0)
-        opus = payload[P.VOICE_HDR.size:P.VOICE_HDR.size + opus_len]
+        want_freq, _from_sid, seq, opus_len = P.VOICE_HDR.unpack_from(payload, 0)
+        opus = payload[P.VOICE_HDR.size:P.VOICE_HDR.size + min(opus_len, MAX_VOICE_BYTES)]
         if not opus:
             return
 
-        freq = s.tx_freq()
+        # Same rule as text: the client names the radio it is keying and must
+        # really be tuned there. Relying on tx_radio from the last position
+        # report would drop the first ~200 ms of every transmission.
+        freq = 0
+        if want_freq and want_freq in (s.com1, s.com2):
+            freq = want_freq
+        elif want_freq == 0:
+            freq = s.tx_freq()
         if freq == 0:
             return
-        s.last_voice = time.monotonic()
+
+        now = time.monotonic()
+        if now - s.last_voice > 1.0:
+            LOG.info("voice %s keyed on %.3f", s.callsign, freq / 1000.0)
+        s.last_voice = now
         out_payload = P.VOICE_HDR.pack(freq, s.sid, seq, len(opus)) + opus
         for peer in self._listeners(s, freq):
             self._send(peer.addr, P.PT_VOICE, peer.sid, out_payload)

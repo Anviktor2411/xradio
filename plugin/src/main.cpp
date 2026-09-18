@@ -1,13 +1,16 @@
 // XRadio -- X-Plane 12 multiplayer + radio plugin.
 //
-// Phase 1: log in to the relay server, send our own position 5x a second,
-// receive nearby traffic and show it in a window. Aircraft rendering (XPMP2)
-// and voice (Opus) plug into the hooks marked TODO below.
+// Main thread (flight loop, 5 Hz): sends our position, drains the inbox of
+// non-voice packets, drives XPMP2 and the windows.
+// Network thread: receives everything; voice frames go straight to the mixer
+// (voice.cpp), everything else is queued for the main thread. Also sends the
+// frames the microphone produces.
 
 #define _USE_MATH_DEFINES   // MSVC needs this before <cmath> for M_PI
 
 #include "net.h"
 #include "protocol.h"
+#include "voice.h"
 #include "xpmp_bridge.h"
 
 #include "XPLMDataAccess.h"
@@ -19,13 +22,17 @@
 #include "XPLMUtilities.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cctype>
 #include <cstring>
+#include <deque>
 #include <map>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #if !defined(XPLM300) || !defined(XPLM400)
@@ -213,7 +220,8 @@ int g_rejected = 0;   // traffic entries dropped as implausible
 // plugin state
 // ---------------------------------------------------------------------------
 xr::UdpSocket    g_sock;
-uint32_t         g_sessionId    = 0;
+std::atomic<uint32_t> g_sessionId{0};      // read by the network thread too
+std::atomic<uint32_t> g_txFreqKhz{0};      // radio the PTT keys, for voice packets
 bool             g_connected    = false;
 float            g_elapsed      = 0.f;
 float            g_lastLogin    = -99.f;
@@ -241,7 +249,7 @@ int writeHeader(uint8_t* buf, uint8_t type, uint16_t payloadLen) {
     h.type       = type;
     h.version    = (uint8_t)xr::kProtoVersion;
     h.payloadLen = payloadLen;
-    h.sessionId  = g_sessionId;
+    h.sessionId  = g_sessionId.load();
     memcpy(buf, &h, sizeof(h));
     return (int)sizeof(h);
 }
@@ -436,19 +444,97 @@ void handleText(const uint8_t* payload, int len) {
     addChat(line);
 }
 
-void pumpNetwork() {
+// ---------------------------------------------------------------------------
+// network thread
+// ---------------------------------------------------------------------------
+// Voice cannot wait for the 5 Hz flight loop, and must not depend on the frame
+// rate at all, so a dedicated thread owns the receive side of the socket.
+// Voice frames are handed to the mixer immediately; everything else is queued
+// for the main thread, which is the only place the sim may be touched.
+std::thread                       g_netThread;
+std::atomic<bool>                 g_netRun{false};
+std::mutex                        g_inboxMx;
+std::deque<std::vector<uint8_t>>  g_inbox;
+const size_t                      kInboxCap = 256;
+
+void handleVoicePacket(const uint8_t* payload, int len) {
+    if (len < (int)sizeof(xr::VoiceHeader)) return;
+    xr::VoiceHeader vh{};
+    memcpy(&vh, payload, sizeof(vh));
+    const int avail = len - (int)sizeof(vh);
+    const int n = std::min<int>(vh.opusLen, avail);
+    if (n <= 0) return;
+    xr::voice::onIncomingFrame(vh.fromSession, vh.seq, payload + sizeof(vh), n);
+}
+
+void sendVoiceFrames() {
+    static std::vector<xr::voice::OutFrame> frames;
+    xr::voice::pollOutgoing(frames);
+    if (frames.empty()) return;
+    const uint32_t freq = g_txFreqKhz.load();
+    if (freq == 0) return;                       // no radio selected: nothing to key
     uint8_t buf[xr::kMaxPacket];
-    for (int guard = 0; guard < 64; ++guard) {   // bounded, so one frame cannot stall
-        int n = g_sock.recv(buf, sizeof(buf));
-        if (n <= 0) break;
-        if (n < (int)sizeof(xr::Header)) continue;
+    for (const auto& f : frames) {
+        if (f.opus.empty() || f.opus.size() > 1000) continue;
+        xr::VoiceHeader vh{};
+        vh.freqKhz     = freq;
+        vh.fromSession = g_sessionId.load();
+        vh.seq         = f.seq;
+        vh.opusLen     = (uint16_t)f.opus.size();
+        const uint16_t payloadLen = (uint16_t)(sizeof(vh) + f.opus.size());
+        int off = writeHeader(buf, xr::PT_VOICE, payloadLen);
+        memcpy(buf + off, &vh, sizeof(vh));
+        memcpy(buf + off + sizeof(vh), f.opus.data(), f.opus.size());
+        g_sock.send(buf, off + (int)payloadLen);
+    }
+}
+
+void netLoop() {
+    uint8_t buf[xr::kMaxPacket];
+    while (g_netRun.load()) {
+        sendVoiceFrames();
+
+        const int n = g_sock.recvWait(buf, sizeof(buf), 20);
+        if (n < (int)sizeof(xr::Header)) continue;   // timeout, error, or runt
 
         xr::Header h{};
         memcpy(&h, buf, sizeof(h));
         if (h.magic != xr::kMagic || h.version != xr::kProtoVersion) continue;
         if ((int)(sizeof(h) + h.payloadLen) > n) continue;
 
-        const uint8_t* payload = buf + sizeof(h);
+        if (h.type == xr::PT_VOICE) {
+            handleVoicePacket(buf + sizeof(h), h.payloadLen);
+            continue;
+        }
+        std::lock_guard<std::mutex> lk(g_inboxMx);
+        if (g_inbox.size() >= kInboxCap) g_inbox.pop_front();   // keep the newest
+        g_inbox.emplace_back(buf, buf + sizeof(h) + h.payloadLen);
+    }
+}
+
+void netStart() {
+    if (g_netRun.load()) return;
+    g_netRun.store(true);
+    g_netThread = std::thread(netLoop);
+}
+
+void netStop() {
+    if (!g_netRun.load()) return;
+    g_netRun.store(false);
+    if (g_netThread.joinable()) g_netThread.join();   // recvWait returns within 20 ms
+}
+
+// Main thread: dispatch what the network thread queued.
+void pumpNetwork() {
+    std::deque<std::vector<uint8_t>> batch;
+    {
+        std::lock_guard<std::mutex> lk(g_inboxMx);
+        batch.swap(g_inbox);
+    }
+    for (const auto& pkt : batch) {
+        xr::Header h{};
+        memcpy(&h, pkt.data(), sizeof(h));
+        const uint8_t* payload = pkt.data() + sizeof(h);
         g_lastRxTime = g_elapsed;
 
         switch (h.type) {
@@ -456,17 +542,14 @@ void pumpNetwork() {
                 if (h.payloadLen < sizeof(xr::LoginAckPayload)) break;
                 xr::LoginAckPayload a{};
                 memcpy(&a, payload, sizeof(a));
-                g_sessionId = a.sessionId;
+                g_sessionId.store(a.sessionId);
                 g_connected = true;
                 g_status    = "connected to " + g_sock.endpoint();
-                logMsg("connected, session %u", (unsigned)g_sessionId);
+                logMsg("connected, session %u", (unsigned)g_sessionId.load());
                 break;
             }
             case xr::PT_TRAFFIC: handleTraffic(payload, h.payloadLen); break;
             case xr::PT_TEXT:    handleText(payload, h.payloadLen);    break;
-            case xr::PT_VOICE:
-                // TODO(voice): decode the Opus frame and feed the mixer.
-                break;
             case xr::PT_PONG:    break;
             default:             break;
         }
@@ -482,6 +565,11 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
     if (!g_sock.isOpen()) return 1.0f;
 
     pumpNetwork();
+    xr::voice::tick();
+
+    // Which COM the PTT keys, published for the network thread's voice packets.
+    // audio_com_selection: 6 == COM1, 7 == COM2.
+    g_txFreqKhz.store((uint32_t)id(id(g_ref.audioComSel) == 7 ? g_ref.com2 : g_ref.com1));
 
     if (!g_connected) {
         if (g_elapsed - g_lastLogin > 2.0f) sendLogin();   // retry until acked
@@ -493,7 +581,7 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
 
     if (g_elapsed - g_lastRxTime > 12.0f) {
         g_connected = false;
-        g_sessionId = 0;
+        g_sessionId.store(0);
         g_remote.clear();
         xr::csl::removeAll();
         g_status = "lost server, retrying...";
@@ -507,9 +595,15 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
 // PTT command
 // ---------------------------------------------------------------------------
 int pttHandler(XPLMCommandRef, XPLMCommandPhase phase, void*) {
-    if (phase == xplm_CommandBegin)      g_pttDown = true;
-    else if (phase == xplm_CommandEnd)   g_pttDown = false;
-    // TODO(voice): start/stop microphone capture here.
+    bool changed = false;
+    if (phase == xplm_CommandBegin)      { g_pttDown = true;  changed = true; }
+    else if (phase == xplm_CommandEnd)   { g_pttDown = false; changed = true; }
+    if (changed) {
+        xr::voice::setTransmitting(g_pttDown);
+        // Tell the server straight away rather than at the next 5 Hz tick, so
+        // the [TX] label on our aircraft follows the key without a lag.
+        if (g_connected) sendPosition();
+    }
     return 0;   // let other plugins see it too
 }
 
@@ -550,6 +644,29 @@ void drawWindow(XPLMWindowID win, void*) {
              id(g_ref.com1) / 1000.0, id(g_ref.com2) / 1000.0,
              g_pttDown ? "** TX **" : "");
     XPLMDrawString(g_pttDown ? green : white, x, y, hdr, nullptr, xplmFont_Proportional);
+    y -= 16;
+
+    // Voice: device status, a mic meter while keyed, and who we are hearing.
+    {
+        std::string line = "Voice: " + xr::voice::status();
+        if (g_pttDown) {
+            const int bars = (int)(xr::voice::micLevel() * 10.f + 0.5f);
+            line += "   MIC [";
+            for (int i = 0; i < 10; ++i) line += (i < bars) ? '#' : '.';
+            line += "]";
+        }
+        const auto rx = xr::voice::activeSpeakers();
+        if (!rx.empty()) {
+            line += "   RX:";
+            for (uint32_t sid : rx) {
+                auto it = g_remote.find(sid);
+                line += " " + (it != g_remote.end() ? it->second.callsign : std::to_string(sid));
+            }
+        }
+        const bool ok = xr::voice::available() && xr::voice::haveMicrophone();
+        XPLMDrawString(!rx.empty() ? green : (ok ? white : amber), x, y,
+                       (char*)line.c_str(), nullptr, xplmFont_Basic);
+    }
     y -= 22;
 
     char title[96];
@@ -587,16 +704,66 @@ void drawWindow(XPLMWindowID win, void*) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// window placement
+// ---------------------------------------------------------------------------
+struct MonitorPick {
+    bool found = false;
+    int  l = 0, t = 0, r = 0, b = 0;
+};
+
+void monitorCb(int, int l, int t, int r, int b, void* refcon) {
+    MonitorPick* m = (MonitorPick*)refcon;
+    if (!m->found) { m->found = true; m->l = l; m->t = t; m->r = r; m->b = b; }
+}
+
+// X-Plane's "global desktop" spans every monitor, and its origin is the main
+// monitor's lower-left -- so on a multi-monitor Linux setup the global bounds
+// can start at a negative x, and a window placed at a fixed offset from them
+// lands off-screen. Ask which monitors X-Plane is actually using, fall back to
+// the global bounds, then clamp the result so the window is always reachable.
+void safeWindowRect(int wantW, int wantH, int offsetX,
+                    int* outL, int* outT, int* outR, int* outB) {
+    MonitorPick m;
+    XPLMGetAllMonitorBoundsGlobal(monitorCb, &m);   // full-screen monitors only
+
+    int l, t, r, b;
+    if (m.found) {
+        l = m.l; t = m.t; r = m.r; b = m.b;         // windowed mode reports none
+    } else {
+        XPLMGetScreenBoundsGlobal(&l, &t, &r, &b);
+    }
+
+    // A nonsensical or degenerate report is worse than no report at all.
+    if (r - l < 320 || t - b < 240) { l = 0; b = 0; r = 1280; t = 800; }
+
+    const int maxW = r - l - 40;
+    const int maxH = t - b - 80;
+    int w = wantW < maxW ? wantW : maxW;
+    int h = wantH < maxH ? wantH : maxH;
+    if (w < 300) w = 300;
+    if (h < 200) h = 200;
+
+    int left = l + 50 + offsetX;
+    int top  = t - 50;
+    if (left + w > r - 10) left = r - 10 - w;       // keep the right edge on screen
+    if (left < l + 10)     left = l + 10;           // ...and the left edge
+    if (top - h < b + 10)  top  = b + 10 + h;       // keep the bottom on screen
+    if (top > t - 10)      top  = t - 10;           // ...and the title bar
+
+    *outL = left; *outT = top; *outR = left + w; *outB = top - h;
+}
+
 void createWindow() {
-    int sl, st, sr, sb;
-    XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);
+    int wl, wt, wr, wb;
+    safeWindowRect(460, 400, 0, &wl, &wt, &wr, &wb);
 
     XPLMCreateWindow_t p{};
     p.structSize            = sizeof(p);
-    p.left                  = sl + 60;
-    p.top                   = st - 100;
-    p.right                 = sl + 520;
-    p.bottom                = st - 500;
+    p.left                  = wl;
+    p.top                   = wt;
+    p.right                 = wr;
+    p.bottom                = wb;
     p.visible               = 1;
     p.drawWindowFunc        = drawWindow;
     p.handleMouseClickFunc  = [](XPLMWindowID, int, int, XPLMMouseStatus, void*) { return 1; };
@@ -616,10 +783,15 @@ void createWindow() {
 
 // Drop the current session and log in again with whatever g_cfg says now.
 void reconnect() {
+    netStop();
     g_connected = false;
-    g_sessionId = 0;
+    g_sessionId.store(0);
     g_remote.clear();
     xr::csl::removeAll();
+    {
+        std::lock_guard<std::mutex> lk(g_inboxMx);
+        g_inbox.clear();
+    }
     std::string err;
     g_sock.close();
     if (!g_sock.open(g_cfg.host, (uint16_t)g_cfg.port, &err)) {
@@ -627,6 +799,7 @@ void reconnect() {
         logMsg("%s", g_status.c_str());
     } else {
         sendLogin();
+        netStart();
     }
 }
 
@@ -674,6 +847,9 @@ void openSettings() {
     g_editPort = std::to_string(g_cfg.port);
     g_focusField = 0;
     g_settingsNote.clear();
+    int l, t, r, b;
+    safeWindowRect(360, 220, 520, &l, &t, &r, &b);
+    XPLMSetWindowGeometry(g_settingsWin, l, t, r, b);
     XPLMSetWindowIsVisible(g_settingsWin, 1);
     XPLMBringWindowToFront(g_settingsWin);
     XPLMTakeKeyboardFocus(g_settingsWin);
@@ -785,15 +961,15 @@ void settingsKey(XPLMWindowID, char key, XPLMKeyFlags flags, char vk, void*, int
 }
 
 void createSettingsWindow() {
-    int sl, st, sr, sb;
-    XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);
+    int wl, wt, wr, wb;
+    safeWindowRect(360, 220, 520, &wl, &wt, &wr, &wb);   // offset clear of the main window
 
     XPLMCreateWindow_t p{};
     p.structSize            = sizeof(p);
-    p.left                  = sl + 600;
-    p.top                   = st - 100;
-    p.right                 = sl + 960;
-    p.bottom                = st - 320;
+    p.left                  = wl;
+    p.top                   = wt;
+    p.right                 = wr;
+    p.bottom                = wb;
     p.visible               = 0;
     p.drawWindowFunc        = drawSettings;
     p.handleMouseClickFunc  = settingsClick;
@@ -811,6 +987,24 @@ void createSettingsWindow() {
     XPLMSetWindowResizingLimits(g_settingsWin, 360, 220, 600, 400);
 }
 
+// Last resort if a window is dragged off-screen, or the monitor layout
+// changed while X-Plane was running.
+void resetWindowPositions() {
+    int l, t, r, b;
+    if (g_window) {
+        safeWindowRect(460, 400, 0, &l, &t, &r, &b);
+        XPLMSetWindowGeometry(g_window, l, t, r, b);
+        XPLMSetWindowIsVisible(g_window, 1);
+        XPLMBringWindowToFront(g_window);
+    }
+    if (g_settingsWin && XPLMGetWindowIsVisible(g_settingsWin)) {
+        safeWindowRect(360, 220, 520, &l, &t, &r, &b);
+        XPLMSetWindowGeometry(g_settingsWin, l, t, r, b);
+        XPLMBringWindowToFront(g_settingsWin);
+    }
+    logMsg("window positions reset");
+}
+
 void menuHandler(void*, void* item) {
     intptr_t which = (intptr_t)item;
     if (which == 0 && g_window) {
@@ -821,6 +1015,8 @@ void menuHandler(void*, void* item) {
         loadConfig();
         reconnect();
     } else if (which == 3) {
+        resetWindowPositions();
+    } else if (which == 4) {
         sendText("Hello from " + g_cfg.callsign);
     }
 }
@@ -848,6 +1044,18 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
         logMsg("3D traffic unavailable: %s", cslErr.c_str());
     }
 
+    std::string voiceErr;
+#ifdef XRADIO_NULL_AUDIO
+    const xr::voice::Mode voiceMode = xr::voice::Mode::Null;   // test builds: no hardware
+#else
+    const xr::voice::Mode voiceMode = xr::voice::Mode::Real;
+#endif
+    if (!xr::voice::init(voiceMode, &voiceErr)) {
+        logMsg("voice unavailable: %s", voiceErr.c_str());
+    } else {
+        logMsg("voice: %s", xr::voice::status().c_str());
+    }
+
     g_cmdPtt = XPLMCreateCommand("xradio/ptt", "XRadio: push to talk");
     XPLMRegisterCommandHandler(g_cmdPtt, pttHandler, 1, nullptr);
 
@@ -856,7 +1064,8 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     XPLMAppendMenuItem(g_menu, "Show / hide window",   (void*)0, 0);
     XPLMAppendMenuItem(g_menu, "Settings...",          (void*)1, 0);
     XPLMAppendMenuItem(g_menu, "Reconnect",            (void*)2, 0);
-    XPLMAppendMenuItem(g_menu, "Send test message",    (void*)3, 0);
+    XPLMAppendMenuItem(g_menu, "Reset window position", (void*)3, 0);
+    XPLMAppendMenuItem(g_menu, "Send test message",    (void*)4, 0);
 
     XPLMCreateFlightLoop_t fl{};
     fl.structSize   = sizeof(fl);
@@ -877,12 +1086,15 @@ PLUGIN_API int XPluginEnable(void) {
         logMsg("%s", g_status.c_str());
     } else {
         sendLogin();
+        netStart();
     }
     XPLMScheduleFlightLoop(g_loop, 0.2f, 1);
     return 1;
 }
 
 PLUGIN_API void XPluginDisable(void) {
+    xr::voice::setTransmitting(false);
+    netStop();
     if (g_sock.isOpen() && g_connected) {
         uint8_t buf[sizeof(xr::Header)];
         writeHeader(buf, xr::PT_LOGOUT, 0);
@@ -890,13 +1102,15 @@ PLUGIN_API void XPluginDisable(void) {
     }
     g_sock.close();
     g_connected = false;
-    g_sessionId = 0;
+    g_sessionId.store(0);
     g_remote.clear();
     xr::csl::disable();
     XPLMScheduleFlightLoop(g_loop, 0, 1);
 }
 
 PLUGIN_API void XPluginStop(void) {
+    netStop();
+    xr::voice::shutdown();
     xr::csl::shutdown();
     if (g_loop)   { XPLMDestroyFlightLoop(g_loop); g_loop = nullptr; }
     if (g_window)      { XPLMDestroyWindow(g_window);      g_window = nullptr; }

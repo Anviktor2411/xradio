@@ -1,0 +1,74 @@
+// Voice over the radio: microphone -> Opus -> network -> Opus -> speakers.
+//
+// Threads involved:
+//   * miniaudio capture thread   encodes 20 ms frames while the PTT is down
+//   * miniaudio playback thread  decodes + mixes every active speaker
+//   * the plugin's network thread moves frames to and from the server
+//   * the main thread            reads status for the window, runs tick()
+//
+// Everything crosses between them through one mutex with microsecond-sized
+// critical sections; the audio callbacks only ever try_lock so they can never
+// stall on the network side.
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace xr {
+namespace voice {
+
+// 48 kHz mono, 20 ms per frame -- Opus' native VoIP configuration.
+constexpr int kSampleRate = 48000;
+constexpr int kFrameSamples = 960;
+
+enum class Mode {
+    Real,       // open the system's default microphone and speakers
+    Null,       // miniaudio's null backend: silent devices that still run
+    NoDevices,  // codec and buffers only; tests drive the callbacks by hand
+};
+
+struct OutFrame {
+    uint16_t seq;
+    std::vector<uint8_t> opus;
+};
+
+struct Stats {
+    uint64_t framesEncoded = 0;
+    uint64_t framesReceived = 0;
+    uint64_t framesPlayed = 0;
+    uint64_t framesConcealed = 0;   // packet-loss concealment ran
+};
+
+// Opens devices and codec. On failure `err` says why and the plugin keeps
+// working without voice.
+bool init(Mode mode, std::string* err);
+void shutdown();
+bool available();       // encoder + playback ready
+bool haveMicrophone();  // capture device opened
+
+void setTransmitting(bool on);   // PTT
+bool transmitting();
+
+// A frame from another pilot, in the order the network delivered them.
+void onIncomingFrame(uint32_t sid, uint16_t seq, const uint8_t* data, int len);
+
+// Take frames the encoder has produced; the caller sends them.
+void pollOutgoing(std::vector<OutFrame>& out);
+
+// Main-thread housekeeping: forgets speakers that stopped talking.
+void tick();
+
+void  setVolume(float v);        // 0..1
+float micLevel();                // 0..1, peak of the most recent capture block
+std::vector<uint32_t> activeSpeakers();
+std::string status();            // one line for the window
+Stats stats();
+
+// Test hooks: feed the capture path and pull from the playback path directly,
+// as the audio devices would. Only meaningful in Mode::NoDevices.
+void testCapture(const int16_t* samples, int count);
+void testRender(int16_t* out, int count);
+
+}  // namespace voice
+}  // namespace xr

@@ -19,6 +19,7 @@
 #  include <fcntl.h>
 #  include <netdb.h>
 #  include <netinet/in.h>
+#  include <sys/select.h>
 #  include <sys/socket.h>
 #  include <unistd.h>
 #  define XR_INVALID (-1)
@@ -92,6 +93,7 @@ void UdpSocket::close() {
 }
 
 bool UdpSocket::send(const void* data, int len) {
+    std::lock_guard<std::mutex> lk(sendMx_);
     if (fd_ == XR_INVALID || addrLen_ == 0) return false;
     int n = (int)sendto(
 #ifdef _WIN32
@@ -101,6 +103,25 @@ bool UdpSocket::send(const void* data, int len) {
 #endif
         (const sockaddr*)addr_, (socklen_t)addrLen_);
     return n == len;
+}
+
+int UdpSocket::recvWait(void* buf, int maxLen, int timeoutMs) {
+    if (fd_ == XR_INVALID) return -1;
+    fd_set rd;
+    FD_ZERO(&rd);
+#ifdef _WIN32
+    FD_SET((SOCKET)fd_, &rd);
+    const int nfds = 0;                       // ignored on Windows
+#else
+    FD_SET((int)fd_, &rd);
+    const int nfds = (int)fd_ + 1;
+#endif
+    timeval tv;
+    tv.tv_sec  = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    const int r = select(nfds, &rd, nullptr, nullptr, &tv);
+    if (r <= 0) return r < 0 ? -1 : 0;        // error, or nothing within the timeout
+    return recv(buf, maxLen);
 }
 
 int UdpSocket::recv(void* buf, int maxLen) {

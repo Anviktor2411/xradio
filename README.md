@@ -1,7 +1,8 @@
 # XRadio
 
 A multiplayer and radio plugin for X-Plane 12. Pilots see each other in the sky
-as real aircraft (CSL models) and talk to each other on COM frequencies.
+as real aircraft (CSL models) and talk to each other by voice on the COM
+frequencies they have tuned, push-to-talk, like the real thing.
 
 Supported: **Windows, macOS (Intel + Apple Silicon), Linux**.
 
@@ -14,9 +15,14 @@ Supported: **Windows, macOS (Intel + Apple Silicon), Linux**.
   │  · reads datarefs        │ ─────────────► │  · sessions        │
   │  · sends its position    │ ◄───────────── │  · traffic at 5 Hz │
   │  · XPMP2 → CSL models    │                │  · frequency-based │
-  │  · PTT + voice (TODO)    │                │    routing         │
+  │  · PTT → Opus voice      │                │    routing         │
   └──────────────────────────┘                └────────────────────┘
 ```
+
+Voice is **[Opus](https://opus-codec.org/)** at 24 kbit/s — the codec behind
+Discord and WhatsApp calls — captured and played through
+**[miniaudio](https://miniaud.io/)**, which talks to WASAPI, CoreAudio, ALSA or
+PulseAudio at run time so the plugin has no audio library dependencies.
 
 Rendering other aircraft is handled by
 **[XPMP2](https://github.com/TwinFan/XPMP2)** — the same library LiveTraffic and
@@ -58,15 +64,32 @@ executable, so CI can point it at a real server and check what its window
 would display:
 
 ```bash
-g++ -std=c++17 -fsanitize=address,undefined \
-  -DXPLM200=1 -DXPLM210=1 -DXPLM300=1 -DXPLM301=1 -DXPLM303=1 -DXPLM400=1 -DLIN=1 \
-  -Iplugin/src -Itools/fake_sdk/XPLM -Itools/harness \
-  plugin/src/*.cpp tools/harness/xplm_stub.cpp tools/harness/main.cpp -o /tmp/harness
+cmake -B build-tests -DXRADIO_BUILD_TESTS=ON -DXRADIO_USE_XPMP2=OFF \
+      -DXPLANE_SDK=$PWD/tools/fake_sdk
+cmake --build build-tests -j
+
+./build-tests/voice_test
+./build-tests/placement_test
 
 python3 server/server.py --port 49400 &
-python3 tools/fake_client.py --port 49400 --callsign PEER01 --lat 57.86 --lon 27.03 --talk &
-/tmp/harness 127.0.0.1 49400 CIRUN
+python3 tools/fake_client.py --port 49400 --callsign PEER01 --lat 57.86 --lon 27.03 --talk --parrot &
+./build-tests/plugin_harness 127.0.0.1 49400 CIRUN
 ```
+
+The harness keys the PTT for two seconds; `--parrot` makes the peer send every
+voice frame it hears straight back, so the run proves the whole loop —
+microphone, encoder, server, decoder, mixer — end to end. It exits non-zero
+if fewer than the expected frames make it round.
+
+`tools/harness/voice_test.cpp` pushes a tone through the microphone path,
+Opus, a simulated network and the playback mixer with no audio hardware, and
+checks half-duplex muting, packet-loss concealment, sequence wrap-around and
+garbage frames.
+
+`tools/harness/placement_test.cpp` drives `XPluginStart` under several monitor
+layouts — including a second monitor to the *left* of the main one, which makes
+X-Plane's global desktop start at a negative x — and asserts both windows land
+fully on screen.
 
 `tools/harness/fuzz_server.py` is the same harness pointed at a deliberately
 hostile server that answers with truncated, inconsistent and random packets.
@@ -92,8 +115,8 @@ Requirements: git, CMake 3.16+, and a C++17 compiler
 (Windows: Visual Studio 2022 C++ tools; macOS: Xcode command line tools;
 Linux: gcc or clang).
 
-**1. Fetch dependencies.** XPMP2 bundles a complete X-Plane SDK, so this is the
-only thing you need to download:
+**1. Fetch dependencies.** XPMP2 (which bundles a complete X-Plane SDK), Opus
+and miniaudio, all into `lib/`:
 
 ```bash
 ./tools/fetch_deps.sh                                           # macOS / Linux
@@ -137,15 +160,15 @@ not `win_x64/win.xpl`. That is the SDK 3.0 rule; with the wrong name X-Plane
 skips the folder without writing anything to `Log.txt`, so it looks as though
 the plugin does not exist.
 
-### Building without 3D models
-
-To test just the networking side quickly:
+### Building with parts switched off
 
 ```bash
-cmake -B build -DXRADIO_USE_XPMP2=OFF -DXPLANE_SDK=<path to SDK>
+cmake -B build -DXRADIO_USE_XPMP2=OFF -DXPLANE_SDK=<path to SDK>   # no 3D models
+cmake -B build -DXRADIO_USE_VOICE=OFF                             # no voice
 ```
 
-Other pilots then only appear in the plugin window's list.
+Without XPMP2 other pilots only appear in the window's list; without voice the
+PTT still marks you as transmitting but nothing is sent.
 
 ## CSL models
 
@@ -184,8 +207,35 @@ actype = C172
 you as. If you edit the file by hand while X-Plane is running, pick up the
 changes with *Plugins → XRadio → Reconnect*.
 
+If a window ever ends up somewhere you cannot reach it — dragged off-screen,
+or the monitor layout changed while X-Plane was running — use
+*Plugins → XRadio → Reset window position*.
+
 **PTT key:** in X-Plane's *Keyboard* or *Joystick* settings, search for the
-command `xradio/ptt` and bind it to a key or joystick button.
+command `xradio/ptt` and bind it to a key or joystick button. Hold it to talk
+on whichever COM the audio panel has selected for transmit; release it to
+listen. Like a real radio it is half-duplex — you do not hear others while you
+are keyed.
+
+## Voice
+
+The window's `Voice:` line tells you what is going on:
+
+| shows | meaning |
+|---|---|
+| `OK  mic: <device>` | microphone and speakers opened; you are set |
+| `no microphone (receive only)` | no input device found — you can hear but not talk |
+| `no speakers` / `no audio backend` | voice is off; see `Log.txt` |
+| `MIC [######....]` | live level while the PTT is held — if this stays at dots, X-Plane is not getting your microphone |
+| `RX: SU-CBB` | who you are hearing right now |
+
+Voice uses the system default microphone and output device. Windows: check
+*Settings → System → Sound → Input* is the headset you mean. macOS: the first
+key press may trigger the microphone permission prompt; grant it and press
+again.
+
+Each transmission is Opus at 24 kbit/s — about 3 KB/s per person talking.
+A 300–3400 Hz band-pass and a faint carrier hiss give it the radio sound.
 
 ## What works today
 
@@ -200,9 +250,13 @@ command `xradio/ptt` and bind it to a key or joystick button.
   are not actually tuned to
 - Dead reckoning between the 5 Hz position updates, so other aircraft move
   smoothly instead of stepping forward five times a second
-- PTT command (currently only flags the TX state)
+- **Voice on the COM frequencies** — push-to-talk, Opus at 24 kbit/s, 20 ms
+  frames, packet-loss concealment, half-duplex, radio band-pass; runs on its
+  own network thread so audio never waits for a frame
 - In-sim settings window for server, port, callsign and aircraft type, with
   validation and immediate reconnect
+- Windows placed against the monitor X-Plane is actually using, so they do not
+  spawn off-screen on multi-monitor setups
 - Builds on Windows, macOS and Linux; CI checks all three
 
 ### Two ranges, on purpose
@@ -231,15 +285,15 @@ do not reuse it for anything sensitive.
 
 ## Roadmap
 
-1. **Voice** — microphone capture (miniaudio), Opus at 48 kHz mono in 20 ms
-   frames, jitter buffer, mixing multiple speakers. Hooks in the code are
-   marked `TODO(voice)`.
-2. **Radio effects** — carrier noise, dropouts with distance, a "blocked"
-   signal when two people transmit at once.
+1. **Microphone and output device selection** in the settings window, plus a
+   volume slider — right now it is the system default device.
+2. **Radio effects** — signal fading towards the edge of range, a "blocked"
+   squeal when two people transmit at once.
 3. **Text chat input field** in the window (receive-only for now).
 4. **Smarter smoothing** — dead reckoning is in, but interpolating between two
    buffered samples would handle turns better than extrapolating from one.
 
 ## License
 
-MIT — see `LICENSE`. XPMP2 is MIT and Opus is BSD, so both are compatible.
+MIT — see `LICENSE`. XPMP2 is MIT, Opus is BSD-3 and miniaudio is public
+domain / MIT-0, so all are compatible.

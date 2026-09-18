@@ -19,6 +19,11 @@ void click(int id, int x, int y);
 void typeText(int id, const std::string& text);
 void pressVk(int id, int vk);
 void windowTop(int id, int* top, int* left);
+void windowRect(int id, int* l, int* t, int* r, int* b);
+void resetWindows();
+void setScreen(int l, int t, int r, int b);
+void clearMonitors();
+void addMonitor(int l, int t, int r, int b);
 
 bool drawnContains(const std::vector<std::string>& lines, const std::string& needle);
 const std::vector<std::string>& log();

@@ -44,6 +44,8 @@ def run(args):
     print(f"logged in as {args.callsign}, sid={sid}")
 
     stop = threading.Event()
+    voice_rx = [0]
+    voice_tx = [0]
 
     def receiver():
         while not stop.is_set():
@@ -73,6 +75,19 @@ def run(args):
                 text = payload[P.TEXT_HDR.size:P.TEXT_HDR.size + tlen]
                 print(f"  [{freq / 1000:.3f}] {P.cstr(frm)}: "
                       f"{text.decode('utf-8', 'replace')}")
+            elif ptype == P.PT_VOICE:
+                freq, from_sid, seq, olen = P.VOICE_HDR.unpack_from(payload, 0)
+                opus = payload[P.VOICE_HDR.size:P.VOICE_HDR.size + olen]
+                voice_rx[0] += 1
+                if voice_rx[0] == 1 or voice_rx[0] % 50 == 0:
+                    print(f"  voice: {voice_rx[0]} frames from sid {from_sid} "
+                          f"on {freq / 1000:.3f} ({olen} bytes)", flush=True)
+                if args.parrot and opus:
+                    # Send the same frame back as our own transmission, so a
+                    # client can test its whole receive path against itself.
+                    voice_tx[0] += 1
+                    sock.sendto(P.pack(P.PT_VOICE, sid, P.VOICE_HDR.pack(
+                        args.com1, sid, voice_tx[0] & 0xFFFF, len(opus)) + opus), dest)
 
     threading.Thread(target=receiver, daemon=True).start()
 
@@ -127,4 +142,6 @@ if __name__ == "__main__":
     ap.add_argument("--speed-kt", type=float, default=110.0)
     ap.add_argument("--com1", type=int, default=122800, help="kHz, e.g. 122800")
     ap.add_argument("--talk", action="store_true", help="send a text message every 5 s")
+    ap.add_argument("--parrot", action="store_true",
+                    help="re-transmit any voice frames received, for loopback tests")
     run(ap.parse_args())
