@@ -204,4 +204,12 @@ if(XRADIO_BUILD_TESTS)
     xradio_test_exe(plugin_harness tools/harness/main.cpp)
     xradio_test_exe(placement_test tools/harness/placement_test.cpp)
     xradio_test_exe(voice_test     tools/harness/voice_test.cpp)
+
+    # Pure maths, no plugin sources needed.
+    add_executable(smoothing_test tools/harness/smoothing_test.cpp)
+    target_include_directories(smoothing_test PRIVATE plugin/src)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(smoothing_test PRIVATE -g -O1 -fsanitize=address,undefined)
+        target_link_options(smoothing_test    PRIVATE -fsanitize=address,undefined)
+    endif()
 endif()

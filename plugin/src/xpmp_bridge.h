@@ -26,6 +26,9 @@ struct RemoteState {
     uint8_t     lights   = 0;     // xr::LT_* bits
     bool        onGround = false;
     bool        txActive = false;
+    uint32_t    timeMs   = 0;     // sender's clock, for interpolation
+    float       track    = 0.f;   // degrees true, direction of travel
+    float       vsFps    = 0.f;   // vertical speed, ft/s
 };
 
 namespace csl {

@@ -11,7 +11,7 @@ namespace xr {
 
 // "XRC1" as little-endian bytes.
 static const uint32_t kMagic       = 0x31435258u;
-static const uint16_t kProtoVersion = 1;
+static const uint16_t kProtoVersion = 2;   // v2: timestamped positions, track, vertical speed
 
 enum PacketType : uint8_t {
     PT_LOGIN     = 1,  // client -> server
@@ -62,11 +62,11 @@ struct LoginAckPayload {     // 8 bytes
 };
 
 // State of our own aircraft, sent to the server.
-struct PositionPayload {     // 56 bytes
+struct PositionPayload {     // 68 bytes
     double   lat;            // degrees
     double   lon;            // degrees
     float    altMslM;        // metres MSL
-    float    headingTrue;    // degrees
+    float    headingTrue;    // degrees, where the nose points
     float    pitch;          // degrees
     float    roll;           // degrees
     float    gsMs;           // ground speed, m/s
@@ -78,10 +78,15 @@ struct PositionPayload {     // 56 bytes
     uint8_t  onGround;
     uint8_t  txRadio;        // TxRadio
     uint8_t  rxMask;         // RX_* bits
+    // v2: lets receivers interpolate in the sender's own timeline, so the
+    // relay's timing cannot make the aircraft stutter.
+    uint32_t timeMs;         // sender's clock, ms, wraps freely
+    float    trackTrue;      // degrees, direction of travel (differs from heading in wind)
+    float    vsMs;           // vertical speed, m/s, up positive
 };
 
 // One other aircraft, as the server sees it.
-struct TrafficEntry {        // 76 bytes
+struct TrafficEntry {        // 88 bytes
     uint32_t sessionId;
     char     callsign[16];
     char     acIcao[8];
@@ -98,6 +103,9 @@ struct TrafficEntry {        // 76 bytes
     uint8_t  onGround;
     uint8_t  txActive;       // 1 while this aircraft is keying a radio we hear
     uint8_t  reserved;
+    uint32_t timeMs;         // the sender's timestamp, passed through untouched
+    float    trackTrue;
+    float    vsMs;
 };
 
 struct TrafficHeader {       // 4 bytes, followed by `count` TrafficEntry

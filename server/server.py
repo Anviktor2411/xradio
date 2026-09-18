@@ -23,11 +23,13 @@ import protocol as P
 LOG = logging.getLogger("xradio")
 
 # --- tuning knobs -----------------------------------------------------------
-TRAFFIC_HZ = 5.0            # traffic broadcast rate
+TRAFFIC_HZ = 10.0           # traffic broadcast rate: twice the clients' report rate, so
+                            # every report is forwarded within 100 ms instead of being
+                            # sampled by a second 5 Hz clock (which duplicates and skips)
 TRAFFIC_RANGE_NM = 80.0     # how far away other aircraft are still sent
 SESSION_TIMEOUT_S = 15.0    # drop a client we have not heard from
 TX_HOLD_S = 0.4             # how long txActive stays set after the last voice frame
-MAX_ENTRIES_PER_PACKET = 16  # 16 * 76 + 16 < 1400 bytes
+MAX_ENTRIES_PER_PACKET = 15  # 15 * 88 + 16 < 1400 bytes
 MAX_TEXT_BYTES = 200        # cap relayed text so one client cannot spam huge frames
 MAX_VOICE_BYTES = 512       # one 20 ms Opus frame at 24 kbit/s is ~60 bytes
 
@@ -57,6 +59,9 @@ class Session:
     last_voice: float = 0.0
     has_position: bool = False
     voice_seq_out: int = field(default=0)
+    time_ms: int = 0            # the client's own timestamp, relayed untouched
+    track: float = 0.0
+    vs_ms: float = 0.0
 
     @property
     def alt_ft(self) -> float:
@@ -203,7 +208,8 @@ class XRadioServer(asyncio.DatagramProtocol):
             return
         (lat, lon, alt_m, heading, pitch, roll, gs_ms,
          gear, flap, com1, com2,
-         lights, on_ground, tx_radio, rx_mask) = P.POSITION.unpack_from(payload, 0)
+         lights, on_ground, tx_radio, rx_mask,
+         time_ms, track, vs_ms) = P.POSITION.unpack_from(payload, 0)
 
         # A client can send anything. NaN or a wild coordinate would be relayed
         # to everyone else and poison their renderer, and it breaks the
@@ -214,7 +220,10 @@ class XRadioServer(asyncio.DatagramProtocol):
             return
         if not (math.isfinite(alt_m) and -1000.0 <= alt_m <= 40000.0):
             return
-        if not all(math.isfinite(v) for v in (heading, pitch, roll, gs_ms, gear, flap)):
+        if not all(math.isfinite(v) for v in (heading, pitch, roll, gs_ms, gear, flap,
+                                              track, vs_ms)):
+            return
+        if not -200.0 <= vs_ms <= 200.0:
             return
         if not 0.0 <= gs_ms <= 1500.0:
             return
@@ -228,6 +237,7 @@ class XRadioServer(asyncio.DatagramProtocol):
         s.com1, s.com2 = com1, com2
         s.lights, s.on_ground = lights, on_ground
         s.tx_radio, s.rx_mask = tx_radio, rx_mask
+        s.time_ms, s.track, s.vs_ms = time_ms, track % 360.0, vs_ms
         s.has_position = True
 
     def _on_text(self, s: Session, payload):
@@ -337,7 +347,8 @@ class XRadioServer(asyncio.DatagramProtocol):
                 o.sid, P.pad(o.callsign, 16), P.pad(o.ac_icao, 8),
                 o.lat, o.lon, o.alt_m, o.heading, o.pitch, o.roll,
                 o.gs_ms, o.gear, o.flap,
-                o.lights, o.on_ground, tx_active, 0))
+                o.lights, o.on_ground, tx_active, 0,
+                o.time_ms, o.track, o.vs_ms))
         self._send(me.addr, P.PT_TRAFFIC, me.sid, b"".join(parts))
 
 

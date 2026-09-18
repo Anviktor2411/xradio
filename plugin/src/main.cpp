@@ -23,6 +23,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
@@ -137,7 +138,7 @@ void loadConfig() {
 // datarefs
 // ---------------------------------------------------------------------------
 struct Refs {
-    XPLMDataRef lat, lon, elev, psi, theta, phi, gs;
+    XPLMDataRef lat, lon, elev, psi, theta, phi, gs, hpath, vh;
     XPLMDataRef gear, flap, onGround;
     XPLMDataRef com1, com2, audioComSel, rxCom1, rxCom2;
     XPLMDataRef ltNav, ltBeacon, ltStrobe, ltLanding, ltTaxi;
@@ -166,6 +167,8 @@ void findRefs() {
     g_ref.theta    = findRef("sim/flightmodel/position/theta");
     g_ref.phi      = findRef("sim/flightmodel/position/phi");
     g_ref.gs       = findRef("sim/flightmodel/position/groundspeed");
+    g_ref.hpath    = findRef("sim/flightmodel/position/hpath");    // ground track, deg true
+    g_ref.vh       = findRef("sim/flightmodel/position/vh_ind");   // vertical speed, m/s
     g_ref.gear     = findRef("sim/flightmodel2/gear/deploy_ratio");
     g_ref.flap     = findRef("sim/cockpit2/controls/flap_ratio");
     g_ref.onGround = findRef("sim/flightmodel/failures/onground_any");
@@ -198,6 +201,14 @@ float firstOfArray(XPLMDataRef r) {
     float v = 0.f;
     if (XPLMGetDatavf(r, &v, 0, 1) < 1) return 0.f;
     return v;
+}
+
+// Sender-side timestamp for position reports. Only differences matter, so a
+// steady clock since plugin start, wrapped into 32 bits, is all we need.
+uint32_t nowMs() {
+    static const auto t0 = std::chrono::steady_clock::now();
+    return (uint32_t)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0).count();
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +313,13 @@ void sendPosition() {
     if (rx == 0) rx = xr::RX_COM1;        // some aircraft do not wire the audio panel
     p.rxMask = rx;
 
+    p.timeMs    = nowMs();
+    // Track is where we are going; heading is where the nose points. They
+    // differ in a crosswind, and receivers extrapolate along track. Fall
+    // back to heading if the sim does not expose the path.
+    p.trackTrue = g_ref.hpath ? fd(g_ref.hpath) : p.headingTrue;
+    p.vsMs      = fd(g_ref.vh);
+
     uint8_t buf[sizeof(xr::Header) + sizeof(p)];
     int off = writeHeader(buf, xr::PT_POSITION, sizeof(p));
     memcpy(buf + off, &p, sizeof(p));
@@ -338,6 +356,8 @@ bool sane(const xr::TrafficEntry& e) {
         !std::isfinite(e.roll))                                   return false;
     if (!std::isfinite(e.gsMs) || e.gsMs < 0.f || e.gsMs > 1500.f) return false;
     if (!std::isfinite(e.gearRatio) || !std::isfinite(e.flapRatio)) return false;
+    if (!std::isfinite(e.trackTrue) || !std::isfinite(e.vsMs) ||
+        e.vsMs < -200.f || e.vsMs > 200.f)                        return false;
     return true;
 }
 
@@ -408,6 +428,9 @@ void handleTraffic(const uint8_t* payload, int len) {
         st.lights   = r.lights;
         st.onGround = r.onGround != 0;
         st.txActive = r.txActive != 0;
+        st.timeMs   = e.timeMs;
+        st.track    = e.trackTrue;
+        st.vsFps    = e.vsMs * 3.28084f;
         xr::csl::upsert(st);
     }
 
@@ -557,8 +580,14 @@ void pumpNetwork() {
 }
 
 // ---------------------------------------------------------------------------
-// flight loop -- runs on the main thread, 5 Hz
+// flight loop -- runs on the main thread, every frame
 // ---------------------------------------------------------------------------
+// Receiving happens every frame so a report reaches the renderer the moment
+// it arrives; draining at 5 Hz would add up to 200 ms of latency on top of
+// the network's, and a jittery 200 ms at that. Sending stays at 5 Hz.
+const float kSendIntervalS = 0.2f;
+float g_lastSend = -99.f;
+
 float flightLoop(float elapsedSinceLast, float, int, void*) {
     g_elapsed += elapsedSinceLast;
 
@@ -573,11 +602,14 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
 
     if (!g_connected) {
         if (g_elapsed - g_lastLogin > 2.0f) sendLogin();   // retry until acked
-        return 0.2f;
+        return -1.0f;
     }
 
     // the server drops us after 15 s of silence, so position doubles as keepalive
-    sendPosition();
+    if (g_elapsed - g_lastSend >= kSendIntervalS) {
+        sendPosition();
+        g_lastSend = g_elapsed;
+    }
 
     if (g_elapsed - g_lastRxTime > 12.0f) {
         g_connected = false;
@@ -588,7 +620,7 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
         logMsg("server went quiet, re-logging in");
     }
 
-    return 0.2f;
+    return -1.0f;   // every frame
 }
 
 // ---------------------------------------------------------------------------
@@ -1088,7 +1120,7 @@ PLUGIN_API int XPluginEnable(void) {
         sendLogin();
         netStart();
     }
-    XPLMScheduleFlightLoop(g_loop, 0.2f, 1);
+    XPLMScheduleFlightLoop(g_loop, -1.0f, 1);   // every frame
     return 1;
 }
 

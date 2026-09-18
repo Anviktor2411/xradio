@@ -7,7 +7,7 @@ means no alignment padding, which matches #pragma pack(1) on the C++ side).
 import struct
 
 MAGIC = 0x31435258  # b"XRC1" little-endian
-PROTO_VERSION = 1
+PROTO_VERSION = 2   # v2: timestamped positions, track, vertical speed
 
 # packet types
 PT_LOGIN = 1
@@ -28,17 +28,17 @@ MAX_PACKET = 1400
 HEADER = struct.Struct("<IBBHI")          # magic, type, version, payloadLen, sessionId
 LOGIN = struct.Struct("<16s8sHH")         # callsign, acIcao, protoVer, reserved
 LOGIN_ACK = struct.Struct("<II")          # sessionId, serverTimeMs
-POSITION = struct.Struct("<2d7f2I4B")     # see PositionPayload
+POSITION = struct.Struct("<2d7f2I4BI2f")  # see PositionPayload
 TRAFFIC_HDR = struct.Struct("<HH")        # count, reserved
-TRAFFIC_ENTRY = struct.Struct("<I16s8s2d7f4B")
+TRAFFIC_ENTRY = struct.Struct("<I16s8s2d7f4BI2f")
 TEXT_HDR = struct.Struct("<II16sH")       # freqKhz, fromSession, from, textLen
 VOICE_HDR = struct.Struct("<IIHH")        # freqKhz, fromSession, seq, opusLen
 
 # Sanity: these sizes are asserted against the C++ structs in tools/check_sizes.py
 assert HEADER.size == 12
 assert LOGIN.size == 28
-assert POSITION.size == 56
-assert TRAFFIC_ENTRY.size == 76
+assert POSITION.size == 68
+assert TRAFFIC_ENTRY.size == 88
 
 
 def pack(ptype: int, session_id: int, payload: bytes = b"") -> bytes:

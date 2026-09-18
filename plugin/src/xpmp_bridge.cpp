@@ -2,6 +2,7 @@
 
 #include "xpmp_bridge.h"
 #include "protocol.h"
+#include "smoothing.h"
 
 #include "XPLMUtilities.h"
 
@@ -76,52 +77,31 @@ public:
         strncpy(acInfoTexts.icaoAcType, icaoType.c_str(), sizeof(acInfoTexts.icaoAcType) - 1);
     }
 
-    // Last state received from the server.
+    // Last state received from the server (configuration, lights, labels).
     RemoteState st;
 
-    // Dead reckoning: positions arrive at 5 Hz but this is called every drawn
-    // frame, so without extrapolation other aircraft visibly step forward 5
-    // times a second. We advance along the last known velocity vector and
-    // stop extrapolating if the updates dry up, so a dropped connection
-    // freezes the aircraft instead of flying it off across the scenery.
-    float sinceNet   = 0.f;   // seconds since the last network update
-    float vsFtPerSec = 0.f;   // vertical speed, derived from successive alts
-    bool  haveVs     = false;
-
-    static constexpr float kMaxExtrapolationS = 2.0f;
+    // Position and attitude come from the smoother, which interpolates in
+    // the sender's own timeline. See smoothing.h for why: drawing reports as
+    // they arrive, or dead-reckoning from each one, stutters.
+    Smoother smoother;
 
     void ApplyNetworkUpdate(const RemoteState& s) {
-        if (sinceNet > 0.01f && sinceNet < kMaxExtrapolationS) {
-            vsFtPerSec = (s.altFt - st.altFt) / sinceNet;
-            haveVs = true;
-        }
         st = s;
-        sinceNet = 0.f;
+        PoseSample ps;
+        ps.lat = s.lat;   ps.lon = s.lon;   ps.altFt = s.altFt;
+        ps.heading = s.heading; ps.pitch = s.pitch; ps.roll = s.roll;
+        ps.track = s.track; ps.gsKt = s.gsKt; ps.vsFps = s.vsFps;
+        smoother.push(s.timeMs, ps);
     }
 
     // XPMP2 calls this once per drawn frame.
     void UpdatePosition(float elapsedSinceLastCall, int) override {
-        sinceNet += elapsedSinceLastCall;
-        const float dt = std::min(sinceNet, kMaxExtrapolationS);
+        const Pose p = smoother.sample(elapsedSinceLastCall);
 
-        double lat = st.lat, lon = st.lon;
-        float  alt = st.altFt;
-
-        if (st.gsKt > 1.f) {
-            const double distM  = (double)st.gsKt * 0.514444 * dt;
-            const double hdgRad = (double)st.heading * M_PI / 180.0;
-            const double cosLat = cos(st.lat * M_PI / 180.0);
-            lat += (distM * cos(hdgRad)) / 111320.0;
-            if (fabs(cosLat) > 1e-6) {
-                lon += (distM * sin(hdgRad)) / (111320.0 * cosLat);
-            }
-            if (haveVs && !st.onGround) alt += vsFtPerSec * dt;
-        }
-
-        SetLocation(lat, lon, alt, st.onGround);
-        drawInfo.pitch   = st.pitch;
-        drawInfo.roll    = st.roll;
-        drawInfo.heading = st.heading;
+        SetLocation(p.lat, p.lon, p.altFt, st.onGround);
+        drawInfo.pitch   = p.pitch;
+        drawInfo.roll    = p.roll;
+        drawInfo.heading = p.heading;
 
         SetGearRatio(st.gear);
         SetFlapRatio(st.flap);
@@ -239,8 +219,7 @@ void upsert(const RemoteState& s) {
     if (it == g_planes.end()) {
         try {
             auto ac = std::make_unique<XRAircraft>(s.acIcao, s.callsign, modeSFor(s.sid));
-            ac->st = s;             // seed directly: no previous sample to derive from
-            ac->sinceNet = 0.f;
+            ac->ApplyNetworkUpdate(s);
             g_planes[s.sid] = std::move(ac);
             logMsg("added %s (%s) sid=%u", s.callsign.c_str(), s.acIcao.c_str(),
                    (unsigned)s.sid);

@@ -30,6 +30,11 @@ xPilot use. It takes care of loading CSL models, the X-Plane instancing API,
 the TCAS override and the map layer, and it already runs on all three
 platforms.
 
+Other aircraft are **interpolated in the sender's own timeline** rather than
+drawn as reports arrive — see `plugin/src/smoothing.h`. Each position report
+carries the sender's timestamp, and receivers render a fixed 350 ms behind the
+newest one. Network and relay timing then cannot affect the motion at all.
+
 The wire protocol is packed binary UDP, little-endian. It is defined in two
 places and the two **must stay in sync**:
 
@@ -80,6 +85,12 @@ The harness keys the PTT for two seconds; `--parrot` makes the peer send every
 voice frame it hears straight back, so the run proves the whole loop —
 microphone, encoder, server, decoder, mixer — end to end. It exits non-zero
 if fewer than the expected frames make it round.
+
+`tools/harness/smoothing_test.cpp` flies a simulated aircraft through a turn,
+pushes its reports through a relay that samples on its own clock (duplicating
+and skipping some) and a jittery network, renders at 60 fps, and asserts the
+motion never runs backwards or jumps. It runs the previous dead-reckoning
+approach through the same scenario first, to prove the test catches the bug.
 
 `tools/harness/voice_test.cpp` pushes a tone through the microphone path,
 Opus, a simulated network and the playback mixer with no audio hardware, and
@@ -186,6 +197,13 @@ Each package root needs an `xsb_aircraft.txt`. A free, open set is
 common types. When no model matches, XPMP2 falls back to the `actype` from
 `xradio.cfg`.
 
+## Protocol versions
+
+The header carries a version and the server rejects anything that does not
+match, so **all pilots and the server must run the same build**. v2 added the
+position timestamp, ground track and vertical speed that the smoothing needs;
+a v1 client gets no error beyond being ignored.
+
 ## Configuration
 
 Easiest way: **Plugins → XRadio → Settings...** in the sim. Click a field,
@@ -248,8 +266,9 @@ A 300–3400 Hz band-pass and a faint carrier hiss give it the radio sound.
 - Text messages routed by frequency and VHF line-of-sight range, without
   needing the PTT held; the server rejects transmissions on a frequency you
   are not actually tuned to
-- Dead reckoning between the 5 Hz position updates, so other aircraft move
-  smoothly instead of stepping forward five times a second
+- **Smooth motion** — positions are timestamped at the sender and interpolated
+  350 ms behind, so other aircraft move continuously regardless of network
+  jitter or relay timing; extrapolation covers a short dropout, then it holds
 - **Voice on the COM frequencies** — push-to-talk, Opus at 24 kbit/s, 20 ms
   frames, packet-loss concealment, half-duplex, radio band-pass; runs on its
   own network thread so audio never waits for a frame
@@ -290,8 +309,9 @@ do not reuse it for anything sensitive.
 2. **Radio effects** — signal fading towards the edge of range, a "blocked"
    squeal when two people transmit at once.
 3. **Text chat input field** in the window (receive-only for now).
-4. **Smarter smoothing** — dead reckoning is in, but interpolating between two
-   buffered samples would handle turns better than extrapolating from one.
+4. **Bandwidth** — traffic is relayed at 10 Hz to every client in range;
+   scaling past a couple of dozen pilots wants per-client rate limiting by
+   distance.
 
 ## License
 

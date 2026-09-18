@@ -59,7 +59,9 @@ class Client:
                                 P.POSITION.pack(
                                     self.lat, self.lon, self.alt_ft / 3.28084,
                                     90.0, 0.0, 0.0, 60.0, 0.0, 0.0,
-                                    self.com1, self.com2, 0, 0, tx, rx)), self.dest)
+                                    self.com1, self.com2, 0, 0, tx, rx,
+                                    int(time.monotonic() * 1000) & 0xFFFFFFFF, 90.0, 0.0)),
+                         self.dest)
 
     def text(self, msg, freq, sid=None):
         b = msg.encode()
@@ -132,8 +134,8 @@ def run():
 
     print("\nwire format")
     check("C++/Python struct sizes agree", all([
-        P.HEADER.size == 12, P.LOGIN.size == 28, P.POSITION.size == 56,
-        P.TRAFFIC_ENTRY.size == 76, P.TEXT_HDR.size == 26, P.VOICE_HDR.size == 12,
+        P.HEADER.size == 12, P.LOGIN.size == 28, P.POSITION.size == 68,
+        P.TRAFFIC_ENTRY.size == 88, P.TEXT_HDR.size == 26, P.VOICE_HDR.size == 12,
     ]))
     check("bad magic is rejected",
           P.unpack_header(struct.pack("<IBBHI", 0xDEADBEEF, 1, 1, 0, 0)) is None)
@@ -165,6 +167,35 @@ def run():
     check("A does not see itself", seen is not None and "ESNA12" not in seen, str(seen))
     check("traffic beyond 80 nm is filtered out",
           seen is not None and "ESFAR1" not in seen, str(seen))
+
+    print("\nv2 fields are relayed untouched")
+    stamp = 123456789
+    while b.recv(P.PT_TRAFFIC, 0.05) is not None:   # drain the 10 Hz backlog first
+        pass
+    a.sock.sendto(P.pack(P.PT_POSITION, a.sid, P.POSITION.pack(
+        a.lat, a.lon, a.alt_ft / 3.28084, 90.0, 0.0, 0.0, 60.0, 0.0, 0.0,
+        a.com1, 0, 0, 0, P.TX_NONE, P.RX_COM1, stamp, 123.5, -2.5)), a.dest)
+    pump(0.4)
+    relayed = None
+    for _ in range(30):
+        payload = b.recv(P.PT_TRAFFIC)
+        if payload is None:
+            break
+        count, _ = P.TRAFFIC_HDR.unpack_from(payload, 0)
+        # NB: not `off` -- that is the name of one of the clients above.
+        pos = P.TRAFFIC_HDR.size
+        for _ in range(count):
+            e = P.TRAFFIC_ENTRY.unpack_from(payload, pos)
+            pos += P.TRAFFIC_ENTRY.size
+            if P.cstr(e[1]) == "ESNA12":
+                relayed = e
+        if relayed and relayed[16] == stamp:
+            break
+    check("sender timestamp arrives at the peer unchanged",
+          relayed is not None and relayed[16] == stamp,
+          str(relayed[16] if relayed else None))
+    check("track and vertical speed arrive too",
+          relayed is not None and abs(relayed[17] - 123.5) < 0.01 and abs(relayed[18] + 2.5) < 0.01)
 
     print("\ntext routing")
     for c in (a, b, far, off, mid):
@@ -229,7 +260,7 @@ def run():
     ]:
         bad.sock.sendto(P.pack(P.PT_POSITION, bad.sid, P.POSITION.pack(
             lat, lon, alt, 90.0, 0.0, 0.0, gs, 0.0, 0.0,
-            FREQ, 0, 0, 0, P.TX_NONE, P.RX_COM1)), bad.dest)
+            FREQ, 0, 0, 0, P.TX_NONE, P.RX_COM1, 0, 90.0, 0.0)), bad.dest)
     pump(0.4)
     now_lat = next((x.lat for x in srv.sessions.values() if x.callsign == "ESBAD1"), None)
     check("implausible position reports are rejected",
@@ -239,7 +270,7 @@ def run():
     # gear/flap outside 0..1 get clamped rather than relayed raw
     bad.sock.sendto(P.pack(P.PT_POSITION, bad.sid, P.POSITION.pack(
         57.85, 27.02, 900.0, 90.0, 0.0, 0.0, 60.0, 9.0, -4.0,
-        FREQ, 0, 0, 0, P.TX_NONE, P.RX_COM1)), bad.dest)
+        FREQ, 0, 0, 0, P.TX_NONE, P.RX_COM1, 0, 90.0, 0.0)), bad.dest)
     pump(0.3)
     sess = next((x for x in srv.sessions.values() if x.callsign == "ESBAD1"), None)
     check("gear and flap ratios are clamped to 0..1",

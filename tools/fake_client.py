@@ -67,7 +67,7 @@ def run(args):
                     e = P.TRAFFIC_ENTRY.unpack_from(payload, off)
                     off += P.TRAFFIC_ENTRY.size
                     names.append(f"{P.cstr(e[1])}@{e[5] * 3.28084:.0f}ft"
-                                 + ("[TX]" if e[-2] else ""))
+                                 + ("[TX]" if e[14] else ""))
                 if names:
                     print(f"  traffic: {', '.join(names)}")
             elif ptype == P.PT_TEXT:
@@ -111,7 +111,10 @@ def run(args):
                 0,                                          # lights
                 0,                                          # onGround
                 P.TX_COM1 if args.talk else P.TX_NONE,      # txRadio
-                P.RX_COM1)), dest)                          # rxMask
+                P.RX_COM1,                                  # rxMask
+                int(time.monotonic() * 1000) & 0xFFFFFFFF,  # timeMs
+                args.heading,                               # trackTrue
+                0.0)), dest)                                # vsMs
 
             # Text names its own frequency and does not need the PTT held.
             if args.talk and time.time() >= next_text:
