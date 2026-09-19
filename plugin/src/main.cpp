@@ -1007,7 +1007,8 @@ void drainKeys() {
         }
         g_ui.pushKey(k.ch, k.vk);
     }
-    g_keyQueue.erase(g_keyQueue.begin(), g_keyQueue.begin() + (long)taken);
+    g_keyQueue.erase(g_keyQueue.begin(),
+                     g_keyQueue.begin() + (std::ptrdiff_t)taken);
 }
 
 void drawSettings(XPLMWindowID win, void*) {

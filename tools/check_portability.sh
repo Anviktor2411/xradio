@@ -49,7 +49,46 @@ else
     ok "no variable-length arrays"
 fi
 
-# 4. min/max as bare macros break under <windows.h>; we define NOMINMAX, but
+# 4. Windows APIs whose declaration lives in a header nobody remembers to
+#    include. These compile everywhere else because the code sits inside
+#    #ifdef _WIN32 and the other platforms never look at it -- so the mistake
+#    survives Linux and macOS and only breaks the Windows build, ten minutes
+#    in. SIO_UDP_CONNRESET did exactly that: it is in <mstcpip.h>, not
+#    <winsock2.h>, and the run failed with "undeclared identifier".
+#
+#    One line per symbol: <symbol> <header that declares it>
+win_needs='
+SIO_UDP_CONNRESET mstcpip.h
+SIO_LOOPBACK_FAST_PATH mstcpip.h
+WSAIoctl winsock2.h
+WSAStartup winsock2.h
+closesocket winsock2.h
+ioctlsocket winsock2.h
+getnameinfo ws2tcpip.h
+getaddrinfo ws2tcpip.h
+freeaddrinfo ws2tcpip.h
+inet_ntop ws2tcpip.h
+NI_MAXHOST ws2tcpip.h
+NI_MAXSERV ws2tcpip.h
+IP_MULTICAST_TTL ws2tcpip.h
+'
+win_bad=""
+while read -r sym hdr; do
+    [ -z "$sym" ] && continue
+    for f in $(grep -lw "$sym" $SOURCES 2>/dev/null); do
+        # Only files that compile Windows-specific code can be at fault.
+        grep -q "_WIN32" "$f" || continue
+        grep -q "#  *include <$hdr>" "$f" || win_bad="$win_bad
+          $f uses $sym but does not include <$hdr>"
+    done
+done <<< "$win_needs"
+if [ -n "$win_bad" ]; then
+    report "Windows API used without the header that declares it:$win_bad"
+else
+    ok "Windows APIs have their declaring headers"
+fi
+
+# 5. min/max as bare macros break under <windows.h>; we define NOMINMAX, but
 #    catch anyone reaching for the C++ versions without <algorithm>.
 algo_bad=""
 for f in $(grep -l 'std::min\|std::max' $SOURCES 2>/dev/null); do

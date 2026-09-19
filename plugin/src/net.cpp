@@ -9,6 +9,10 @@
 #  endif
 #  include <winsock2.h>
 #  include <ws2tcpip.h>
+   // SIO_UDP_CONNRESET lives here, not in winsock2.h. Leaving it out compiles
+   // fine everywhere except MSVC, which is exactly the kind of mistake
+   // tools/check_portability.sh now looks for.
+#  include <mstcpip.h>
    typedef int socklen_t;
 #  define XR_INVALID (-1)
 #  define XR_CLOSE(f) closesocket((SOCKET)(f))
@@ -223,10 +227,12 @@ bool UdpServerSocket::open(uint16_t port, const std::string& bindAddr, std::stri
     // A client that has gone away makes Windows report the earlier sendto as
     // ECONNRESET on the *next* recvfrom, which would look like a dead socket.
     // Switching this off keeps one lost client from stopping the server.
+#  ifdef SIO_UDP_CONNRESET
     DWORD off = 0;
     DWORD ret = 0;
     WSAIoctl((SOCKET)f, SIO_UDP_CONNRESET, &off, sizeof(off), nullptr, 0, &ret,
              nullptr, nullptr);
+#  endif
 #else
     int flags = fcntl((int)f, F_GETFL, 0);
     fcntl((int)f, F_SETFL, flags | O_NONBLOCK);

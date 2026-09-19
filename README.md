@@ -104,15 +104,26 @@ machine without Python:
 ## Tests
 
 ```bash
-./tools/check_portability.sh          # instant: MSVC-only pitfalls
+bash tools/check_portability.sh       # instant: MSVC-only pitfalls
+bash tools/check_windows_build.sh     # ~20s: compile everything for Windows
 python3 tools/test_server.py          # server: protocol and routing
 ```
 
 `check_portability.sh` catches the mistakes that pass on Linux and macOS and
 fail on Windows ten minutes later — `M_PI` (POSIX, not standard C++, and MSVC
 only defines it when `_USE_MATH_DEFINES` precedes `<cmath>`), unguarded POSIX
-headers, variable-length arrays, `std::min` without `<algorithm>`. Use
-`xr::kPi` from `plugin/src/mathconst.h` rather than `M_PI`.
+headers, variable-length arrays, `std::min` without `<algorithm>`, and a
+Win32 symbol used without the header that declares it. Use `xr::kPi` from
+`plugin/src/mathconst.h` rather than `M_PI`.
+
+`check_windows_build.sh` goes further and actually compiles every source file
+for Windows with MinGW, from Linux, in about twenty seconds. Code inside
+`#ifdef _WIN32` is invisible to the Linux and macOS compilers, so a missing
+header there passes two of the three CI jobs and fails the third ten minutes
+in — `SIO_UDP_CONNRESET` is declared in `<mstcpip.h>`, not `<winsock2.h>`,
+and that is exactly how it was found. MinGW is not MSVC and will not catch
+everything, but it compiles the Windows branches against real Windows
+headers, which is where that whole class of mistake lives.
 
 Starts a real server on a spare port and drives it over real UDP, covering the
 wire format, login, traffic filtering, frequency and range routing, hostile
