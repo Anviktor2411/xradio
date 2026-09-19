@@ -334,8 +334,8 @@ server, port, callsign or aircraft type causes a reconnect.
 | Microphone / Output | pick a device, or leave empty for the system default |
 | Volume | incoming radio volume |
 | Hear own voice | sidetone: hear yourself while keyed, like a real headset |
-| Carrier hiss | background noise while someone is transmitting; 0 for clean audio |
-| Radio filter | the 300–3400 Hz band-pass that makes it sound like a radio |
+| Radio noise | scales every bit of noise the radio makes: the faint floor under a strong signal, the hiss that grows towards the horizon, the squelch bursts. 0 for none |
+| Radio sound | the whole VHF radio character — limiter, overdrive, squelch, 300–2700 Hz filter, distance fading, the blocked squeal. Off = clean audio |
 
 The audio tab also shows a live mic level meter and the voice status line, so
 you can hold the PTT and confirm the right microphone is being heard before
@@ -421,7 +421,38 @@ key press may trigger the microphone permission prompt; grant it and press
 again.
 
 Each transmission is Opus at 24 kbit/s — about 3 KB/s per person talking.
-A 300–3400 Hz band-pass and a faint carrier hiss give it the radio sound.
+
+### The radio sound
+
+A band-pass on its own sounds like a telephone. What makes a COM radio sound
+like one is the rest of the chain, so all of it is modelled on the receiving
+side, in the order the real signal goes through it (`plugin/src/voice.cpp`,
+`struct Radio`):
+
+| stage | what it does |
+|---|---|
+| transmitter | a modulation limiter squashes every syllable to the same level, then a soft overdrive adds the crunch that consonants get when a voice over-modulates |
+| channel | noise that rises as the other aircraft nears the VHF horizon; near it the audio breaks up, whole 20 ms frames going missing; two people keying at once produce the beating heterodyne squeal |
+| receiver | the squelch opens with a click and a burst of noise, closes with a longer burst and a click once the carrier drops; a 4th-order 300–2700 Hz audio filter; an output stage that cannot be driven past two thirds of full scale, whatever comes in |
+
+Distance comes from the same VHF horizon the server uses to route
+transmissions (`1.23 × (√h₁ + √h₂)` nm): a signal is clean to about half of
+it, then degrades to nothing at the horizon, where the server stops relaying
+it anyway. Someone the traffic list does not know about counts as strong.
+
+To hear it without X-Plane, `tools/harness/radio_demo.cpp` renders a WAV
+through the real pipeline — microphone path, Opus, the radio — and writes
+four versions: clean, a strong signal, one from the horizon, and two people
+transmitting at once:
+
+```bash
+./build-tests/radio_demo call.wav out      # out_clean.wav, out_strong.wav, ...
+```
+
+`tools/harness/voice_test.cpp` pins each of these down: the filter's cut-off,
+the limiter bringing 24 dB of input spread to under 8 dB, the squelch
+bursts and the silence after them, the noise rising with distance, the
+dropouts, the squeal, and the output ceiling.
 
 ## What works today
 

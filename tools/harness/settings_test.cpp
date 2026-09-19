@@ -243,7 +243,7 @@ int main() {
         check("a toggle renders", shows(lines, "[x]") || shows(lines, "[ ]"));
         check("buttons are drawn", shows(lines, "Save & apply") && shows(lines, "Cancel"));
         check("audio fields are NOT on the connection tab",
-              !shows(lines, "Microphone") && !shows(lines, "Carrier hiss"));
+              !shows(lines, "Microphone") && !shows(lines, "Radio noise"));
         if (failures) dump(lines);
 
         printf("\ntabs\n");
@@ -254,7 +254,7 @@ int main() {
             harness::click(kWin, tx + 10, ty);
             auto audio = draw();
             check("clicking it switches tab",
-                  shows(audio, "Microphone") && shows(audio, "Carrier hiss") &&
+                  shows(audio, "Microphone") && shows(audio, "Radio noise") &&
                   shows(audio, "Volume"));
             check("connection fields are gone", !shows(audio, "Server host"));
             check("the mic meter is on the audio tab", shows(audio, "Mic level"));
@@ -266,7 +266,7 @@ int main() {
             check("traffic tab shows its fields",
                   shows(traffic, "Draw other aircraft") && shows(traffic, "Label range") &&
                   shows(traffic, "Traffic range"));
-            check("audio fields are gone", !shows(traffic, "Carrier hiss"));
+            check("audio fields are gone", !shows(traffic, "Radio noise"));
             if (failures) dump(traffic);
         }
 

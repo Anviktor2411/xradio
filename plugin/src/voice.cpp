@@ -32,6 +32,7 @@ const std::string& currentOutput() { return g_none; }
 void setSidetone(bool) {}
 void setHiss(float) {}
 void setRadioFilter(bool) {}
+void setSignalQuality(uint32_t, float) {}
 void shutdown() {}
 bool available() { return false; }
 bool haveMicrophone() { return false; }
@@ -108,6 +109,7 @@ struct Speaker {
     uint16_t                         lastSeq = 0;
     bool                             haveSeq = false;
     bool                             playing = false;
+    bool                             dropped = false;   // this frame lost to fading
     int                              concealed = 0;
     std::chrono::steady_clock::time_point lastRx;
 
@@ -150,8 +152,20 @@ std::vector<DevEntry> g_capDevs, g_playDevs;
 std::deque<int16_t> g_sidechain;
 constexpr size_t kSidechainMax = 48000 / 2;      // half a second
 
-// --- the "radio" sound: 300-3400 Hz band-pass ------------------------------
-// Two second-order sections (RBJ cookbook), state kept on the playback thread.
+// --- the sound of a VHF radio ----------------------------------------------
+// A band-pass on its own sounds like a telephone. What makes a COM radio
+// sound like one is everything else in the chain, so all of it is modelled,
+// in the order the real signal goes through it:
+//
+//   transmitter  the modulation limiter squashes every syllable to the same
+//                level, and over-modulation gives consonants their crunch
+//   channel      noise that rises as the other aircraft nears the horizon,
+//                the audio breaking up out there, and the heterodyne squeal
+//                when two people key at once
+//   receiver     the squelch opening with a click, closing with a burst of
+//                noise, and the narrow 300-2700 Hz audio filter
+//
+// All of it runs on the playback thread, per sample, with no allocation.
 struct Biquad {
     float b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
     float z1 = 0, z2 = 0;
@@ -161,34 +175,137 @@ struct Biquad {
         z2 = b2 * x - a2 * y;
         return y;
     }
+    void reset() { z1 = z2 = 0.f; }
 };
 
-Biquad g_hp, g_lp;
-
-void designHighpass(Biquad& q, float fc) {
+void designHighpass(Biquad& q, float fc, float Q) {
     const float w = 2.f * (float)kPi * fc / (float)kSampleRate;
-    const float c = cosf(w), s = sinf(w), alpha = s / (2.f * 0.7071f);
+    const float c = cosf(w), s = sinf(w), alpha = s / (2.f * Q);
     const float a0 = 1.f + alpha;
     q.b0 = (1.f + c) / 2.f / a0; q.b1 = -(1.f + c) / a0; q.b2 = (1.f + c) / 2.f / a0;
     q.a1 = -2.f * c / a0;        q.a2 = (1.f - alpha) / a0;
 }
 
-void designLowpass(Biquad& q, float fc) {
+void designLowpass(Biquad& q, float fc, float Q) {
     const float w = 2.f * (float)kPi * fc / (float)kSampleRate;
-    const float c = cosf(w), s = sinf(w), alpha = s / (2.f * 0.7071f);
+    const float c = cosf(w), s = sinf(w), alpha = s / (2.f * Q);
     const float a0 = 1.f + alpha;
     q.b0 = (1.f - c) / 2.f / a0; q.b1 = (1.f - c) / a0; q.b2 = (1.f - c) / 2.f / a0;
     q.a1 = -2.f * c / a0;        q.a2 = (1.f - alpha) / a0;
 }
 
-uint32_t g_noise = 0x12345678u;
-inline float hiss() {
-    // cheap white noise: the carrier you hear when a squelch opens
-    const float level = g_hiss.load();
-    if (level <= 0.f) return 0.f;
-    g_noise = g_noise * 1664525u + 1013904223u;
-    return ((float)(g_noise >> 16) / 32768.f - 1.f) * 320.f * level;
+// Levels are in int16 units. The hiss setting (0..1) scales the noise ones.
+constexpr float kLimThreshold = 2000.f;   // -24 dBFS: everything above comes out the same
+constexpr float kLimMakeup    = 9.f;
+constexpr float kDrive        = 1.3f;     // into the overdrive
+constexpr float kClipLevel    = 20000.f;  // the overdrive's ceiling
+constexpr float kAudioMax     = 24000.f;  // the receiver's audio stage: nothing louder
+
+// Cubic soft clipper: unity gain for small signals, a gentle bend towards
+// `level`, and never above it. The bend is what adds the harmonics that
+// make an over-modulated voice sound the way it does.
+inline float softClip(float x, float level) {
+    const float full = level * 1.5f;
+    float s = x / full;
+    if (s > 1.f) s = 1.f; else if (s < -1.f) s = -1.f;
+    return (s - s * s * s / 3.f) * full;
 }
+// The noise is white before the 300-2700 Hz filter, which keeps about a
+// tenth of it, so what comes out is ~15 dB below these figures. At the
+// default noise setting (0.35) that puts a strong signal 50 dB under the
+// speech, one at the horizon about 15 dB under it -- readable, noisy -- and
+// at the full setting 6 dB, which is a proper weak-signal struggle.
+constexpr float kNoiseStrong  = 250.f;
+constexpr float kNoiseWeak    = 13700.f;
+constexpr float kNoiseBurst   = 16000.f;  // squelch opening and closing
+constexpr float kHetAmp       = 4000.f;   // two carriers on one frequency
+constexpr float kClickAmp     = 14000.f;
+constexpr int   kClickLen     = 96;       // 2 ms step, the filter turns it into a click
+constexpr int   kOpenBurst    = 960;      // 20 ms of noise as the squelch opens
+constexpr int   kCloseTail    = 5280;     // 110 ms of noise after the carrier drops
+constexpr int   kSettle       = 1440;     // 30 ms: let the filters ring down
+
+struct Radio {
+    Biquad hp1, hp2, lp1, lp2;            // 4th order each side
+    float  env = 0.f;                     // limiter envelope
+    bool   open = false;                  // squelch state
+    int    burst = 0, tail = 0, click = 0, settle = 0;
+    float  clickSign = 1.f;
+    float  hetPhase = 0.f, wobble = 0.f;
+    uint32_t noise = 0x12345678u;
+
+    void design() {
+        // Butterworth pair for a 4th-order slope: 24 dB/octave.
+        designHighpass(hp1, 300.f, 0.5412f);
+        designHighpass(hp2, 300.f, 1.3066f);
+        designLowpass(lp1, 2700.f, 0.5412f);
+        designLowpass(lp2, 2700.f, 1.3066f);
+    }
+
+    float white() {
+        noise = noise * 1664525u + 1013904223u;
+        return (float)(noise >> 16) / 32768.f - 1.f;
+    }
+
+    // The transmitter: modulation limiter, then overdrive. Speech only.
+    float transmitter(float x) {
+        const float a = x < 0.f ? -x : x;
+        // ~1 ms attack, ~120 ms release
+        env += (a > env ? 0.02f : 0.00017f) * (a - env);
+        const float g = env > kLimThreshold ? kLimThreshold / env : 1.f;
+        return softClip(x * g * kLimMakeup * kDrive, kClipLevel);
+    }
+
+    float filter(float x) { return lp2.run(lp1.run(hp2.run(hp1.run(x)))); }
+
+    // The audio amplifier at the end of the chain. Speech is already held
+    // down by the overdrive, but click + noise + squeal on top of it could
+    // still add up past full scale; this keeps the sum inside kAudioMax.
+    static float amplifier(float x) { return softClip(x, kAudioMax); }
+
+    // Called once per callback with what the mixer found.
+    void gate(bool carrier) {
+        if (carrier && !open)  { open = true;  burst = kOpenBurst; click = kClickLen; clickSign = 1.f; }
+        if (!carrier && open)  { open = false; tail = kCloseTail; }
+        if (carrier || tail || burst || click) settle = kSettle;
+    }
+    bool active() const { return open || tail > 0 || burst > 0 || click > 0 || settle > 0; }
+
+    // One output sample. `speech` is the mixed, already-transmitter-processed
+    // voice (0 when nobody is talking), `quality` the best signal among the
+    // carriers (1 next door, 0 at the horizon), `carriers` how many.
+    float receiver(float speech, bool carrier, int carriers, float quality, float hiss) {
+        float noiseAmp = 0.f;
+        if (tail > 0) {
+            noiseAmp = hiss * kNoiseBurst;
+            if (--tail == 0) { click = kClickLen; clickSign = -1.f; }
+        } else if (carrier) {
+            const float w = 1.f - quality;
+            noiseAmp = hiss * (kNoiseStrong + (kNoiseWeak - kNoiseStrong) * w);
+            if (burst > 0) { noiseAmp = noiseAmp > hiss * kNoiseBurst ? noiseAmp : hiss * kNoiseBurst; --burst; }
+        }
+        float x = carrier ? speech : 0.f;
+        if (noiseAmp > 0.f) x += white() * noiseAmp;
+
+        if (carrier && carriers >= 2) {
+            // Two AM carriers a little apart beat against each other.
+            wobble += 2.f * (float)kPi * 0.6f / (float)kSampleRate;
+            if (wobble > 2.f * (float)kPi) wobble -= 2.f * (float)kPi;
+            const float f = 1300.f + 250.f * sinf(wobble);
+            hetPhase += 2.f * (float)kPi * f / (float)kSampleRate;
+            if (hetPhase > 2.f * (float)kPi) hetPhase -= 2.f * (float)kPi;
+            x += kHetAmp * sinf(hetPhase);
+        }
+        if (click > 0) {
+            x += clickSign * kClickAmp * (float)click / (float)kClickLen;
+            --click;
+        }
+        if (settle > 0 && !carrier && tail == 0 && burst == 0 && click == 0) --settle;
+        return amplifier(filter(x));
+    }
+};
+
+Radio g_radio;
 
 void captureCb(ma_device*, void*, const void* in, ma_uint32 n);
 void playbackCb(ma_device*, void* out, const void*, ma_uint32 n);
@@ -254,19 +371,33 @@ bool refill(Speaker& sp) {
     return true;
 }
 
+// Per-speaker signal quality from the main thread: distance against the VHF
+// horizon. Sessions come and go, so entries older than a while are dropped.
+struct Quality { float q; std::chrono::steady_clock::time_point at; };
+std::map<uint32_t, Quality> g_quality;          // guarded by g_mx
+
+float qualityOf(uint32_t sid) {
+    auto it = g_quality.find(sid);
+    return it == g_quality.end() ? 1.f : it->second.q;
+}
+
 void render(int16_t* out, int count) {
     memset(out, 0, sizeof(int16_t) * (size_t)count);
+    const float vol  = g_volume.load();
+    const bool  fx   = g_filter.load();
+    const float hiss = g_hiss.load();
 
-    // Half duplex: while keyed you hear only your own sidetone, if enabled.
+    // Half duplex: while keyed you hear only your own sidetone, if enabled --
+    // through the transmitter and the audio filter, as a headset would.
     if (g_tx.load()) {
         if (!g_sidetone.load()) return;
         std::unique_lock<std::mutex> lk(g_mx, std::try_to_lock);
         if (!lk.owns_lock()) return;
-        const float vol = g_volume.load() * 0.5f;      // quieter than incoming
         for (int i = 0; i < count && !g_sidechain.empty(); ++i) {
-            float v = (float)g_sidechain.front() * vol;
+            float v = (float)g_sidechain.front();
             g_sidechain.pop_front();
-            if (g_filter.load()) v = g_lp.run(g_hp.run(v));
+            if (fx) v = Radio::amplifier(g_radio.filter(g_radio.transmitter(v)));
+            v *= vol * 0.5f;                         // quieter than incoming
             out[i] = (int16_t)(v > 32767.f ? 32767.f : (v < -32768.f ? -32768.f : v));
         }
         return;
@@ -275,9 +406,10 @@ void render(int16_t* out, int count) {
     std::unique_lock<std::mutex> lk(g_mx, std::try_to_lock);
     if (!lk.owns_lock()) return;                 // never stall the audio thread
 
-    static std::vector<int32_t> mix;
-    mix.assign((size_t)count, 0);
-    bool anyone = false;
+    static std::vector<float> mix;
+    mix.assign((size_t)count, 0.f);
+    int   carriers = 0;
+    float best = 0.f;                            // strongest signal among them
 
     for (auto& kv : g_speakers) {
         Speaker& sp = *kv.second;
@@ -285,24 +417,46 @@ void render(int16_t* out, int count) {
             if ((int)sp.packets.size() < kPrebuffer) continue;
             sp.playing = true;
         }
+        const float q = qualityOf(kv.first);
+        bool contributed = false;
         for (int i = 0; i < count; ++i) {
-            if (sp.pcmPos >= sp.pcm.size() && !refill(sp)) break;
-            mix[(size_t)i] += sp.pcm[sp.pcmPos++];
+            if (sp.pcmPos >= sp.pcm.size()) {
+                if (!refill(sp)) break;
+                // Near the horizon the audio breaks up: whole 20 ms frames
+                // go missing, more of them the further away they are.
+                if (fx && q < 0.4f) {
+                    g_radio.noise = g_radio.noise * 1664525u + 1013904223u;
+                    const float roll = (float)(g_radio.noise >> 16) / 65536.f;
+                    sp.dropped = roll < (0.4f - q) / 0.4f * 0.7f;
+                } else {
+                    sp.dropped = false;
+                }
+            }
+            const float smp = sp.dropped ? 0.f : (float)sp.pcm[sp.pcmPos];
+            ++sp.pcmPos;
+            mix[(size_t)i] += smp;
+            contributed = true;
         }
-        anyone = true;
+        if (contributed) { ++carriers; if (q > best) best = q; }
     }
     lk.unlock();
 
-    if (!anyone) return;
-    const float vol = g_volume.load();
-    const bool filt = g_filter.load();
+    const bool carrier = carriers > 0;
+    if (!fx) {
+        if (!carrier) return;
+        for (int i = 0; i < count; ++i) {
+            float v = mix[(size_t)i] * vol;
+            out[i] = (int16_t)(v > 32767.f ? 32767.f : (v < -32768.f ? -32768.f : v));
+        }
+        return;
+    }
+
+    g_radio.gate(carrier);
+    if (!g_radio.active()) return;               // silence, and the filters stay put
     for (int i = 0; i < count; ++i) {
-        float v = (float)mix[(size_t)i] + hiss();
-        if (filt) v = g_lp.run(g_hp.run(v));
-        v *= vol;
-        if (v > 32767.f) v = 32767.f;
-        if (v < -32768.f) v = -32768.f;
-        out[i] = (int16_t)v;
+        const float speech = carrier ? g_radio.transmitter(mix[(size_t)i]) : 0.f;
+        float v = g_radio.receiver(speech, carrier, carriers, best, hiss) * vol;
+        out[i] = (int16_t)(v > 32767.f ? 32767.f : (v < -32768.f ? -32768.f : v));
     }
 }
 
@@ -398,8 +552,8 @@ bool init(Mode mode, std::string* err) {
     opus_encoder_ctl(g_enc, OPUS_SET_INBAND_FEC(0));
     opus_encoder_ctl(g_enc, OPUS_SET_DTX(0));
 
-    designHighpass(g_hp, 300.f);
-    designLowpass(g_lp, 3400.f);
+    g_radio = Radio();
+    g_radio.design();
 
     if (mode == Mode::NoDevices) {
         g_status = "codec only";
@@ -466,6 +620,7 @@ void shutdown() {
     if (g_enc)    { opus_encoder_destroy(g_enc); g_enc = nullptr; }
     std::lock_guard<std::mutex> lk(g_mx);
     g_speakers.clear();
+    g_quality.clear();
     g_out.clear();
     g_sidechain.clear();
     g_capDevs.clear();
@@ -518,6 +673,13 @@ void pollOutgoing(std::vector<OutFrame>& out) {
 void tick() {
     const auto now = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lk(g_mx);
+    for (auto it = g_quality.begin(); it != g_quality.end();) {
+        if (std::chrono::duration<float>(now - it->second.at).count() > 10.f) {
+            it = g_quality.erase(it);
+        } else {
+            ++it;
+        }
+    }
     for (auto it = g_speakers.begin(); it != g_speakers.end();) {
         const float age = std::chrono::duration<float>(now - it->second->lastRx).count();
         if (age > kSpeakerTimeoutS && it->second->packets.empty()) {
@@ -537,6 +699,11 @@ void  setSidetone(bool on) {
     }
 }
 void  setHiss(float level)     { g_hiss.store(level < 0.f ? 0.f : (level > 1.f ? 1.f : level)); }
+void  setSignalQuality(uint32_t sid, float q) {
+    q = q < 0.f ? 0.f : (q > 1.f ? 1.f : q);
+    std::lock_guard<std::mutex> lk(g_mx);
+    g_quality[sid] = {q, std::chrono::steady_clock::now()};
+}
 void  setRadioFilter(bool on)  { g_filter.store(on); }
 float micLevel()         { return g_micLevel.load(); }
 

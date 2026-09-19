@@ -230,6 +230,8 @@ if(XRADIO_BUILD_TESTS)
     xradio_test_exe(voice_test     tools/harness/voice_test.cpp)
     xradio_test_exe(settings_test  tools/harness/settings_test.cpp)
     xradio_test_exe(hosting_test   tools/harness/hosting_test.cpp)
+    # Not a test: renders a WAV through the radio chain so it can be listened to.
+    xradio_test_exe(radio_demo     tools/harness/radio_demo.cpp)
 
     # Pure maths, no plugin sources needed.
     add_executable(smoothing_test tools/harness/smoothing_test.cpp)
