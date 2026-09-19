@@ -27,12 +27,20 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Fetch dependencies
-        run: ./tools/fetch_deps.sh
+        run: bash tools/fetch_deps.sh
 
       # Instant, and catches the one-platform-only mistakes (MSVC and M_PI,
       # POSIX headers, VLAs) before ten minutes of compiling finds them.
       - name: Portability checks
-        run: ./tools/check_portability.sh
+        run: bash tools/check_portability.sh
+
+      # The Windows build is the one that breaks, because code inside
+      # #ifdef _WIN32 is invisible to the other two compilers. Compiling it
+      # here, on Linux, finds that in twenty seconds instead of ten minutes.
+      - name: The plugin compiles for Windows
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq mingw-w64
+          bash tools/check_windows_build.sh
 
       - name: Server protocol and routing tests
         run: python3 tools/test_server.py
@@ -67,6 +75,18 @@ jobs:
       - name: Window placement across monitor layouts
         run: ASAN_OPTIONS=detect_leaks=0 ./build-tests/placement_test
 
+      - name: Settings window (config file, tabs, every widget)
+        run: ASAN_OPTIONS=detect_leaks=0 ./build-tests/settings_test
+
+      - name: Hosting (plugin runs the server, a real peer joins it)
+        run: ASAN_OPTIONS=detect_leaks=0 ./build-tests/hosting_test 49640
+
+      # Two relay servers, one protocol. This drives the same scenarios at
+      # both over real UDP and diffs the transcripts, so a validation rule
+      # fixed in one and forgotten in the other fails here.
+      - name: The Python and built-in servers behave identically
+        run: python3 tools/test_server_parity.py --cpp ./build-tests/xradio_server
+
       - name: Plugin talks to a real server, voice round trip via a peer
         run: |
           python3 server/server.py --port 49400 > /tmp/srv.log 2>&1 &
@@ -78,6 +98,20 @@ jobs:
           echo "--- server ---"; grep -E "login|voice|text" /tmp/srv.log || true
           echo "--- peer ---";   grep -E "voice" /tmp/peer.log || true
           kill %1 %2 2>/dev/null || true
+
+      # Hosting puts this server on a pilot's home connection, so it gets the
+      # same treatment the client gets: malformed packets under ASan/UBSan.
+      - name: Hosted server survives a hostile client
+        run: |
+          ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 \
+            ./build-tests/xradio_server 49402 > /tmp/hostsrv.log 2>&1 &
+          sleep 1
+          python3 tools/harness/fuzz_client.py --port 49402
+          kill %1 2>/dev/null || true
+          if grep -qiE "ERROR|runtime error" /tmp/hostsrv.log; then
+            echo "sanitizer findings:"; cat /tmp/hostsrv.log; exit 1
+          fi
+          echo "no sanitizer findings"
 
       - name: Plugin survives a hostile server
         run: |
@@ -111,11 +145,11 @@ jobs:
 
       - name: Portability checks
         shell: bash
-        run: ./tools/check_portability.sh
+        run: bash tools/check_portability.sh
 
       - name: Fetch dependencies
         shell: bash
-        run: ./tools/fetch_deps.sh
+        run: bash tools/fetch_deps.sh
 
       - name: Configure
         shell: bash
@@ -138,6 +172,15 @@ jobs:
           mkdir -p dist
           cp -r build/XRadio dist/XRadio
           cp README.md LICENSE dist/XRadio/
+          # The standalone relay server, for anyone who wants one running
+          # without X-Plane open. Hosting from inside the sim needs none of
+          # this -- it is here for a machine that should stay up.
+          mkdir -p dist/XRadio/server/${{ matrix.platdir }}
+          for p in build/xradio_server build/xradio_server.exe \
+                   build/Release/xradio_server.exe build/Release/xradio_server; do
+            if [ -f "$p" ]; then cp "$p" dist/XRadio/server/${{ matrix.platdir }}/; fi
+          done
+          cp server/server.py server/protocol.py dist/XRadio/server/
           mkdir -p dist/XRadio/Resources/CSL
           cat > dist/XRadio/Resources/CSL/README.txt <<'EOF'
           CSL models go here
