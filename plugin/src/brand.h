@@ -14,7 +14,7 @@
 namespace xr {
 namespace brand {
 
-inline const char* version() { return "0.1.5"; }
+inline const char* version() { return "0.5.1"; }
 
 // Width of one character of the fixed-pitch font, asked of X-Plane once.
 inline int charWidth() {
@@ -27,7 +27,7 @@ inline int charWidth() {
     return w;
 }
 
-// Draws `)))  XRadio  v0.1.5` at (x, y). Returns the height it used, so the
+// Draws `)))  XRadio  v0.5.1` at (x, y). Returns the height it used, so the
 // caller can move its cursor down by exactly that much.
 inline int draw(int x, int y, bool withTagline = false) {
     float amber[] = {1.f, 0.72f, 0.13f};
