@@ -6,6 +6,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <string>
 
@@ -44,5 +45,56 @@ private:
     unsigned char addr_[128] = {0};
     int addrLen_ = 0;
 };
+
+// Who a datagram came from. Opaque bytes so this header stays free of
+// platform sockets; compare and copy it, do not look inside.
+struct Peer {
+    unsigned char addr[128] = {0};
+    int           len = 0;
+
+    bool operator==(const Peer& o) const {
+        return len == o.len && memcmp(addr, o.addr, (size_t)len) == 0;
+    }
+    bool operator<(const Peer& o) const {      // so it can key a std::map
+        if (len != o.len) return len < o.len;
+        return memcmp(addr, o.addr, (size_t)len) < 0;
+    }
+    std::string text() const;                  // "1.2.3.4:49100", for logs
+};
+
+// A bound UDP socket: receives from anyone, replies to a specific peer.
+// This is what the built-in server listens on, so a pilot can host a
+// flight without installing anything.
+class UdpServerSocket {
+public:
+    UdpServerSocket() = default;
+    ~UdpServerSocket();
+    UdpServerSocket(const UdpServerSocket&) = delete;
+    UdpServerSocket& operator=(const UdpServerSocket&) = delete;
+
+    // Binds `port` on every interface. `bindAddr` empty means 0.0.0.0.
+    bool open(uint16_t port, const std::string& bindAddr, std::string* err);
+    void close();
+    bool isOpen() const { return fd_ >= 0; }
+
+    // Waits up to timeoutMs. Returns bytes read, 0 on timeout, -1 on error.
+    int recvFrom(void* buf, int maxLen, Peer* from, int timeoutMs);
+    bool sendTo(const Peer& to, const void* data, int len);
+
+    uint16_t boundPort() const { return port_; }
+
+private:
+#ifdef _WIN32
+    long long fd_ = -1;
+#else
+    int fd_ = -1;
+#endif
+    uint16_t   port_ = 0;
+    std::mutex sendMx_;
+};
+
+// Best guess at this machine's address on the local network, for the
+// "tell your friends to type this" line. Empty if it cannot be worked out.
+std::string localAddress();
 
 }  // namespace xr

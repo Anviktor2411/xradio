@@ -6,18 +6,55 @@ frequencies they have tuned, push-to-talk, like the real thing.
 
 Supported: **Windows, macOS (Intel + Apple Silicon), Linux**.
 
+## Flying together
+
+Nobody has to set a server up.
+
+One of you opens **Plugins → XRadio → Settings → Hosting**, ticks *Host a
+flight here* and saves. The plugin starts the relay server itself, connects
+to it, asks the router to open the port, and then shows the address to pass
+on:
+
+```
+  Running on port 49100  ·  1 connected
+  Friends type:  81.90.144.12:49100
+  Router opened the port (Livebox)
+  Here now: ESNA12
+```
+
+Everyone else puts that address into **Settings → Connection** and saves.
+That is the whole procedure — no VPS, no Python, no terminal, and nothing to
+configure on anyone's router.
+
+If the router will not open the port, the window says so instead of leaving
+you guessing, and people on the same network as the host can still join using
+the host's local address. A dedicated server is still the better answer for a
+group that wants to fly without waiting for one particular person to be
+online — see [Running a dedicated server](#running-a-dedicated-server).
+
 ## Architecture
 
 ```
-  X-Plane 12                                  your server
-  ┌──────────────────────────┐                ┌────────────────────┐
-  │  XRadio plugin (C++)     │  UDP :49100    │  server.py         │
-  │  · reads datarefs        │ ─────────────► │  · sessions        │
-  │  · sends its position    │ ◄───────────── │  · traffic at 5 Hz │
-  │  · XPMP2 → CSL models    │                │  · frequency-based │
-  │  · PTT → Opus voice      │                │    routing         │
-  └──────────────────────────┘                └────────────────────┘
+  the host's X-Plane                          everyone else
+  ┌──────────────────────────┐                ┌──────────────────────────┐
+  │  XRadio plugin (C++)     │                │  XRadio plugin           │
+  │  · reads datarefs        │                │                          │
+  │  · sends its position    │                │                          │
+  │  · XPMP2 → CSL models    │                │                          │
+  │  · PTT → Opus voice      │                │                          │
+  │  ─────────────────────   │   UDP :49100   │                          │
+  │  relay server (thread)   │ ◄───────────── │                          │
+  │  · sessions              │ ─────────────► │                          │
+  │  · traffic at 10 Hz      │                │                          │
+  │  · frequency routing     │                │                          │
+  └──────────────────────────┘                └──────────────────────────┘
 ```
+
+The relay server exists twice, on purpose: `plugin/src/server.cpp` is the one
+built into the plugin, and `server/server.py` is the same thing for a machine
+that should stay up without X-Plane running. They speak one protocol, so a
+difference between them is a bug — `tools/test_server_parity.py` drives the
+same scenarios at both over real UDP and fails if the transcripts differ.
 
 Voice is **[Opus](https://opus-codec.org/)** at 24 kbit/s — the codec behind
 Discord and WhatsApp calls — captured and played through
@@ -43,7 +80,11 @@ places and the two **must stay in sync**:
 
 `tools/check_sizes.cpp` verifies that the struct sizes match.
 
-## Running the server
+## Running a dedicated server
+
+Only worth it if you want a server that is up whether or not any particular
+person is flying. For an evening with friends, hosting from inside the sim is
+simpler and does the same job.
 
 ```bash
 cd server
@@ -52,6 +93,13 @@ python3 server.py --host 0.0.0.0 --port 49100 -v
 
 No dependencies beyond Python 3.10+. Open **UDP** port 49100 in your firewall.
 A systemd unit is provided in `server/xradio.service`.
+
+The release package also carries the same server as a compiled binary, for a
+machine without Python:
+
+```bash
+./server/lin_x64/xradio_server 49100        # or win_x64\ , mac_x64/
+```
 
 ## Tests
 
@@ -83,6 +131,11 @@ cmake --build build-tests -j
 ./build-tests/voice_test
 ./build-tests/placement_test
 ./build-tests/settings_test
+./build-tests/hosting_test
+python3 tools/test_server_parity.py
+
+./build-tests/xradio_server 49700 &
+python3 tools/harness/fuzz_client.py --port 49700
 
 python3 server/server.py --port 49400 &
 python3 tools/fake_client.py --port 49400 --callsign PEER01 --lat 57.86 --lon 27.03 --talk --parrot &
@@ -113,10 +166,32 @@ things that are easy to get wrong and impossible to see — that a burst of
 keystrokes arriving in one frame all land in the field that was focused when
 each was typed, and that Enter saves the character typed just before it.
 
+`tools/harness/hosting_test.cpp` is the hosting feature end to end: it ticks
+*Host a flight here* in the settings window, waits for the plugin's own client
+to connect to its own server, then opens a real UDP socket and joins as a
+second pilot. It checks that each sees the other's aircraft, that text
+reaches both ways through the hosted server, that the Hosting tab reports the
+truth, and that unticking the box really does stop the server and refuse new
+joins.
+
+`tools/test_server_parity.py` is a differential test between the two server
+implementations. It starts a fresh Python server and a fresh C++ server for
+each of eight scenarios, drives identical traffic at them over real UDP, and
+compares what the clients receive. Every position-validation rule is probed
+with its own timestamped report, so dropping one rule from one server shows
+up as a state the watching client should never have seen.
+
 `tools/harness/placement_test.cpp` drives `XPluginStart` under several monitor
 layouts — including a second monitor to the *left* of the main one, which makes
 X-Plane's global desktop start at a negative x — and asserts both windows land
 fully on screen.
+
+`tools/harness/fuzz_client.py` is the mirror image, and it matters more now
+that hosting puts the server on a pilot's home connection: it throws ~11,000
+malformed, truncated, length-lying and outright random datagrams at the
+server while a real session runs alongside, then checks the server is still
+answering and still accepting new pilots. Run against the ASan build, one
+out-of-bounds read stops it with a stack trace.
 
 `tools/harness/fuzz_server.py` is the same harness pointed at a deliberately
 hostile server that answers with truncated, inconsistent and random packets.
@@ -255,6 +330,14 @@ The audio tab also shows a live mic level meter and the voice status line, so
 you can hold the PTT and confirm the right microphone is being heard before
 you go looking for someone to talk to.
 
+**Hosting**
+
+| setting | what it does |
+|---|---|
+| Host a flight here | run the relay server inside the plugin. Your own aircraft connects to it, so the Connection tab is ignored while this is on |
+| Port to host on | the UDP port friends connect to. 49100 unless something else is using it |
+| Ask the router to open it | UPnP: opens the port automatically so nobody touches a router config page. Off if you have forwarded the port yourself, or if your router's UPnP is switched off |
+
 **Traffic**
 
 | setting | what it does |
@@ -287,6 +370,10 @@ showtraffic = yes
 showlabels = yes
 labeldist = 20
 range = 80
+
+hosting = no
+hostport = 49100
+hostupnp = yes
 ```
 
 Out-of-range numbers are clamped to the limits above rather than rejected, and
@@ -342,10 +429,13 @@ A 300–3400 Hz band-pass and a faint carrier hiss give it the radio sound.
 - **Voice on the COM frequencies** — push-to-talk, Opus at 24 kbit/s, 20 ms
   frames, packet-loss concealment, half-duplex, radio band-pass; runs on its
   own network thread so audio never waits for a frame
+- **Hosting from inside the sim** — one pilot ticks a box and the plugin runs
+  the relay server itself, opens the router port over UPnP and shows the
+  address to share; no VPS, Python or terminal for anyone
 - **Tabbed in-sim settings window** — connection, audio (device pickers,
-  volume, sidetone, hiss, radio filter, live mic meter) and traffic (models,
-  labels, ranges) — with validation, live mic level, and changes applied
-  without a restart
+  volume, sidetone, hiss, radio filter, live mic meter), traffic (models,
+  labels, ranges) and hosting — with validation and changes applied without a
+  restart
 - Windows placed against the monitor X-Plane is actually using, so they do not
   spawn off-screen on multi-monitor setups
 - Builds on Windows, macOS and Linux; CI checks all three
@@ -368,6 +458,12 @@ strings that arrive without a null terminator are handled as fixed-width.
 
 ### Security
 
+Hosting opens a UDP port on your machine to the internet, and the relay
+server behind it is the same code either way -- it validates every field of
+every packet before relaying it, and the fuzzing below is run against it. It
+is still a port, though: host when you want to fly with people, and untick
+the box when you are done, which also asks the router to close it again.
+
 The server has no authentication: anyone who knows the address can join under
 any callsign. Packets after login must carry the session id the server issued,
 which stops blind off-path spoofing, but this is a flying-with-friends server,
@@ -376,12 +472,14 @@ do not reuse it for anything sensitive.
 
 ## Roadmap
 
-1. **Radio effects** — signal fading towards the edge of range, a "blocked"
+1. **Finding each other without swapping addresses** — a small list of public
+   servers, or a code you can read out over the phone instead of an IP.
+2. **Radio effects** — signal fading towards the edge of range, a "blocked"
    squeal when two people transmit at once.
-2. **Text chat input field** in the window (receive-only for now).
-3. **Key binding from the settings window** — the PTT is bound through
+3. **Text chat input field** in the window (receive-only for now).
+4. **Key binding from the settings window** — the PTT is bound through
    X-Plane's own keyboard settings for now.
-4. **Bandwidth** — traffic is relayed at 10 Hz to every client in range;
+5. **Bandwidth** — traffic is relayed at 10 Hz to every client in range;
    scaling past a couple of dozen pilots wants per-client rate limiting by
    distance.
 

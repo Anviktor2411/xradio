@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+"""Differential test: the Python server and the built-in C++ server must behave
+identically.
+
+There are two relay servers now -- `server/server.py` for a machine that
+should stay up without X-Plane, and the one compiled into the plugin so a
+pilot can just switch Hosting on. Two implementations of one protocol is
+exactly the situation where they drift apart: someone fixes a validation rule
+in one and forgets the other, and the bug only shows up when the two halves of
+a flight are hosted differently.
+
+So this runs the same black-box scenarios against both over real UDP and
+compares the transcripts byte for byte. It also asserts what the answers
+should actually be, so "both are equally wrong" still fails.
+
+    python3 tools/test_server_parity.py [--cpp ./build-tests/xradio_server]
+"""
+
+import argparse
+import os
+import re
+import socket
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "server"))
+
+import protocol as P          # noqa: E402
+
+FREQ = 122800                 # 122.800 MHz
+OTHER_FREQ = 118100
+
+failures = []
+
+
+def check(name, cond, detail=""):
+    print(f"  {'PASS' if cond else 'FAIL'}  {name}" + (f"  [{detail}]" if detail and not cond else ""))
+    if not cond:
+        failures.append(name)
+
+
+class Client:
+    def __init__(self, port, callsign, lat, lon, alt_ft=3000.0, com1=FREQ, com2=0,
+                 ac="C172"):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.settimeout(0.25)
+        self.dest = ("127.0.0.1", port)
+        self.callsign = callsign
+        self.ac = ac
+        self.lat, self.lon, self.alt_ft = lat, lon, alt_ft
+        self.com1, self.com2 = com1, com2
+        self.sid = 0
+
+    def send(self, ptype, payload=b"", sid=None):
+        self.sock.sendto(P.pack(ptype, self.sid if sid is None else sid, payload),
+                         self.dest)
+
+    def login(self, proto=P.PROTO_VERSION, callsign=None, ac=None):
+        self.send(P.PT_LOGIN, P.LOGIN.pack(
+            P.pad(callsign if callsign is not None else self.callsign, 16),
+            P.pad(ac if ac is not None else self.ac, 8), proto, 0), sid=0)
+        pkt = self.recv(P.PT_LOGIN_ACK)
+        if pkt is not None:
+            self.sid, _ = P.LOGIN_ACK.unpack_from(pkt, 0)
+        return self.sid
+
+    def position(self, tx=P.TX_NONE, rx=P.RX_COM1, sid=None, lat=None, lon=None,
+                 alt_ft=None, gs=50.0, gear=0.0, flap=0.0, time_ms=0,
+                 track=90.0, vs=0.0, heading=90.0):
+        self.send(P.PT_POSITION, P.POSITION.pack(
+            self.lat if lat is None else lat,
+            self.lon if lon is None else lon,
+            (self.alt_ft if alt_ft is None else alt_ft) / 3.28084,
+            heading, 0.0, 0.0, gs, gear, flap,
+            self.com1, self.com2, 0, 0, tx, rx, time_ms, track, vs), sid=sid)
+
+    def text(self, body, freq=0, sid=None):
+        raw = body.encode()
+        self.send(P.PT_TEXT,
+                  P.TEXT_HDR.pack(freq, 0, P.pad(self.callsign, 16), len(raw)) + raw,
+                  sid=sid)
+
+    def voice(self, seq=1, freq=0, opus=b"\x01\x02\x03\x04"):
+        self.send(P.PT_VOICE, P.VOICE_HDR.pack(freq, 0, seq, len(opus)) + opus)
+
+    def recv(self, want=None, timeout=0.25):
+        end = time.time() + timeout
+        while time.time() < end:
+            self.sock.settimeout(max(0.01, end - time.time()))
+            try:
+                data, _ = self.sock.recvfrom(2048)
+            except socket.timeout:
+                return None
+            parsed = P.unpack_header(data)
+            if parsed is None:
+                continue
+            ptype, _v, _l, _sid, payload = parsed
+            if want is None or ptype == want:
+                return payload
+        return None
+
+    def drain(self, seconds):
+        """Collect everything that arrives, grouped by packet type."""
+        out = {P.PT_TRAFFIC: [], P.PT_TEXT: [], P.PT_VOICE: [], P.PT_PONG: []}
+        end = time.time() + seconds
+        while time.time() < end:
+            self.sock.settimeout(max(0.01, end - time.time()))
+            try:
+                data, _ = self.sock.recvfrom(2048)
+            except socket.timeout:
+                break
+            parsed = P.unpack_header(data)
+            if parsed is None:
+                continue
+            ptype, _v, _l, _sid, payload = parsed
+            out.setdefault(ptype, []).append(payload)
+        return out
+
+    def close(self):
+        self.sock.close()
+
+
+def norm(callsign):
+    """A placeholder callsign carries the session number, which depends on how
+    many clients logged in earlier. Fold it away so the comparison is about
+    behaviour, not ordering."""
+    return "UNK*" if re.fullmatch(r"UNK\d+", callsign) else callsign
+
+
+def traffic_set(packets, keep=None):
+    """Every aircraft seen across a burst of traffic packets, as a stable set.
+
+    `keep` limits it to this scenario's own aircraft: sessions live for 15
+    seconds, so without it each scenario would also see the leftovers of the
+    ones before and the result would depend on how fast the suite ran."""
+    seen = set()
+    for payload in packets:
+        if len(payload) < P.TRAFFIC_HDR.size:
+            continue
+        count, _ = P.TRAFFIC_HDR.unpack_from(payload, 0)
+        off = P.TRAFFIC_HDR.size
+        for _ in range(count):
+            if off + P.TRAFFIC_ENTRY.size > len(payload):
+                break
+            e = P.TRAFFIC_ENTRY.unpack_from(payload, off)
+            off += P.TRAFFIC_ENTRY.size
+            cs = norm(P.cstr(e[1]))
+            if keep is not None and not cs.startswith(tuple(keep)):
+                continue
+            # lat, lon, alt, heading, ground speed, vertical speed and the
+            # sender's timestamp: enough that a validation rule quietly
+            # dropped from one server shows up as a different aircraft state.
+            seen.add((cs, P.cstr(e[2]),
+                      round(e[3], 4), round(e[4], 4), round(e[5], 1),
+                      round(e[6], 1), round(e[9], 1), round(e[18], 1),
+                      e[16], e[12], e[13]))
+    return sorted(seen)
+
+
+def tx_flags(packets, keep=None):
+    """Whether any traffic entry was marked as transmitting, per callsign."""
+    flags = {}
+    for payload in packets:
+        if len(payload) < P.TRAFFIC_HDR.size:
+            continue
+        count, _ = P.TRAFFIC_HDR.unpack_from(payload, 0)
+        off = P.TRAFFIC_HDR.size
+        for _ in range(count):
+            if off + P.TRAFFIC_ENTRY.size > len(payload):
+                break
+            e = P.TRAFFIC_ENTRY.unpack_from(payload, off)
+            off += P.TRAFFIC_ENTRY.size
+            cs = norm(P.cstr(e[1]))
+            if keep is not None and not cs.startswith(tuple(keep)):
+                continue
+            flags[cs] = flags.get(cs, 0) | int(e[14])
+    return sorted(flags.items())
+
+
+def texts(packets):
+    out = []
+    for payload in packets:
+        if len(payload) < P.TEXT_HDR.size:
+            continue
+        freq, _sid, frm, n = P.TEXT_HDR.unpack_from(payload, 0)
+        body = payload[P.TEXT_HDR.size:P.TEXT_HDR.size + n]
+        out.append((freq, P.cstr(frm), body.decode("utf-8", "replace")))
+    return sorted(out)
+
+
+def voices(packets):
+    out = []
+    for payload in packets:
+        if len(payload) < P.VOICE_HDR.size:
+            continue
+        freq, _sid, seq, n = P.VOICE_HDR.unpack_from(payload, 0)
+        out.append((freq, seq, payload[P.VOICE_HDR.size:P.VOICE_HDR.size + n]))
+    return sorted(out)
+
+
+# ---------------------------------------------------------------------------
+# the scenarios -- each returns a value that must match between the two servers
+# ---------------------------------------------------------------------------
+def scenario_login_and_traffic(port):
+    a = Client(port, "ESNA12", 57.85, 27.02)
+    b = Client(port, "ESNB34", 57.86, 27.03, ac="A20N")
+    far = Client(port, "ESFAR1", 60.00, 27.02)          # ~130 nm north
+    out = {}
+    out["sid_a"] = a.login()
+    out["sid_b"] = b.login()
+    out["sid_far"] = far.login()
+    for _ in range(3):
+        a.position(); b.position(); far.position()
+        time.sleep(0.12)
+    mine = ("ESNA12", "ESNB34", "ESFAR1")
+    out["a_sees"] = traffic_set(a.drain(0.4)[P.PT_TRAFFIC], mine)
+    out["far_sees"] = traffic_set(far.drain(0.4)[P.PT_TRAFFIC], mine)
+    for c in (a, b, far):
+        c.close()
+    return out
+
+
+def scenario_bad_login(port):
+    out = {}
+    v1 = Client(port, "OLDVER", 57.85, 27.02)
+    out["old_protocol_gets_no_ack"] = (v1.login(proto=1) == 0)
+    ctl = Client(port, "BAD\x07CS\x01", 57.85, 27.02)
+    ctl.login()
+    empty = Client(port, "   ", 57.85, 27.02, ac="")
+    empty.login()
+    peer = Client(port, "WATCH1", 57.85, 27.02)
+    peer.login()
+    for _ in range(3):
+        ctl.position(); empty.position(); peer.position()
+        time.sleep(0.12)
+    mine = ("BADCS", "UNK*", "WATCH1")
+    out["callsigns_seen"] = [t[0] for t in
+                             traffic_set(peer.drain(0.4)[P.PT_TRAFFIC], mine)]
+    out["ac_types_seen"] = sorted({t[1] for t in
+                                   traffic_set(peer.drain(0.3)[P.PT_TRAFFIC], mine)})
+    for c in (v1, ctl, empty, peer):
+        c.close()
+    return out
+
+
+def scenario_position_validation(port):
+    """Bad values must be dropped, leaving the last good position in place.
+
+    Every rejected report carries a different timestamp, and the timestamp is
+    relayed untouched, so if any one of these is wrongly accepted the watcher
+    sees a state it should never have seen -- even when the bad field itself
+    is not the one being looked at.
+    """
+    a = Client(port, "ESVAL1", 57.85, 27.02)
+    b = Client(port, "ESWAT1", 57.851, 27.021)
+    a.login(); b.login()
+    a.position(lat=57.85, lon=27.02, gs=50.0, vs=0.0, time_ms=1)   # a good one first
+    b.position()
+    time.sleep(0.2)
+    bad = [
+        (float("nan"), 27.02, 3000, 50, 0),      # not-a-number latitude
+        (57.85, float("inf"), 3000, 50, 0),      # infinite longitude
+        (57.85, 27.02, float("nan"), 50, 0),     # not-a-number altitude
+        (91.0, 27.02, 3000, 50, 0),              # off the top of the planet
+        (-91.0, 27.02, 3000, 50, 0),
+        (57.85, 181.0, 3000, 50, 0),
+        (57.85, -181.0, 3000, 50, 0),
+        (57.85, 27.02, 200000, 50, 0),           # 200 000 ft
+        (57.85, 27.02, -5000, 50, 0),            # below the Dead Sea
+        (57.85, 27.02, 3000, 9999, 0),           # 9999 m/s ground speed
+        (57.85, 27.02, 3000, -10, 0),            # negative ground speed
+        (57.85, 27.02, 3000, 50, 5000),          # 5000 m/s vertical
+        (57.85, 27.02, 3000, 50, -5000),
+        (57.85, 27.02, 3000, float("nan"), 0),   # not-a-number ground speed
+        (57.85, 27.02, 3000, 50, float("nan")),  # not-a-number vertical speed
+    ]
+    for i, (lat, lon, alt, gs, vs) in enumerate(bad):
+        a.position(lat=lat, lon=lon, alt_ft=alt, gs=gs, vs=vs, time_ms=1000 + i)
+    for _ in range(3):
+        b.position()
+        time.sleep(0.12)
+    out = {"b_sees": traffic_set(b.drain(0.4)[P.PT_TRAFFIC], ("ESVAL1",))}
+    a.close(); b.close()
+    return out
+
+
+def scenario_text_routing(port):
+    a = Client(port, "ESTXA1", 57.85, 27.02)
+    same = Client(port, "ESTXB1", 57.855, 27.025)
+    other = Client(port, "ESTXC1", 57.856, 27.026, com1=OTHER_FREQ)
+    far = Client(port, "ESTXD1", 60.50, 27.02)      # past the VHF horizon
+    for c in (a, same, other, far):
+        c.login()
+        c.position()
+    time.sleep(0.2)
+    a.text("hello all", freq=FREQ)
+    a.text("wrong radio", freq=121500)              # not tuned there
+    a.text("x" * 400, freq=FREQ)                    # over the 200-byte cap
+    time.sleep(0.3)
+    out = {
+        "same_freq": texts(same.drain(0.3)[P.PT_TEXT]),
+        "other_freq": texts(other.drain(0.2)[P.PT_TEXT]),
+        "out_of_range": texts(far.drain(0.2)[P.PT_TEXT]),
+    }
+    for c in (a, same, other, far):
+        c.close()
+    return out
+
+
+def scenario_voice_routing(port):
+    a = Client(port, "ESVCA1", 57.85, 27.02)
+    b = Client(port, "ESVCB1", 57.855, 27.025)
+    off = Client(port, "ESVCC1", 57.856, 27.026, com1=OTHER_FREQ)
+    for c in (a, b, off):
+        c.login()
+        c.position(tx=P.TX_COM1)
+    time.sleep(0.2)
+    for i in range(5):
+        a.voice(seq=i, freq=FREQ)
+        time.sleep(0.02)
+    time.sleep(0.2)
+    got = b.drain(0.3)
+    out = {
+        "heard": voices(got[P.PT_VOICE]),
+        "not_heard": voices(off.drain(0.2)[P.PT_VOICE]),
+    }
+    # keep talking so the tx flag is definitely set while traffic goes out
+    for i in range(6):
+        a.voice(seq=100 + i, freq=FREQ)
+        b.position(tx=P.TX_NONE)
+        time.sleep(0.05)
+    out["tx_flags"] = tx_flags(b.drain(0.3)[P.PT_TRAFFIC], ("ESVC",))
+    for c in (a, b, off):
+        c.close()
+    return out
+
+
+def scenario_session_id(port):
+    a = Client(port, "ESSID1", 57.85, 27.02)
+    b = Client(port, "ESSID2", 57.855, 27.025)
+    a.login(); b.login()
+    a.position(); b.position()
+    time.sleep(0.2)
+    # A position claiming somebody else's session id must be ignored.
+    a.position(sid=a.sid + 500, lat=10.0, lon=10.0)
+    a.text("spoofed", freq=FREQ, sid=a.sid + 500)
+    for _ in range(3):
+        b.position()
+        time.sleep(0.12)
+    got = b.drain(0.4)
+    out = {"b_sees": traffic_set(got[P.PT_TRAFFIC], ("ESSID",)),
+           "b_texts": texts(got[P.PT_TEXT])}
+    # ping/pong still works with the right id
+    a.send(P.PT_PING)
+    out["pong"] = a.recv(P.PT_PONG) is not None
+    a.close(); b.close()
+    return out
+
+
+def scenario_logout(port):
+    a = Client(port, "ESOUT1", 57.85, 27.02)
+    b = Client(port, "ESOUT2", 57.855, 27.025)
+    a.login(); b.login()
+    a.position(); b.position()
+    time.sleep(0.25)
+    before = traffic_set(b.drain(0.3)[P.PT_TRAFFIC], ("ESOUT",))
+    a.send(P.PT_LOGOUT)
+    time.sleep(0.25)
+    for _ in range(2):
+        b.position()
+        time.sleep(0.12)
+    after = traffic_set(b.drain(0.3)[P.PT_TRAFFIC], ("ESOUT",))
+    a.close(); b.close()
+    return {"before": [t[0] for t in before], "after": [t[0] for t in after]}
+
+
+def scenario_garbage(port):
+    """Nonsense must be ignored without disturbing a working session."""
+    a = Client(port, "ESGAR1", 57.85, 27.02)
+    b = Client(port, "ESGAR2", 57.855, 27.025)
+    a.login(); b.login()
+    junk = [
+        b"",
+        b"\x00" * 4,
+        b"XRC1",
+        P.HEADER.pack(0xDEADBEEF, P.PT_POSITION, P.PROTO_VERSION, 0, a.sid),
+        P.HEADER.pack(P.MAGIC, P.PT_POSITION, 99, 0, a.sid),
+        P.HEADER.pack(P.MAGIC, P.PT_POSITION, P.PROTO_VERSION, 9999, a.sid),
+        P.HEADER.pack(P.MAGIC, P.PT_POSITION, P.PROTO_VERSION, 4, a.sid) + b"\x01\x02",
+        P.HEADER.pack(P.MAGIC, 200, P.PROTO_VERSION, 0, a.sid),
+        P.pack(P.PT_TEXT, a.sid, b"\x00" * 3),
+        P.pack(P.PT_VOICE, a.sid, b"\x00" * 5),
+        P.pack(P.PT_LOGIN, 0, b"short"),
+        os.urandom(64),
+    ]
+    for j in junk:
+        a.sock.sendto(j, a.dest)
+    time.sleep(0.2)
+    for _ in range(3):
+        a.position(); b.position()
+        time.sleep(0.12)
+    out = {"still_working": traffic_set(b.drain(0.4)[P.PT_TRAFFIC], ("ESGAR",))}
+    a.close(); b.close()
+    return out
+
+
+SCENARIOS = [
+    ("login and traffic", scenario_login_and_traffic),
+    ("login validation", scenario_bad_login),
+    ("position validation", scenario_position_validation),
+    ("text routing", scenario_text_routing),
+    ("voice routing", scenario_voice_routing),
+    ("session id enforcement", scenario_session_id),
+    ("logout", scenario_logout),
+    ("garbage packets", scenario_garbage),
+]
+
+
+# ---------------------------------------------------------------------------
+# running a server
+# ---------------------------------------------------------------------------
+def wait_until_up(port, timeout=8.0):
+    probe = Client(port, "PROBE1", 0.0, 0.0)
+    end = time.time() + timeout
+    while time.time() < end:
+        if probe.login() != 0:
+            probe.send(P.PT_LOGOUT)
+            probe.close()
+            return True
+        time.sleep(0.15)
+    probe.close()
+    return False
+
+
+def run_against(label, make_cmd, base_port, cwd=None):
+    """Run every scenario against its own fresh server.
+
+    One long-lived server would let each scenario see the aircraft of the ones
+    before it -- sessions live for 15 seconds -- and once more than 15 are
+    logged in the traffic packet cap starts dropping the furthest, which makes
+    the result depend on how fast the suite happened to run. A server per
+    scenario costs a fraction of a second and removes the whole class of
+    flake.
+    """
+    print(f"\n--- {label} ---")
+    results = {}
+    for i, (name, fn) in enumerate(SCENARIOS):
+        port = base_port + i
+        proc = subprocess.Popen(make_cmd(port), cwd=cwd,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            if not wait_until_up(port):
+                print(f"  server did not come up on port {port}")
+                return None
+            results[name] = fn(port)
+            print(f"  ran  {name}")
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    return results
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cpp", default=str(ROOT / "build-tests" / "xradio_server"))
+    ap.add_argument("--port", type=int, default=49380)
+    args = ap.parse_args()
+
+    if not Path(args.cpp).exists():
+        print(f"C++ server not built at {args.cpp} -- "
+              f"configure with -DXRADIO_BUILD_TESTS=ON and build it first")
+        return 1
+
+    py = run_against(
+        "python server",
+        lambda p: [sys.executable, str(ROOT / "server" / "server.py"), "--port", str(p)],
+        args.port, cwd=str(ROOT / "server"))
+    cpp = run_against(
+        "built-in C++ server",
+        lambda p: [args.cpp, str(p)],
+        args.port + len(SCENARIOS) + 1)
+
+    if py is None or cpp is None:
+        print("\none of the servers did not start")
+        return 1
+
+    print("\nthe two servers agree")
+    for name, _ in SCENARIOS:
+        same = py[name] == cpp[name]
+        detail = ""
+        if not same:
+            for k in py[name]:
+                if py[name][k] != cpp[name].get(k):
+                    detail = f"{k}: python={py[name][k]!r} cpp={cpp[name].get(k)!r}"
+                    break
+        check(name, same, detail)
+
+    # And the answers are the right ones, not just the same ones.
+    print("\nand the answers are correct")
+    r = cpp["login and traffic"]
+    sids = [r["sid_a"], r["sid_b"], r["sid_far"]]
+    check("sessions get consecutive ids",
+          all(x > 0 for x in sids) and sids[1] == sids[0] + 1 and sids[2] == sids[1] + 1,
+          str(sids))
+    check("a nearby aircraft is in the traffic list",
+          any(t[0] == "ESNB34" for t in r["a_sees"]))
+    check("its ICAO type comes through",
+          any(t[0] == "ESNB34" and t[1] == "A20N" for t in r["a_sees"]))
+    check("an aircraft 130 nm away is not", not any(t[0] == "ESFAR1" for t in r["a_sees"]))
+
+    r = cpp["login validation"]
+    check("an old protocol version is refused", r["old_protocol_gets_no_ack"])
+    check("control characters are stripped from callsigns",
+          all(all(ord(c) >= 32 for c in cs) for cs in r["callsigns_seen"]),
+          str(r["callsigns_seen"]))
+    check("an empty callsign gets a placeholder",
+          any(cs.startswith("UNK") for cs in r["callsigns_seen"]), str(r["callsigns_seen"]))
+    check("an empty aircraft type becomes ZZZZ", "ZZZZ" in r["ac_types_seen"],
+          str(r["ac_types_seen"]))
+
+    r = cpp["position validation"]
+    states = [t for t in r["b_sees"] if t[0] == "ESVAL1"]
+    check("every bad position is dropped, the last good one stands",
+          len(states) == 1 and states[0][2] == 57.85 and states[0][8] == 1,
+          str(states))
+
+    r = cpp["text routing"]
+    check("text reaches someone on the same frequency",
+          any(t[2] == "hello all" for t in r["same_freq"]), str(r["same_freq"]))
+    check("text does not reach another frequency", r["other_freq"] == [])
+    check("text does not reach past the VHF horizon", r["out_of_range"] == [])
+    check("a transmission on an untuned radio is refused",
+          not any(t[2] == "wrong radio" for t in r["same_freq"]))
+    long_ones = [t for t in r["same_freq"] if t[2].startswith("xxx")]
+    check("over-long text is clamped to 200 bytes",
+          len(long_ones) == 1 and len(long_ones[0][2]) == 200,
+          str(len(long_ones[0][2]) if long_ones else "none"))
+
+    r = cpp["voice routing"]
+    check("voice reaches the same frequency", len(r["heard"]) == 5, str(len(r["heard"])))
+    check("voice payload survives intact",
+          all(v[2] == b"\x01\x02\x03\x04" for v in r["heard"]))
+    check("voice does not reach another frequency", r["not_heard"] == [])
+    check("a talking aircraft is flagged as transmitting",
+          ("ESVCA1", 1) in r["tx_flags"], str(r["tx_flags"]))
+
+    r = cpp["session id enforcement"]
+    check("a position with the wrong session id is ignored",
+          all(t[2] != 10.0 for t in r["b_sees"]), str(r["b_sees"]))
+    check("text with the wrong session id is ignored", r["b_texts"] == [])
+    check("ping still answers with the right id", r["pong"])
+
+    r = cpp["logout"]
+    check("logout removes the aircraft",
+          "ESOUT1" in r["before"] and "ESOUT1" not in r["after"],
+          f"{r['before']} -> {r['after']}")
+
+    r = cpp["garbage packets"]
+    check("a working session survives a burst of junk",
+          any(t[0] == "ESGAR1" for t in r["still_working"]), str(r["still_working"]))
+
+    print()
+    if failures:
+        print(f"{len(failures)} FAILED: {', '.join(failures)}")
+        return 1
+    print("both servers behave identically, and correctly")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

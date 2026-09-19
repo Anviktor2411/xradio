@@ -94,7 +94,7 @@ int main() {
         check("every tab has at least one field", [] {
             xr::Settings t;
             std::vector<int> n((size_t)xr::kNumTabs, 0);
-            for (auto& x : xr::describe(t)) ++n[x.tab];
+            for (auto& x : xr::describe(t)) ++n[(size_t)x.tab];
             for (int c : n) if (c == 0) return false;
             return true;
         }());

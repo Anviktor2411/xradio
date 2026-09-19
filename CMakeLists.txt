@@ -66,10 +66,25 @@ endif()
 set(XR_PLUGIN_SOURCES
     plugin/src/main.cpp
     plugin/src/net.cpp
+    plugin/src/server.cpp
     plugin/src/ui.cpp
+    plugin/src/upnp.cpp
     plugin/src/voice.cpp
     plugin/src/xpmp_bridge.cpp
 )
+
+# The same relay server as a standalone program, for a machine that should
+# stay up without X-Plane running -- and so tools/test_server_parity.py can
+# hold it to the same behaviour as the Python one. Needs no X-Plane SDK.
+add_executable(xradio_server tools/server_main.cpp plugin/src/server.cpp
+                             plugin/src/net.cpp plugin/src/upnp.cpp)
+target_include_directories(xradio_server PRIVATE plugin/src)
+find_package(Threads REQUIRED)
+target_link_libraries(xradio_server PRIVATE Threads::Threads)
+if(WIN32)
+    target_link_libraries(xradio_server PRIVATE wsock32 ws2_32 iphlpapi)
+    target_compile_definitions(xradio_server PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+endif()
 
 # Applies SDK feature level, platform defines and the optional libraries.
 function(xradio_configure_target tgt)
@@ -202,10 +217,19 @@ if(XRADIO_BUILD_TESTS)
         endif()
     endfunction()
 
+    # The hosted server now listens on a home machine's port, so it gets the
+    # sanitizers too: tools/harness/fuzz_client.py attacks this binary.
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(xradio_server PRIVATE -g -O1 -fsanitize=address,undefined
+                                                     -fno-omit-frame-pointer)
+        target_link_options(xradio_server    PRIVATE -fsanitize=address,undefined)
+    endif()
+
     xradio_test_exe(plugin_harness tools/harness/main.cpp)
     xradio_test_exe(placement_test tools/harness/placement_test.cpp)
     xradio_test_exe(voice_test     tools/harness/voice_test.cpp)
     xradio_test_exe(settings_test  tools/harness/settings_test.cpp)
+    xradio_test_exe(hosting_test   tools/harness/hosting_test.cpp)
 
     # Pure maths, no plugin sources needed.
     add_executable(smoothing_test tools/harness/smoothing_test.cpp)

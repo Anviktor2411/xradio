@@ -30,6 +30,14 @@ struct Settings {
     float       hiss       = 0.35f;        // carrier noise
     bool        radioFilter = true;        // 300-3400 Hz band-pass
 
+    // --- hosting ---
+    // With this on the plugin runs the relay server itself and connects to
+    // it locally, so nobody has to set a server up. The host/port above are
+    // then unused -- the friends type this machine's address instead.
+    bool        hostEnabled = false;
+    std::string hostPort    = "49100";
+    bool        hostUpnp    = true;        // ask the router to open the port
+
     // --- traffic ---
     bool        showTraffic = true;
     bool        showLabels  = true;
@@ -37,6 +45,11 @@ struct Settings {
     float       trafficRangeNm = 80.f;
 
     int         port_i() const { return atoi(port.c_str()); }
+    int         hostPort_i() const { return atoi(hostPort.c_str()); }
+
+    // Where the client should actually connect: hosting means our own server.
+    std::string activeHost() const { return hostEnabled ? "127.0.0.1" : host; }
+    int         activePort() const { return hostEnabled ? hostPort_i() : port_i(); }
 };
 
 // --- descriptor table -------------------------------------------------------
@@ -46,7 +59,7 @@ struct FieldRef {
     const char* key;       // config-file key
     const char* label;     // shown in the window
     Kind        kind;
-    int         tab;       // 0 connection, 1 audio, 2 traffic
+    int         tab;       // 0 connection, 1 audio, 2 traffic, 3 hosting
     void*       ptr;       // &Settings member
     float       lo = 0.f, hi = 1.f;
     const char* unit = "";
@@ -78,6 +91,10 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"showlabels",  "Callsign labels",     Kind::Bool, 2, &s.showLabels},
         {"labeldist",   "Label range",   Kind::Slider, 2, &s.labelDistNm,   1.f, 100.f, " nm", 0},
         {"range",       "Traffic range", Kind::Slider, 2, &s.trafficRangeNm, 5.f, 200.f, " nm", 0},
+
+        {"hosting",     "Host a flight here", Kind::Bool, 3, &s.hostEnabled},
+        {"hostport",    "Port to host on",    Kind::Text, 3, &s.hostPort, 0,0,"",0, 5, true},
+        {"hostupnp",    "Ask the router to open it", Kind::Bool, 3, &s.hostUpnp},
     };
 }
 
@@ -85,10 +102,11 @@ inline const char* tabName(int i) {
     switch (i) {
         case 0:  return "Connection";
         case 1:  return "Audio";
-        default: return "Traffic";
+        case 2:  return "Traffic";
+        default: return "Hosting";
     }
 }
-inline constexpr int kNumTabs = 3;
+inline constexpr int kNumTabs = 4;
 
 // --- file I/O ---------------------------------------------------------------
 namespace detail {
@@ -169,10 +187,15 @@ inline bool loadSettings(Settings& s, const std::string& path) {
 
 // Anything the user could have hand-edited into nonsense.
 inline std::string validate(const Settings& s) {
+    if (detail::trim(s.callsign).empty())  return "Callsign cannot be empty";
+    if (s.hostEnabled) {
+        const int hp = s.hostPort_i();
+        if (hp < 1 || hp > 65535)          return "Host port must be 1-65535";
+        return "";                         // the server field is unused while hosting
+    }
     if (detail::trim(s.host).empty())      return "Host cannot be empty";
     const int p = s.port_i();
     if (p < 1 || p > 65535)                return "Port must be 1-65535";
-    if (detail::trim(s.callsign).empty())  return "Callsign cannot be empty";
     return "";
 }
 

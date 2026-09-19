@@ -9,6 +9,8 @@
 #include "net.h"
 #include "protocol.h"
 #include "mathconst.h"
+#include "server.h"
+#include "upnp.h"
 #include "settings.h"
 #include "smoothing.h"
 #include "ui.h"
@@ -195,6 +197,9 @@ struct Remote {
 
 std::map<uint32_t, Remote> g_remote;
 int g_rejected = 0;   // traffic entries dropped as implausible
+
+// Defined with the hosting code further down; the main window needs it.
+std::string shareAddress();
 
 // ---------------------------------------------------------------------------
 // plugin state
@@ -632,12 +637,23 @@ void drawWindow(XPLMWindowID win, void*) {
     XPLMDrawString(g_connected ? green : amber, x, y, (char*)g_status.c_str(),
                    nullptr, xplmFont_Proportional);
     y -= 16;
-    char who[160];
+    char who[200];
     snprintf(who, sizeof(who), "%s as %s (%s)   Plugins > XRadio > Settings to change",
              g_sock.endpoint().empty() ? "no server" : g_sock.endpoint().c_str(),
              g_cfg.callsign.c_str(), g_cfg.acIcao.c_str());
     XPLMDrawString(white, x, y, who, nullptr, xplmFont_Basic);
-    y -= 18;
+    y -= 16;
+
+    if (xr::relay::running()) {
+        const xr::relay::Status st = xr::relay::status();
+        char hostLine[200];
+        snprintf(hostLine, sizeof(hostLine),
+                 "Hosting  ·  %d connected  ·  friends type %s",
+                 st.clients, shareAddress().c_str());
+        XPLMDrawString(green, x, y, hostLine, nullptr, xplmFont_Basic);
+        y -= 16;
+    }
+    y -= 2;
 
     char hdr[128];
     snprintf(hdr, sizeof(hdr), "COM1 %.3f   COM2 %.3f   %s",
@@ -781,6 +797,53 @@ void createWindow() {
     XPLMSetWindowResizingLimits(g_window, 320, 200, 900, 900);
 }
 
+// ---------------------------------------------------------------------------
+// hosting
+// ---------------------------------------------------------------------------
+// The whole point: one pilot switches this on and the others type their
+// address. No VPS, no Python, no terminal. The plugin runs the same relay
+// server that server.py runs, on its own thread, and its own client connects
+// to it over the loopback.
+std::string g_hostNote;      // why hosting is not working, if it is not
+
+void applyHosting() {
+    const uint16_t port = (uint16_t)g_cfg.hostPort_i();
+
+    if (!g_cfg.hostEnabled) {
+        if (xr::relay::running()) {
+            xr::relay::stop();
+            xr::upnp::releaseAsync();
+            logMsg("hosting stopped");
+        }
+        g_hostNote.clear();
+        return;
+    }
+
+    if (xr::relay::running() && xr::relay::status().port == port) return;
+
+    xr::relay::stop();
+    std::string err;
+    if (!xr::relay::start(port, &err)) {
+        g_hostNote = "cannot host: " + err;
+        logMsg("%s", g_hostNote.c_str());
+        return;
+    }
+    g_hostNote.clear();
+    logMsg("hosting on port %u", (unsigned)port);
+
+    xr::upnp::clear();
+    if (g_cfg.hostUpnp) xr::upnp::requestAsync(port, "XRadio");
+}
+
+// What the window tells the hosting pilot to send their friends.
+std::string shareAddress() {
+    const xr::upnp::Result u = xr::upnp::latest();
+    const std::string port = std::to_string(g_cfg.hostPort_i());
+    if (!u.externalIp.empty()) return u.externalIp + ":" + port;
+    const std::string lan = xr::localAddress();
+    return lan.empty() ? ("<your address>:" + port) : (lan + ":" + port);
+}
+
 // Drop the current session and log in again with whatever g_cfg says now.
 void reconnect() {
     netStop();
@@ -794,7 +857,7 @@ void reconnect() {
     }
     std::string err;
     g_sock.close();
-    if (!g_sock.open(g_cfg.host, (uint16_t)g_cfg.port_i(), &err)) {
+    if (!g_sock.open(g_cfg.activeHost(), (uint16_t)g_cfg.activePort(), &err)) {
         g_status = "socket error: " + err;
         logMsg("%s", g_status.c_str());
     } else {
@@ -888,13 +951,21 @@ void applySettings() {
     const bool netChanged = (g_edit.host != g_cfg.host) ||
                             (g_edit.port != g_cfg.port) ||
                             (g_edit.callsign != g_cfg.callsign) ||
-                            (g_edit.acIcao != g_cfg.acIcao);
+                            (g_edit.acIcao != g_cfg.acIcao) ||
+                            (g_edit.hostEnabled != g_cfg.hostEnabled) ||
+                            (g_edit.hostPort != g_cfg.hostPort);
+    const bool hostChanged = (g_edit.hostEnabled != g_cfg.hostEnabled) ||
+                             (g_edit.hostPort != g_cfg.hostPort) ||
+                             (g_edit.hostUpnp != g_cfg.hostUpnp);
     const bool devChanged = (g_edit.micDevice != g_cfg.micDevice) ||
                             (g_edit.outDevice != g_cfg.outDevice);
 
     g_cfg = g_edit;
     xr::saveSettings(g_cfg, g_cfgPath);
     applyLiveSettings();
+    // Start or stop the built-in server before reconnecting, so the client
+    // has something to connect to by the time it tries.
+    if (hostChanged) applyHosting();
 
     if (devChanged) {
         std::string err;
@@ -972,6 +1043,49 @@ void drawSettings(XPLMWindowID win, void*) {
                 xr::ui::choice(g_ui, f.label, *(std::string*)f.ptr,
                                isMic ? g_micList : g_outList, "system default");
                 break;
+            }
+        }
+    }
+
+    // The hosting tab is mostly status: what to send your friends, and
+    // whether the router co-operated. Guessing at this is the thing that
+    // makes people give up, so it is all spelled out.
+    if (g_tab == 3) {
+        g_ui.nextRow();
+        const xr::relay::Status st = xr::relay::status();
+        if (!g_hostNote.empty()) {
+            xr::ui::text(g_ui, g_hostNote.c_str(), 3);
+        } else if (!st.running) {
+            xr::ui::text(g_ui, "Not hosting. Switch it on and save; your friends", 1);
+            xr::ui::text(g_ui, "then put your address in their Connection tab.", 1);
+        } else {
+            char line[192];
+            snprintf(line, sizeof(line), "Running on port %u  ·  %d connected",
+                     (unsigned)st.port, st.clients);
+            xr::ui::text(g_ui, line, 2);
+
+            snprintf(line, sizeof(line), "Friends type:  %s", shareAddress().c_str());
+            xr::ui::text(g_ui, line, 0);
+
+            const xr::upnp::Result u = xr::upnp::latest();
+            if (!g_cfg.hostUpnp) {
+                xr::ui::text(g_ui, "Router not asked -- forward this UDP port yourself.", 1);
+            } else if (xr::upnp::busy()) {
+                xr::ui::text(g_ui, "Asking the router to open the port...", 1);
+            } else if (u.mapped) {
+                snprintf(line, sizeof(line), "Router opened the port (%s)",
+                         u.router.empty() ? "UPnP" : u.router.c_str());
+                xr::ui::text(g_ui, line, 2);
+            } else if (u.done) {
+                snprintf(line, sizeof(line), "Port not opened: %s", u.error.c_str());
+                xr::ui::text(g_ui, line, 3);
+                xr::ui::text(g_ui, "Friends on your own network can still join.", 1);
+            }
+
+            if (!st.callsigns.empty()) {
+                std::string who = "Here now:";
+                for (const auto& c : st.callsigns) who += " " + c;
+                xr::ui::text(g_ui, who.c_str(), 0);
             }
         }
     }
@@ -1129,6 +1243,7 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
         logMsg("voice: %s", xr::voice::status().c_str());
     }
     applyLiveSettings();
+    applyHosting();
 
     g_cmdPtt = XPLMCreateCommand("xradio/ptt", "XRadio: push to talk");
     XPLMRegisterCommandHandler(g_cmdPtt, pttHandler, 1, nullptr);
@@ -1162,7 +1277,7 @@ PLUGIN_API int XPluginEnable(void) {
     }
 
     std::string err;
-    if (!g_sock.open(g_cfg.host, (uint16_t)g_cfg.port_i(), &err)) {
+    if (!g_sock.open(g_cfg.activeHost(), (uint16_t)g_cfg.activePort(), &err)) {
         g_status = "socket error: " + err;
         logMsg("%s", g_status.c_str());
     } else {
@@ -1191,6 +1306,9 @@ PLUGIN_API void XPluginDisable(void) {
 
 PLUGIN_API void XPluginStop(void) {
     netStop();
+    xr::relay::stop();
+    xr::upnp::releaseAsync();      // give the router's port back if we can
+    xr::upnp::shutdown();
     xr::voice::shutdown();
     xr::csl::shutdown();
     if (g_loop)   { XPLMDestroyFlightLoop(g_loop); g_loop = nullptr; }
