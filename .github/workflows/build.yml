@@ -52,7 +52,7 @@ jobs:
           python3 - <<'PY' > /tmp/py_sizes.txt
           import sys; sys.path.insert(0, 'server')
           import protocol as P
-          for n in ("HEADER", "LOGIN", "LOGIN_ACK", "POSITION",
+          for n in ("HEADER", "LOGIN", "LOGIN_ACK", "LOGIN_REJECT", "POSITION",
                     "TRAFFIC_HDR", "TRAFFIC_ENTRY", "TEXT_HDR", "VOICE_HDR"):
               print(n, getattr(P, n).size)
           PY
@@ -80,6 +80,18 @@ jobs:
 
       - name: Hosting (plugin runs the server, a real peer joins it)
         run: ASAN_OPTIONS=detect_leaks=0 ./build-tests/hosting_test 49640
+
+      # The router-side of hosting, against a fake router that does the
+      # awkward things real firmware does, in each of its moods.
+      - name: UPnP client against a fake router
+        run: |
+          for mode in ok lease refuse private-wan deaf; do
+            python3 tools/harness/fake_igd.py --mode $mode > /tmp/igd.log 2>&1 &
+            sleep 1
+            XRADIO_UPNP_GATEWAY=127.0.0.1 ASAN_OPTIONS=detect_leaks=0 ./build-tests/upnp_test $mode
+            kill %1 2>/dev/null || true
+            wait 2>/dev/null || true
+          done
 
       # Two relay servers, one protocol. This drives the same scenarios at
       # both over real UDP and diffs the transcripts, so a validation rule
