@@ -29,6 +29,11 @@ jobs:
       - name: Fetch dependencies
         run: ./tools/fetch_deps.sh
 
+      # Instant, and catches the one-platform-only mistakes (MSVC and M_PI,
+      # POSIX headers, VLAs) before ten minutes of compiling finds them.
+      - name: Portability checks
+        run: ./tools/check_portability.sh
+
       - name: Server protocol and routing tests
         run: python3 tools/test_server.py
 
@@ -103,6 +108,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Portability checks
+        shell: bash
+        run: ./tools/check_portability.sh
 
       - name: Fetch dependencies
         shell: bash
