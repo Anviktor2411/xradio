@@ -40,10 +40,18 @@ public:
     // How far behind the newest report we draw. Larger absorbs more jitter,
     // smaller feels more immediate; 350 ms covers the relay's worst case
     // (two 5 Hz samplers beating against each other) with room to spare.
-    static constexpr double kPlayoutS   = 0.35;
+    static constexpr double kPlayoutS   = 0.35;   // default; see setDefaultPlayout
     static constexpr double kMaxExtrapS = 1.0;    // then hold position
     static constexpr double kSnapS      = 0.75;   // render clock this far off -> jump, do not slew
     static constexpr int    kMaxSamples = 10;
+
+    // Settings can trade latency against jitter tolerance. New Smoothers pick
+    // this up; existing ones keep what they were created with, which avoids a
+    // step change in the middle of someone's approach.
+    static void setDefaultPlayout(double seconds) {
+        defaultPlayout() = seconds < 0.05 ? 0.05 : (seconds > 2.0 ? 2.0 : seconds);
+    }
+    static double& defaultPlayout() { static double v = kPlayoutS; return v; }
 
     bool empty() const { return buf_.empty(); }
 
@@ -71,7 +79,7 @@ public:
 
         if (!haveRender_) {
             haveRender_ = true;
-            renderT_ = s.t - kPlayoutS;
+            renderT_ = s.t - playout_;
         }
     }
 
@@ -87,7 +95,7 @@ public:
         // would move the aircraft backwards, which is the very thing this
         // class exists to prevent. If the stream stalls we simply run on into
         // extrapolation and then hold; when it resumes far ahead of us, jump.
-        const double target = buf_.back().t - kPlayoutS;
+        const double target = buf_.back().t - playout_;
         const double err = target - renderT_;
         double rate = 1.0;
         if (err > 0.02)       rate = 1.05;
@@ -128,6 +136,7 @@ public:
 
 private:
     std::deque<PoseSample> buf_;
+    const double playout_ = defaultPlayout();
     double   renderT_ = 0;
     bool     haveRender_ = false;
     uint32_t lastRaw_ = 0;

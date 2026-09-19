@@ -860,16 +860,26 @@ void applyHosting() {
     logMsg("hosting on port %u", (unsigned)port);
 
     xr::upnp::clear();
-    if (g_cfg.hostUpnp) xr::upnp::requestAsync(port, "XRadio");
+    xr::upnp::requestAsync(port, "XRadio", g_cfg.hostUpnp);
 }
 
-// What the window tells the hosting pilot to send their friends.
+// The address on this network, for friends on the same LAN.
+std::string lanAddress() {
+    const std::string lan = xr::localAddress();
+    const std::string port = std::to_string(g_cfg.hostPort_i());
+    return (lan.empty() ? std::string("<this computer>") : lan) + ":" + port;
+}
+
+// What the main window tells the hosting pilot to send their friends. Only
+// an address the internet can reach counts; until the port is known to be
+// open it is the LAN one, marked as such, so nobody passes on a 192.168
+// address to a friend across town.
 std::string shareAddress() {
     const xr::upnp::Result u = xr::upnp::latest();
-    const std::string port = std::to_string(g_cfg.hostPort_i());
-    if (!u.externalIp.empty()) return u.externalIp + ":" + port;
-    const std::string lan = xr::localAddress();
-    return lan.empty() ? ("<your address>:" + port) : (lan + ":" + port);
+    if (u.mapped && !u.externalIp.empty()) {
+        return u.externalIp + ":" + std::to_string(g_cfg.hostPort_i());
+    }
+    return lanAddress() + " (your network only)";
 }
 
 // Drop the current session and log in again with whatever g_cfg says now.
@@ -1093,22 +1103,50 @@ void drawSettings(XPLMWindowID win, void*) {
                      (unsigned)st.port, st.clients);
             xr::ui::text(g_ui, line, 2);
 
-            snprintf(line, sizeof(line), "Friends type:  %s", shareAddress().c_str());
-            xr::ui::text(g_ui, line, 0);
-
             const xr::upnp::Result u = xr::upnp::latest();
-            if (!g_cfg.hostUpnp) {
-                xr::ui::text(g_ui, "Router not asked -- forward this UDP port yourself.", 1);
-            } else if (xr::upnp::busy()) {
-                xr::ui::text(g_ui, "Asking the router to open the port...", 1);
+            const std::string port = std::to_string(st.port);
+            if (u.mapped && !u.externalIp.empty()) {
+                snprintf(line, sizeof(line), "Friends type:  %s:%s", u.externalIp.c_str(), port.c_str());
+                xr::ui::text(g_ui, line, 0);
+                snprintf(line, sizeof(line), "Router opened the port (%s)%s",
+                         u.router.empty() ? "UPnP" : u.router.c_str(),
+                         u.leaseSeconds ? ", an hour at a time" : "");
+                xr::ui::text(g_ui, line, 2);
             } else if (u.mapped) {
-                snprintf(line, sizeof(line), "Router opened the port (%s)",
+                snprintf(line, sizeof(line), "Router opened the port (%s) but did not say its address",
                          u.router.empty() ? "UPnP" : u.router.c_str());
                 xr::ui::text(g_ui, line, 2);
-            } else if (u.done) {
-                snprintf(line, sizeof(line), "Port not opened: %s", u.error.c_str());
-                xr::ui::text(g_ui, line, 3);
-                xr::ui::text(g_ui, "Friends on your own network can still join.", 1);
+                snprintf(line, sizeof(line), "Friends type:  <your public address>:%s", port.c_str());
+                xr::ui::text(g_ui, line, 0);
+            } else if (xr::upnp::busy()) {
+                xr::ui::text(g_ui, g_cfg.hostUpnp ? "Asking the router to open the port..."
+                                                  : "Looking up your public address...", 1);
+                snprintf(line, sizeof(line), "Friends type:  %s   (on your network)", lanAddress().c_str());
+                xr::ui::text(g_ui, line, 0);
+            } else {
+                // The port is not open. Say exactly what will and will not
+                // work and what to do about it: a 192.168 address handed to
+                // a friend across town is the classic dead end.
+                if (!g_cfg.hostUpnp) {
+                    xr::ui::text(g_ui, "Router not asked to open the port.", 1);
+                } else if (u.doubleNat) {
+                    xr::ui::text(g_ui, "Your router is itself behind another NAT (mobile or shared", 3);
+                    xr::ui::text(g_ui, "internet): hosting over the internet cannot work from here.", 3);
+                } else if (u.done) {
+                    snprintf(line, sizeof(line), "Port not opened: %s", u.error.c_str());
+                    xr::ui::text(g_ui, line, 3);
+                }
+                snprintf(line, sizeof(line), "Friends type:  %s   (on your network)", lanAddress().c_str());
+                xr::ui::text(g_ui, line, 0);
+                if (!u.doubleNat) {
+                    snprintf(line, sizeof(line), "Over the internet: forward UDP %s on your router to %s,",
+                             port.c_str(), xr::localAddress().c_str());
+                    xr::ui::text(g_ui, line, 1);
+                    snprintf(line, sizeof(line), "then friends type  %s:%s",
+                             u.externalIp.empty() ? "<your public address>" : u.externalIp.c_str(),
+                             port.c_str());
+                    xr::ui::text(g_ui, line, 1);
+                }
             }
 
             if (!st.callsigns.empty()) {

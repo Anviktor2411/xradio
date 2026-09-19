@@ -233,6 +233,15 @@ if(XRADIO_BUILD_TESTS)
     # Not a test: renders a WAV through the radio chain so it can be listened to.
     xradio_test_exe(radio_demo     tools/harness/radio_demo.cpp)
 
+    # The UPnP client alone, against tools/harness/fake_igd.py.
+    add_executable(upnp_test tools/harness/upnp_test.cpp plugin/src/upnp.cpp plugin/src/net.cpp)
+    target_include_directories(upnp_test PRIVATE plugin/src)
+    target_link_libraries(upnp_test PRIVATE Threads::Threads)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(upnp_test PRIVATE -g -O1 -fsanitize=address,undefined)
+        target_link_options(upnp_test    PRIVATE -fsanitize=address,undefined)
+    endif()
+
     # Pure maths, no plugin sources needed.
     add_executable(smoothing_test tools/harness/smoothing_test.cpp)
     target_include_directories(smoothing_test PRIVATE plugin/src)

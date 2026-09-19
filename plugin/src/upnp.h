@@ -19,6 +19,10 @@ struct Result {
     bool        done = false;       // the attempt has finished
     bool        mapped = false;     // the router opened the port
     std::string externalIp;         // what the internet sees us as, if known
+    bool        externalFromWeb = false;   // ...learned from the internet, not the router
+    bool        doubleNat = false;  // the router's own WAN address is private: CGNAT /
+                                    // double NAT, so opening its port cannot help
+    int         leaseSeconds = 0;   // 0 = permanent; otherwise the router insisted on a lease
     std::string router;             // which device answered
     std::string error;              // why it did not work, in plain words
 };
@@ -29,9 +33,15 @@ Result addMapping(uint16_t port, const std::string& localIp,
                   const std::string& description, int timeoutMs = 1500);
 bool   removeMapping(uint16_t port, int timeoutMs = 1500);
 
+// The address the internet sees this machine as, asked of the internet
+// itself. Empty if offline. Blocking; the async helper calls it for you.
+std::string publicAddress(int timeoutMs = 2500);
+
 // Fire and forget from the main thread: kicks off a worker, leaves the
 // answer in latest(). Calling it again while one is running is a no-op.
-void   requestAsync(uint16_t port, const std::string& description);
+// With askRouter false only the public address is looked up (for the
+// "forward the port yourself" instructions); the router is left alone.
+void   requestAsync(uint16_t port, const std::string& description, bool askRouter);
 void   releaseAsync();          // remove whatever we mapped
 bool   busy();
 Result latest();

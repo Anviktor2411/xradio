@@ -27,8 +27,19 @@ That is the whole procedure — no VPS, no Python, no terminal, and nothing to
 configure on anyone's router.
 
 If the router will not open the port, the window says so instead of leaving
-you guessing, and people on the same network as the host can still join using
-the host's local address. A dedicated server is still the better answer for a
+you guessing — and says what to do: friends on the same network use the local
+address it shows, and for friends over the internet it spells out which UDP
+port to forward to which machine, and looks up your public address so you
+have something to send them once that is done. A router that is itself behind
+a carrier's NAT (mobile internet, some fibre providers) is recognised and the
+window says hosting over the internet cannot work from there, rather than
+handing out an address that goes nowhere.
+
+The UPnP search goes out of the network interface that carries the internet
+route and is also sent straight to the gateway, because on a PC with
+VirtualBox, VMware, Hyper-V or a VPN adapter installed the operating system's
+default multicast interface is usually the wrong one and the router never
+hears the question. A dedicated server is still the better answer for a
 group that wants to fly without waiting for one particular person to be
 online — see [Running a dedicated server](#running-a-dedicated-server).
 
@@ -191,6 +202,15 @@ each of eight scenarios, drives identical traffic at them over real UDP, and
 compares what the clients receive. Every position-validation rule is probed
 with its own timestamped report, so dropping one rule from one server shows
 up as a state the watching client should never have seen.
+
+`tools/harness/fake_igd.py` is a fake home router — SSDP, the device
+description, the SOAP control endpoint — that deliberately does the awkward
+things real firmware does: a chunked description, a relative control URL
+resolved through `<URLBase>`, and in `lease` mode a refusal of permanent
+mappings with error 725 until asked for a timed one. `upnp_test.cpp` drives
+the real client against it in each mood (`ok`, `lease`, `refuse`,
+`private-wan`, `deaf`) and checks the mapping, its removal, the public
+address, the double-NAT detection and the plain-words errors.
 
 `tools/harness/placement_test.cpp` drives `XPluginStart` under several monitor
 layouts — including a second monitor to the *left* of the main one, which makes
