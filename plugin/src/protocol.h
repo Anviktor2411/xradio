@@ -11,7 +11,7 @@ namespace xr {
 
 // "XRC1" as little-endian bytes.
 static const uint32_t kMagic       = 0x31435258u;
-static const uint16_t kProtoVersion = 2;   // v2: timestamped positions, track, vertical speed
+static const uint16_t kProtoVersion = 3;   // v3: livery, flight password, login rejection
 
 enum PacketType : uint8_t {
     PT_LOGIN     = 1,  // client -> server
@@ -23,6 +23,13 @@ enum PacketType : uint8_t {
     PT_PING      = 7,  // client -> server keepalive
     PT_PONG      = 8,  // server -> client
     PT_LOGOUT    = 9,  // client -> server
+    PT_LOGIN_REJECT = 10,  // server -> client: why the login was refused
+};
+
+// LoginRejectPayload.reason
+enum RejectReason : uint16_t {
+    RJ_PASSWORD = 1,   // wrong or missing flight password
+    RJ_VERSION  = 2,   // client and server are different XRadio versions
 };
 
 // Transmit selector
@@ -49,16 +56,24 @@ struct Header {              // 12 bytes
     uint32_t sessionId;      // 0 until the server assigns one
 };
 
-struct LoginPayload {        // 28 bytes
+struct LoginPayload {        // 76 bytes
     char     callsign[16];   // null-padded, e.g. "ESNA12"
     char     acIcao[8];      // ICAO type code, e.g. "C172"
     uint16_t protoVer;
     uint16_t reserved;
+    // v3
+    char     livery[16];     // the aircraft's livery folder name, for CSL matching
+    char     password[32];   // the flight password; empty if the server has none
 };
 
 struct LoginAckPayload {     // 8 bytes
     uint32_t sessionId;
     uint32_t serverTimeMs;
+};
+
+struct LoginRejectPayload {  // 4 bytes
+    uint16_t reason;         // RejectReason
+    uint16_t reserved;
 };
 
 // State of our own aircraft, sent to the server.
@@ -86,7 +101,7 @@ struct PositionPayload {     // 68 bytes
 };
 
 // One other aircraft, as the server sees it.
-struct TrafficEntry {        // 88 bytes
+struct TrafficEntry {        // 104 bytes
     uint32_t sessionId;
     char     callsign[16];
     char     acIcao[8];
@@ -106,6 +121,7 @@ struct TrafficEntry {        // 88 bytes
     uint32_t timeMs;         // the sender's timestamp, passed through untouched
     float    trackTrue;
     float    vsMs;
+    char     livery[16];     // v3, from the login
 };
 
 struct TrafficHeader {       // 4 bytes, followed by `count` TrafficEntry

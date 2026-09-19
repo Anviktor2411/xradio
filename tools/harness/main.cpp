@@ -69,8 +69,14 @@ int main(int argc, char** argv) {
     }
 
     // ---- settings window: fix the port and callsign through the UI ----
-    harness::tick(0.2f);
-    auto before = harness::draw();
+    // The socket is opened on the network thread now, so give it a moment.
+    std::vector<std::string> before;
+    for (int i = 0; i < 40; ++i) {
+        harness::tick(0.05f);
+        before = harness::draw();
+        if (harness::drawnContains(before, "logging in")) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     if (!harness::drawnContains(before, "logging in")) {
         fprintf(stderr, "FAIL: expected to be logging in (to the wrong port) at start\n");
         return 1;

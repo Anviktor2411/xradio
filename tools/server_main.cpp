@@ -1,6 +1,6 @@
 // The built-in relay server as a standalone program.
 //
-//   ./xradio_server [port]
+//   ./xradio_server [port] [password]
 //
 // Two reasons this exists. It lets someone run the C++ server on a machine
 // without Python, and -- more usefully -- it lets tools/test_server.py run
@@ -25,13 +25,15 @@ int main(int argc, char** argv) {
         port = (uint16_t)v;
     }
 
+    const std::string password = argc > 2 ? argv[2] : "";
     std::string err;
-    if (!xr::relay::start(port, &err)) {
+    if (!xr::relay::start(port, password, &err)) {
         fprintf(stderr, "cannot start: %s\n", err.c_str());
         return 1;
     }
     // test_server.py waits for this line before it starts sending.
-    printf("listening on 0.0.0.0:%u\n", (unsigned)port);
+    printf("listening on 0.0.0.0:%u%s\n", (unsigned)port,
+           password.empty() ? "" : " (password required)");
     fflush(stdout);
 
     int lastClients = -1;

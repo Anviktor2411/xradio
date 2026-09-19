@@ -6,7 +6,9 @@
 // not a re-derived copy of the layout that could drift out of sync with it.
 #include "harness.h"
 #include "settings.h"
+#include "joincode.h"
 #include "ui.h"
+#include "voice.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -68,6 +70,8 @@ int main() {
     {
         xr::Settings s;
         check("sane defaults", s.port_i() == 49100 && s.volume > 0.f && s.showLabels);
+        check("aircraft type comes from the sim unless overridden", s.acIcao.empty());
+        check("no password by default", s.password.empty());
         check("every field has a unique config key", [] {
             xr::Settings t;
             auto f = xr::describe(t);
@@ -114,6 +118,50 @@ int main() {
             }
             return true;
         }());
+    }
+
+    printf("\njoin codes\n");
+    {
+        using namespace xr::joincode;
+        const std::string code = encode("81.90.144.12", 49100);
+        check("an address and port become a ten-letter code", code.size() == 11 && code[5] == '-', code);
+        std::string ip; uint16_t port = 0;
+        check("and come back out of it", decode(code, &ip, &port) && ip == "81.90.144.12" && port == 49100,
+              ip + ":" + std::to_string(port));
+        std::string lower = code;
+        for (auto& c : lower) c = (char)tolower((unsigned char)c);
+        check("lower case, no dash, spaces: all accepted",
+              decode(lower, &ip, &port) && decode(code.substr(0, 5) + code.substr(6), &ip, &port) &&
+              decode(code.substr(0, 5) + " " + code.substr(6), &ip, &port));
+        std::string typo = code;
+        typo[7] = (typo[7] == 'A') ? 'B' : 'A';
+        std::string ip2; uint16_t port2 = 0;
+        // Either the check bits catch the typo, or the damage is confined to
+        // the address being different; it must never decode to the same one.
+        check("a mistyped letter never gives the same address",
+              !decode(typo, &ip2, &port2) || ip2 != ip || port2 != port);
+        check("no zero for O, no one for I: misreadings are corrected", [&] {
+            std::string alt = code;
+            for (auto& c : alt) { if (c == '0') c = 'O'; else if (c == '1') c = 'I'; }
+            std::string ip3; uint16_t p3 = 0;
+            return decode(alt, &ip3, &p3) && ip3 == ip && p3 == port;
+        }());
+        check("a host name is not mistaken for a code",
+              !looksLikeCode("fly.example.net") && !looksLikeCode("41.34.24.79") && looksLikeCode(code));
+        check("port 0 is not encodable", encode("1.2.3.4", 0).empty());
+        check("a non-address is not encodable", encode("fly.example.net", 49100).empty());
+
+        // In the settings, a code in the host field replaces host and port.
+        xr::Settings s;
+        s.host = code;
+        s.port = "1";
+        check("a code in the host field decides where to connect",
+              s.activeHost() == "81.90.144.12" && s.activePort() == 49100,
+              s.activeHost() + ":" + std::to_string(s.activePort()));
+        check("and validates", xr::validate(s).empty(), xr::validate(s));
+        s.host = "K7M2Q-ZZZZZ";
+        check("a wrong code is refused with a hint",
+              xr::validate(s).find("join code") != std::string::npos, xr::validate(s));
     }
 
     printf("\nconfig file round trip\n");
@@ -216,6 +264,7 @@ int main() {
         s.host = "fly.example.net";
         s.port = "49200";
         s.callsign = "SU-CBB";
+        s.acIcao = "C172";              // an override, so the field has text to edit
         s.autoConnect = false;          // no network in this test
         s.volume = 0.5f;
         s.sidetone = false;
@@ -406,6 +455,56 @@ int main() {
             check("escape closes it too", !harness::windowVisible(kWin));
         }
 
+        printf("\nthe push-to-talk key\n");
+        {
+            harness::menu(1);
+            draw();
+            int tx = 0, ty = 0;
+            harness::drawnAt("Audio", &tx, &ty);
+            harness::click(kWin, tx + 10, ty);
+            auto audio = draw();
+            check("starts unbound", shows(audio, "[ none ]"));
+            check("clicked the PTT row", clickRow("Push-to-talk key", kValueX + 10));
+            check("it waits for a key", shows(draw(), "press a key"));
+            harness::pressVk(kWin, 0x20);                   // Space
+            auto bound = draw();
+            check("the pressed key becomes the binding", shows(bound, "[ Space ]"));
+            check("a bare key press does not key the radio yet",
+                  harness::simKey(0x20, true) == 1);        // not saved: sniffer passes it on
+            harness::simKey(0x20, false);
+
+            int bx = 0, by = 0;
+            harness::drawnAt("Save & apply", &bx, &by);
+            harness::click(kWin, bx + 20, by);
+            draw();
+            xr::Settings saved;
+            xr::loadSettings(saved, kCfgPath);
+            check("the binding is saved", saved.pttKey == 0x20, std::to_string(saved.pttKey));
+
+            // Now the sniffer owns Space: pressing it keys the radio, and the
+            // sim does not see the key.
+            check("pressing the bound key is eaten by the plugin", harness::simKey(0x20, true) == 0);
+            check("...and keys the transmitter", xr::voice::transmitting());
+            check("releasing it unkeys", harness::simKey(0x20, false) == 0 && !xr::voice::transmitting());
+            check("other keys still reach the sim", harness::simKey(0x41, true) == 1);
+            harness::simKey(0x41, false);
+
+            // Rebind to none through Escape.
+            harness::menu(1);
+            draw();
+            harness::drawnAt("Audio", &tx, &ty);
+            harness::click(kWin, tx + 10, ty);
+            draw();
+            clickRow("Push-to-talk key", kValueX + 10);
+            harness::pressVk(kWin, 27);
+            check("Escape while capturing means no key", shows(draw(), "[ none ]"));
+            harness::drawnAt("Cancel", &bx, &by);
+            harness::click(kWin, bx + 10, by);
+            draw();
+            check("cancel keeps the saved binding", harness::simKey(0x20, true) == 0);
+            harness::simKey(0x20, false);
+        }
+
         printf("\nkeystrokes keep their order\n");
         {
             // X-Plane hands over keys as they arrive, several per frame on a
@@ -413,6 +512,13 @@ int main() {
             // typed -- and Enter must not act before them.
             harness::menu(1);
             draw();
+            {
+                // The previous section left the window on the Audio tab.
+                int tx = 0, ty = 0;
+                harness::drawnAt("Connection", &tx, &ty);
+                harness::click(kWin, tx + 10, ty);
+                draw();
+            }
             check("clicked the callsign field", clickRow("Callsign", kValueX + 10));
 
             harness::typeText(kWin, "1");

@@ -25,6 +25,9 @@ typedef struct {
     XPLMWindowLayer layer;
     XPLMHandleMouseClick_f handleRightClickFunc;
 } XPLMCreateWindow_t;
+typedef int (*XPLMKeySniffer_f)(char inChar, XPLMKeyFlags inFlags, char inVirtualKey, void* inRefcon);
+int XPLMRegisterKeySniffer(XPLMKeySniffer_f, int inBeforeWindows, void* inRefcon);
+int XPLMUnregisterKeySniffer(XPLMKeySniffer_f, int inBeforeWindows, void* inRefcon);
 XPLMWindowID XPLMCreateWindowEx(XPLMCreateWindow_t*);
 void XPLMDestroyWindow(XPLMWindowID);
 void XPLMGetWindowGeometry(XPLMWindowID, int*, int*, int*, int*);

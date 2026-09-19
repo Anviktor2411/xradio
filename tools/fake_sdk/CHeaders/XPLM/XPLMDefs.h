@@ -21,6 +21,10 @@ enum { xplm_ShiftFlag = 1, xplm_OptionAltFlag = 2, xplm_ControlFlag = 4,
 #define XPLM_VK_RETURN  0x0D
 #define XPLM_VK_ESCAPE  0x1B
 #define XPLM_VK_ENTER   0x6C
+#define XPLM_VK_SPACE   0x20
+#define XPLM_VK_F1      0x70
+#define XPLM_VK_NUMPAD0 0x60
+#define XPLM_VK_LSHIFT  0xA0
 typedef int  XPLMFontID;
 
 enum { xplmFont_Basic = 0, xplmFont_Proportional = 18 };

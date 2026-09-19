@@ -32,7 +32,8 @@ def traffic_entry(callsign=b"FUZZ01", **kw):
         kw.get("lat", 57.85), kw.get("lon", 27.02),
         kw.get("alt", 900.0), 90.0, 0.0, 0.0, 50.0, 0.0, 0.0,
         0, 0, kw.get("tx", 0), 0,
-        kw.get("t", 1000), kw.get("track", 90.0), kw.get("vs", 0.0))
+        kw.get("t", 1000), kw.get("track", 90.0), kw.get("vs", 0.0),
+        P.pad(kw.get("livery", ""), 16))
 
 
 def nasty_packets(sid, rnd):
@@ -54,7 +55,8 @@ def nasty_packets(sid, rnd):
     yield "traffic: callsign with no null terminator", \
         raw(P.PT_TRAFFIC, sid, P.TRAFFIC_HDR.pack(1, 0) +
             P.TRAFFIC_ENTRY.pack(9, b"A" * 16, b"B" * 8, 57.0, 27.0,
-                                 900.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0))
+                                 900.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0,
+                                 b"L" * 16))
     yield "traffic: NaN track and absurd vertical speed", \
         raw(P.PT_TRAFFIC, sid, P.TRAFFIC_HDR.pack(1, 0) +
             traffic_entry(track=float("nan"), vs=1e9))

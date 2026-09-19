@@ -25,8 +25,7 @@ def run(args):
     sock.settimeout(0.2)
     dest = (args.server, args.port)
 
-    sock.sendto(P.pack(P.PT_LOGIN, 0, P.LOGIN.pack(
-        P.pad(args.callsign, 16), P.pad(args.actype, 8), P.PROTO_VERSION, 0)), dest)
+    sock.sendto(P.pack(P.PT_LOGIN, 0, P.login(args.callsign, args.actype)), dest)
 
     sid = 0
     deadline = time.time() + 3.0

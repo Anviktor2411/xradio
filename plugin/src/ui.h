@@ -78,6 +78,11 @@ bool slider(Ctx& c, const char* label, float& value, float lo, float hi,
 bool choice(Ctx& c, const char* label, std::string& value,
             const std::vector<std::string>& options, const char* empty);
 
+// `Label  [ Space ]  click to change`. Clicking the row starts capturing;
+// the caller stores the next key that arrives and clears `capturing`.
+// Returns true when capture was started this frame.
+bool keybind(Ctx& c, const char* label, const std::string& keyName, bool& capturing);
+
 // Plain text line, no interaction.
 void text(Ctx& c, const char* s, int colour = 0);   // 0 white, 1 grey, 2 green, 3 amber
 

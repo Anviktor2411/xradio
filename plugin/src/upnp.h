@@ -43,6 +43,7 @@ std::string publicAddress(int timeoutMs = 2500);
 // "forward the port yourself" instructions); the router is left alone.
 void   requestAsync(uint16_t port, const std::string& description, bool askRouter);
 void   releaseAsync();          // remove whatever we mapped
+void   tick(const std::string& description);   // renews a timed lease; call every few seconds
 bool   busy();
 Result latest();
 void   clear();

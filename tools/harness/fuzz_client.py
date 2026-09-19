@@ -82,8 +82,7 @@ class Session:
         self.backlog = 0
 
     def login(self):
-        self.sock.sendto(P.pack(P.PT_LOGIN, 0, P.LOGIN.pack(
-            P.pad(self.callsign, 16), P.pad("C172", 8), P.PROTO_VERSION, 0)),
+        self.sock.sendto(P.pack(P.PT_LOGIN, 0, P.login(self.callsign, "C172")),
             self.dest)
         try:
             data, _ = self.sock.recvfrom(2048)

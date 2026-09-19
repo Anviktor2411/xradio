@@ -29,7 +29,7 @@ TRAFFIC_HZ = 10.0           # traffic broadcast rate: twice the clients' report 
 TRAFFIC_RANGE_NM = 80.0     # how far away other aircraft are still sent
 SESSION_TIMEOUT_S = 15.0    # drop a client we have not heard from
 TX_HOLD_S = 0.4             # how long txActive stays set after the last voice frame
-MAX_ENTRIES_PER_PACKET = 15  # 15 * 88 + 16 < 1400 bytes
+MAX_ENTRIES_PER_PACKET = 13  # 13 * 104 + 16 < 1400 bytes
 MAX_TEXT_BYTES = 200        # cap relayed text so one client cannot spam huge frames
 MAX_VOICE_BYTES = 512       # one 20 ms Opus frame at 24 kbit/s is ~60 bytes
 
@@ -41,6 +41,7 @@ class Session:
     callsign: str
     ac_icao: str
     last_seen: float
+    livery: str = ""
     lat: float = 0.0
     lon: float = 0.0
     alt_m: float = 0.0
@@ -115,7 +116,8 @@ def in_radio_range(a: Session, b: Session) -> bool:
 
 
 class XRadioServer(asyncio.DatagramProtocol):
-    def __init__(self):
+    def __init__(self, password: str = ""):
+        self.password = password       # empty: anyone may join
         self.transport = None
         self.sessions: dict[tuple, Session] = {}   # addr -> Session
         self.by_sid: dict[int, Session] = {}
@@ -133,6 +135,11 @@ class XRadioServer(asyncio.DatagramProtocol):
             return                      # not ours, or truncated -- ignore silently
         ptype, version, _plen, sid, payload = parsed
         if version != P.PROTO_VERSION:
+            # Tell a login from another version why it is getting nowhere;
+            # the header is the same in every version, so the reply can at
+            # least be seen. Anything else from a mismatched client is dropped.
+            if ptype == P.PT_LOGIN:
+                self._send(addr, P.PT_LOGIN_REJECT, 0, P.LOGIN_REJECT.pack(P.RJ_VERSION, 0))
             return
         try:
             self._dispatch(ptype, sid, payload, addr)
@@ -177,13 +184,20 @@ class XRadioServer(asyncio.DatagramProtocol):
     def _on_login(self, payload, addr):
         if len(payload) < P.LOGIN.size:
             return
-        callsign_raw, icao_raw, proto_ver, _res = P.LOGIN.unpack_from(payload, 0)
+        (callsign_raw, icao_raw, proto_ver, _res,
+         livery_raw, password_raw) = P.LOGIN.unpack_from(payload, 0)
         if proto_ver != P.PROTO_VERSION:
             LOG.warning("rejecting %s: protocol v%s", addr, proto_ver)
+            self._send(addr, P.PT_LOGIN_REJECT, 0, P.LOGIN_REJECT.pack(P.RJ_VERSION, 0))
+            return
+        if self.password and P.cstr(password_raw) != self.password:
+            LOG.warning("rejecting %s: wrong password", addr)
+            self._send(addr, P.PT_LOGIN_REJECT, 0, P.LOGIN_REJECT.pack(P.RJ_PASSWORD, 0))
             return
 
         callsign = _clean(P.cstr(callsign_raw), 15)
         ac_icao = _clean(P.cstr(icao_raw), 7)
+        livery = _clean(P.cstr(livery_raw), 15)
 
         old = self.sessions.pop(addr, None)
         if old:
@@ -197,6 +211,7 @@ class XRadioServer(asyncio.DatagramProtocol):
             callsign=callsign or f"UNK{sid}",
             ac_icao=ac_icao or "ZZZZ",
             last_seen=time.monotonic(),
+            livery=livery,
         )
         self.sessions[addr] = s
         self.by_sid[sid] = s
@@ -348,7 +363,8 @@ class XRadioServer(asyncio.DatagramProtocol):
                 o.lat, o.lon, o.alt_m, o.heading, o.pitch, o.roll,
                 o.gs_ms, o.gear, o.flap,
                 o.lights, o.on_ground, tx_active, 0,
-                o.time_ms, o.track, o.vs_ms))
+                o.time_ms, o.track, o.vs_ms,
+                P.pad(o.livery, 16)))
         self._send(me.addr, P.PT_TRAFFIC, me.sid, b"".join(parts))
 
 
@@ -356,6 +372,8 @@ async def main():
     ap = argparse.ArgumentParser(description="XRadio relay server")
     ap.add_argument("--host", default=os.environ.get("XRADIO_HOST", "0.0.0.0"))
     ap.add_argument("--port", type=int, default=int(os.environ.get("XRADIO_PORT", "49100")))
+    ap.add_argument("--password", default=os.environ.get("XRADIO_PASSWORD", ""),
+                    help="flight password pilots must give to join (default: none)")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
@@ -365,7 +383,9 @@ async def main():
     )
 
     loop = asyncio.get_running_loop()
-    server = XRadioServer()
+    server = XRadioServer(password=args.password)
+    if args.password:
+        LOG.info("a flight password is required to join")
     transport, _ = await loop.create_datagram_endpoint(
         lambda: server, local_addr=(args.host, args.port))
     try:

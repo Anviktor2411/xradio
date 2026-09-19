@@ -303,6 +303,42 @@ int main() {
         setTransmitting(false);
         check("sidetone plays your own voice back while keyed", side > 2000.0, std::to_string(side));
 
+        // The cockpit's volume knobs: a voice on COM1 follows COM1's knob, one
+        // on a frequency neither radio has plays at full so it is not lost.
+        fresh(); setHiss(0.f);
+        setRadioVolumes(122800, 1.f, 118100, 1.f);
+        {
+            auto f = encode(tone(300));
+            for (size_t i = 0; i < f.size(); ++i)
+                onIncomingFrame(40, (uint16_t)i, f[i].opus.data(), (int)f[i].opus.size(), 122800);
+        }
+        const double knobUp = rms(slice(renderMs(300), 100, 300));
+        fresh(); setHiss(0.f);
+        setRadioVolumes(122800, 0.1f, 118100, 1.f);
+        {
+            auto f = encode(tone(300));
+            for (size_t i = 0; i < f.size(); ++i)
+                onIncomingFrame(41, (uint16_t)i, f[i].opus.data(), (int)f[i].opus.size(), 122800);
+        }
+        const double knobDown = rms(slice(renderMs(300), 100, 300));
+        check("turning COM1 down in the cockpit turns its voices down",
+              knobDown < knobUp * 0.5, std::to_string(knobDown) + " vs " + std::to_string(knobUp));
+        fresh(); setHiss(0.f);
+        setRadioVolumes(122800, 0.1f, 118100, 0.1f);
+        {
+            auto f = encode(tone(300));
+            for (size_t i = 0; i < f.size(); ++i)
+                onIncomingFrame(42, (uint16_t)i, f[i].opus.data(), (int)f[i].opus.size(), 121500);
+        }
+        const double neither = rms(slice(renderMs(300), 100, 300));
+        check("a frequency neither radio has is not silenced by either knob",
+              neither > knobUp * 0.5, std::to_string(neither));
+
+        check("signal quality reads back for the window's bars", [] {
+            setSignalQuality(77, 0.3f);
+            return signalQualityOf(77) > 0.29f && signalQualityOf(77) < 0.31f && signalQualityOf(78) == 1.f;
+        }());
+
         // Switched off, the radio gets out of the way entirely.
         fresh(); setRadioFilter(false); setHiss(1.f);
         feed(32, encode(tone(300, 6000.0)));

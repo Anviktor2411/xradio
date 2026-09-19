@@ -59,14 +59,24 @@ class Client:
         self.sock.sendto(P.pack(ptype, self.sid if sid is None else sid, payload),
                          self.dest)
 
-    def login(self, proto=P.PROTO_VERSION, callsign=None, ac=None):
+    def login(self, proto=P.PROTO_VERSION, callsign=None, ac=None, livery="",
+              password=""):
         self.send(P.PT_LOGIN, P.LOGIN.pack(
             P.pad(callsign if callsign is not None else self.callsign, 16),
-            P.pad(ac if ac is not None else self.ac, 8), proto, 0), sid=0)
-        pkt = self.recv(P.PT_LOGIN_ACK)
-        if pkt is not None:
-            self.sid, _ = P.LOGIN_ACK.unpack_from(pkt, 0)
-        return self.sid
+            P.pad(ac if ac is not None else self.ac, 8), proto, 0,
+            P.pad(livery, 16), P.pad(password, 32)), sid=0)
+        self.rejected = None
+        pkt = self.recv(None)
+        while pkt is not None:
+            ptype, payload = pkt
+            if ptype == P.PT_LOGIN_ACK:
+                self.sid, _ = P.LOGIN_ACK.unpack_from(payload, 0)
+                return self.sid
+            if ptype == P.PT_LOGIN_REJECT:
+                self.rejected, _ = P.LOGIN_REJECT.unpack_from(payload, 0)
+                return 0
+            pkt = self.recv(None)
+        return 0
 
     def position(self, tx=P.TX_NONE, rx=P.RX_COM1, sid=None, lat=None, lon=None,
                  alt_ft=None, gs=50.0, gear=0.0, flap=0.0, time_ms=0,
@@ -99,7 +109,9 @@ class Client:
             if parsed is None:
                 continue
             ptype, _v, _l, _sid, payload = parsed
-            if want is None or ptype == want:
+            if want is None:
+                return (ptype, payload)
+            if ptype == want:
                 return payload
         return None
 
@@ -408,6 +420,45 @@ def scenario_garbage(port):
     return out
 
 
+def scenario_password(port):
+    """The server runs with a flight password; the door must behave the same."""
+    out = {}
+    nopw = Client(port, "ESNOPW", 57.85, 27.02)
+    out["without_password_sid"] = nopw.login()
+    out["without_password_reason"] = nopw.rejected
+    wrong = Client(port, "ESWRNG", 57.85, 27.02)
+    out["wrong_password_sid"] = wrong.login(password="clouds")
+    out["wrong_password_reason"] = wrong.rejected
+    right = Client(port, "ESOKPW", 57.85, 27.02)
+    out["right_password_joined"] = right.login(password="sky") != 0
+    old = Client(port, "ESOLDV", 57.85, 27.02)
+    old.login(proto=2, password="sky")
+    out["old_version_reason"] = old.rejected
+    # a v2 *header* gets the same answer, so an old build sees why
+    old.sock.sendto(P.HEADER.pack(P.MAGIC, P.PT_LOGIN, 2, P.LOGIN.size,
+                                  0) + P.login("ESOLDV", "C172", "", "sky"), old.dest)
+    pkt = old.recv(P.PT_LOGIN_REJECT)
+    out["old_header_reason"] = P.LOGIN_REJECT.unpack_from(pkt, 0)[0] if pkt else None
+    # liveries come back in traffic
+    a = Client(port, "ESLIVA", 57.85, 27.02)
+    b = Client(port, "ESLIVB", 57.855, 27.025)
+    a.login(password="sky", livery="Lufthansa"); b.login(password="sky")
+    for _ in range(3):
+        a.position(); b.position(); time.sleep(0.12)
+    liveries = set()
+    for payload in b.drain(0.4)[P.PT_TRAFFIC]:
+        count, _ = P.TRAFFIC_HDR.unpack_from(payload, 0)
+        off = P.TRAFFIC_HDR.size
+        for _ in range(count):
+            e = P.TRAFFIC_ENTRY.unpack_from(payload, off); off += P.TRAFFIC_ENTRY.size
+            if P.cstr(e[1]) == "ESLIVA":
+                liveries.add(P.cstr(e[19]))
+    out["livery_seen"] = sorted(liveries)
+    for c in (nopw, wrong, right, old, a, b):
+        c.close()
+    return out
+
+
 SCENARIOS = [
     ("login and traffic", scenario_login_and_traffic),
     ("login validation", scenario_bad_login),
@@ -417,17 +468,20 @@ SCENARIOS = [
     ("session id enforcement", scenario_session_id),
     ("logout", scenario_logout),
     ("garbage packets", scenario_garbage),
+    ("flight password", scenario_password),
 ]
+# scenarios whose server runs with a flight password
+PASSWORDED = {"flight password": "sky"}
 
 
 # ---------------------------------------------------------------------------
 # running a server
 # ---------------------------------------------------------------------------
-def wait_until_up(port, timeout=8.0):
+def wait_until_up(port, password="", timeout=8.0):
     probe = Client(port, "PROBE1", 0.0, 0.0)
     end = time.time() + timeout
     while time.time() < end:
-        if probe.login() != 0:
+        if probe.login(password=password) != 0:
             probe.send(P.PT_LOGOUT)
             probe.close()
             return True
@@ -450,10 +504,10 @@ def run_against(label, make_cmd, base_port, cwd=None):
     results = {}
     for i, (name, fn) in enumerate(SCENARIOS):
         port = base_port + i
-        proc = subprocess.Popen(make_cmd(port), cwd=cwd,
+        proc = subprocess.Popen(make_cmd(port, PASSWORDED.get(name, "")), cwd=cwd,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
-            if not wait_until_up(port):
+            if not wait_until_up(port, PASSWORDED.get(name, "")):
                 print(f"  server did not come up on port {port}")
                 return None
             results[name] = fn(port)
@@ -480,11 +534,12 @@ def main():
 
     py = run_against(
         "python server",
-        lambda p: [sys.executable, str(ROOT / "server" / "server.py"), "--port", str(p)],
+        lambda p, pw: [sys.executable, str(ROOT / "server" / "server.py"), "--port", str(p)]
+                      + (["--password", pw] if pw else []),
         args.port, cwd=str(ROOT / "server"))
     cpp = run_against(
         "built-in C++ server",
-        lambda p: [args.cpp, str(p)],
+        lambda p, pw: [args.cpp, str(p)] + ([pw] if pw else []),
         args.port + len(SCENARIOS) + 1)
 
     if py is None or cpp is None:
@@ -565,6 +620,18 @@ def main():
     r = cpp["garbage packets"]
     check("a working session survives a burst of junk",
           any(t[0] == "ESGAR1" for t in r["still_working"]), str(r["still_working"]))
+
+    r = cpp["flight password"]
+    check("no password is refused and told why",
+          r["without_password_sid"] == 0 and r["without_password_reason"] == P.RJ_PASSWORD)
+    check("a wrong password is refused and told why",
+          r["wrong_password_sid"] == 0 and r["wrong_password_reason"] == P.RJ_PASSWORD)
+    check("the right password gets in", r["right_password_joined"])
+    check("an old version is told it is an old version",
+          r["old_version_reason"] == P.RJ_VERSION and r["old_header_reason"] == P.RJ_VERSION,
+          str((r["old_version_reason"], r["old_header_reason"])))
+    check("the livery given at login is relayed in traffic", r["livery_seen"] == ["Lufthansa"],
+          str(r["livery_seen"]))
 
     print()
     if failures:

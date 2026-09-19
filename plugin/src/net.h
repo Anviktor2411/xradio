@@ -93,6 +93,11 @@ private:
     std::mutex sendMx_;
 };
 
+// Wait up to timeoutMs for a socket to be readable (or writable). >0 ready,
+// 0 timed out, <0 error. poll() on POSIX, so descriptors above FD_SETSIZE
+// are fine; select() on Windows, where they are.
+int waitSocket(long long fd, bool forWrite, int timeoutMs);
+
 // Best guess at this machine's address on the local network, for the
 // "tell your friends to type this" line. Empty if it cannot be worked out.
 std::string localAddress();

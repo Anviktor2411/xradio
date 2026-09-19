@@ -23,7 +23,7 @@
 #  include <fcntl.h>
 #  include <netdb.h>
 #  include <netinet/in.h>
-#  include <sys/select.h>
+#  include <poll.h>
 #  include <sys/socket.h>
 #  include <unistd.h>
 #  define XR_INVALID (-1)
@@ -32,6 +32,33 @@
 #endif
 
 namespace xr {
+
+// Wait for a socket to become readable or writable. select() is used on
+// Windows, where its fd_set is a list; on POSIX it is a bitmap of at most
+// FD_SETSIZE (1024) descriptors, and X-Plane with a few hundred scenery
+// files and other plugins' sockets open can hand us a descriptor above
+// that -- FD_SET then writes past the end of the set. poll() has no limit.
+int waitSocket(long long fd, bool forWrite, int timeoutMs) {
+    if (fd == XR_INVALID) return -1;
+#ifdef _WIN32
+    fd_set s;
+    FD_ZERO(&s);
+    FD_SET((SOCKET)fd, &s);
+    timeval tv;
+    tv.tv_sec  = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    return select(0, forWrite ? nullptr : &s, forWrite ? &s : nullptr, nullptr, &tv);
+#else
+    pollfd p{};
+    p.fd = (int)fd;
+    p.events = forWrite ? POLLOUT : POLLIN;
+    const int r = poll(&p, 1, timeoutMs);
+    if (r > 0 && (p.revents & (POLLERR | POLLHUP | POLLNVAL)) && !(p.revents & p.events)) {
+        return -1;
+    }
+    return r;
+#endif
+}
 
 #ifdef _WIN32
 namespace {
@@ -52,7 +79,10 @@ bool UdpSocket::open(const std::string& host, uint16_t port, std::string* err) {
     snprintf(portStr, sizeof(portStr), "%u", (unsigned)port);
 
     addrinfo hints{};
-    hints.ai_family   = AF_UNSPEC;      // IPv4 or IPv6, whichever resolves
+    // IPv4 only, same as the servers: a name that also has an IPv6 address
+    // (localhost on most systems, for one) would otherwise be sent to over
+    // v6 and never arrive, with nothing to say why.
+    hints.ai_family   = AF_INET;
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_protocol = IPPROTO_UDP;
 
@@ -111,19 +141,7 @@ bool UdpSocket::send(const void* data, int len) {
 
 int UdpSocket::recvWait(void* buf, int maxLen, int timeoutMs) {
     if (fd_ == XR_INVALID) return -1;
-    fd_set rd;
-    FD_ZERO(&rd);
-#ifdef _WIN32
-    FD_SET((SOCKET)fd_, &rd);
-    const int nfds = 0;                       // ignored on Windows
-#else
-    FD_SET((int)fd_, &rd);
-    const int nfds = (int)fd_ + 1;
-#endif
-    timeval tv;
-    tv.tv_sec  = timeoutMs / 1000;
-    tv.tv_usec = (timeoutMs % 1000) * 1000;
-    const int r = select(nfds, &rd, nullptr, nullptr, &tv);
+    const int r = waitSocket(fd_, false, timeoutMs);
     if (r <= 0) return r < 0 ? -1 : 0;        // error, or nothing within the timeout
     return recv(buf, maxLen);
 }
@@ -191,14 +209,15 @@ bool UdpServerSocket::open(uint16_t port, const std::string& bindAddr, std::stri
         return false;
     }
 
-    // Without this a restart within the TIME_WAIT window fails to bind, which
-    // looks to the pilot like "hosting is broken" when they toggle it off and
-    // straight back on.
-    int yes = 1;
+    // UDP has no TIME_WAIT, so there is no reason to share the port -- and
+    // every reason not to: on Windows SO_REUSEADDR lets a second listener
+    // bind a port that is already taken, so "port in use" would never be
+    // reported and datagrams would go to whichever socket won. Ask for the
+    // opposite instead.
 #ifdef _WIN32
-    setsockopt((SOCKET)f, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof(yes));
-#else
-    setsockopt((int)f, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    int exclusive = 1;
+    setsockopt((SOCKET)f, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, (const char*)&exclusive,
+               sizeof(exclusive));
 #endif
 
     if (bind(
@@ -208,13 +227,30 @@ bool UdpServerSocket::open(uint16_t port, const std::string& bindAddr, std::stri
             (int)f,
 #endif
             res->ai_addr, (socklen_t)res->ai_addrlen) != 0) {
+#ifdef _WIN32
+        const int code = WSAGetLastError();
+        const bool inUse = code == WSAEADDRINUSE;
+        const bool denied = code == WSAEACCES;
+#else
+        const int code = errno;
+        const bool inUse = code == EADDRINUSE;
+        const bool denied = code == EACCES;
+#endif
         freeaddrinfo(res);
         XR_CLOSE(f);
         if (err) {
-            char msg[128];
-            snprintf(msg, sizeof(msg),
-                     "port %u is already in use (another server running?)",
-                     (unsigned)port);
+            char msg[160];
+            if (inUse) {
+                snprintf(msg, sizeof(msg),
+                         "port %u is already in use (another server running?)", (unsigned)port);
+            } else if (denied) {
+                snprintf(msg, sizeof(msg),
+                         "not allowed to use port %u here -- pick one above 1024",
+                         (unsigned)port);
+            } else {
+                snprintf(msg, sizeof(msg), "cannot listen on port %u (error %d)",
+                         (unsigned)port, code);
+            }
             *err = msg;
         }
         return false;
@@ -253,20 +289,7 @@ void UdpServerSocket::close() {
 
 int UdpServerSocket::recvFrom(void* buf, int maxLen, Peer* from, int timeoutMs) {
     if (fd_ == XR_INVALID) return -1;
-
-    fd_set rd;
-    FD_ZERO(&rd);
-#ifdef _WIN32
-    FD_SET((SOCKET)fd_, &rd);
-    const int nfds = 0;
-#else
-    FD_SET((int)fd_, &rd);
-    const int nfds = (int)fd_ + 1;
-#endif
-    timeval tv;
-    tv.tv_sec  = timeoutMs / 1000;
-    tv.tv_usec = (timeoutMs % 1000) * 1000;
-    const int r = select(nfds, &rd, nullptr, nullptr, &tv);
+    const int r = waitSocket(fd_, false, timeoutMs);
     if (r <= 0) return r < 0 ? -1 : 0;
 
     sockaddr_storage src{};

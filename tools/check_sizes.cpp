@@ -7,6 +7,7 @@ int main() {
     printf("HEADER %zu\n",        sizeof(xr::Header));
     printf("LOGIN %zu\n",         sizeof(xr::LoginPayload));
     printf("LOGIN_ACK %zu\n",     sizeof(xr::LoginAckPayload));
+    printf("LOGIN_REJECT %zu\n",  sizeof(xr::LoginRejectPayload));
     printf("POSITION %zu\n",      sizeof(xr::PositionPayload));
     printf("TRAFFIC_HDR %zu\n",   sizeof(xr::TrafficHeader));
     printf("TRAFFIC_ENTRY %zu\n", sizeof(xr::TrafficEntry));

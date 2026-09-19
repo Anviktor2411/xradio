@@ -14,6 +14,7 @@ struct RemoteState {
     uint32_t    sid      = 0;
     std::string callsign;
     std::string acIcao;
+    std::string livery;           // livery folder name, for CSL matching; may be empty
     double      lat      = 0.0;
     double      lon      = 0.0;
     float       altFt    = 0.f;

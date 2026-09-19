@@ -181,6 +181,28 @@ bool choice(Ctx& c, const char* label, std::string& value,
     return changed;
 }
 
+bool keybind(Ctx& c, const char* label, const std::string& keyName, bool& capturing) {
+    const int self = c.index++;
+    bool started = false;
+    if (c.rowHit()) {
+        capturing = true;
+        started = true;
+        c.focus = self;
+        c.clicked = false;
+    }
+    draw(c, 10, label, 1);
+    char buf[96];
+    if (capturing) {
+        snprintf(buf, sizeof(buf), "press a key...   (Escape: none)");
+        draw(c, kBarX, buf, 2);
+    } else {
+        snprintf(buf, sizeof(buf), "[ %s ]   click to change", keyName.c_str());
+        draw(c, kBarX, buf, keyName == "none" ? 1 : 0);
+    }
+    c.nextRow();
+    return started;
+}
+
 void text(Ctx& c, const char* s, int col) {
     draw(c, 10, s, col);
     c.nextRow();

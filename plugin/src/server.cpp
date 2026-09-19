@@ -26,6 +26,7 @@ struct Session {
     Peer        peer;
     std::string callsign;
     std::string acIcao;
+    std::string livery;
     double      lastSeen = 0;
 
     double  lat = 0, lon = 0;
@@ -120,7 +121,8 @@ public:
     // Called for every datagram the server wants to send.
     using Sink = void (*)(void* ctx, const Peer& to, const void* data, int len);
 
-    Core(Sink sink, void* ctx) : sink_(sink), ctx_(ctx) {}
+    Core(Sink sink, void* ctx, std::string password)
+        : sink_(sink), ctx_(ctx), password_(std::move(password)) {}
 
     void onPacket(const Peer& from, const uint8_t* data, int len, double now);
     void tick(double now);
@@ -151,6 +153,7 @@ private:
 
     Sink     sink_;
     void*    ctx_;
+    std::string password_;              // empty: open to all
     std::map<Peer, Session> sessions_;
     uint32_t nextSid_ = 1;
     double   lastTraffic_ = 0;
@@ -183,7 +186,16 @@ void Core::onPacket(const Peer& from, const uint8_t* data, int len, double now) 
     Header h{};
     memcpy(&h, data, sizeof(h));
     if (h.magic != kMagic) return;
-    if (h.version != kProtoVersion) return;
+    if (h.version != kProtoVersion) {
+        // A login from another version is told why it gets nowhere; the
+        // header is the same in every version, so the reply can be read.
+        if (h.type == PT_LOGIN) {
+            LoginRejectPayload rj{};
+            rj.reason = RJ_VERSION;
+            send(from, PT_LOGIN_REJECT, 0, &rj, (int)sizeof(rj));
+        }
+        return;
+    }
 
     // The declared length must match what actually arrived; a lying header is
     // the first thing a fuzzer tries.
@@ -215,10 +227,26 @@ void Core::onLogin(const Peer& from, const uint8_t* p, int len, double now) {
     if (len < (int)sizeof(LoginPayload)) return;
     LoginPayload lp{};
     memcpy(&lp, p, sizeof(lp));
-    if (lp.protoVer != kProtoVersion) return;
+    if (lp.protoVer != kProtoVersion) {
+        LoginRejectPayload rj{};
+        rj.reason = RJ_VERSION;
+        send(from, PT_LOGIN_REJECT, 0, &rj, (int)sizeof(rj));
+        return;
+    }
+    if (!password_.empty()) {
+        // fixed-width, may lack a terminator
+        std::string given(lp.password, strnlen(lp.password, sizeof(lp.password)));
+        if (given != password_) {
+            LoginRejectPayload rj{};
+            rj.reason = RJ_PASSWORD;
+            send(from, PT_LOGIN_REJECT, 0, &rj, (int)sizeof(rj));
+            return;
+        }
+    }
 
     std::string callsign = clean(lp.callsign, sizeof(lp.callsign), 15);
     std::string acIcao   = clean(lp.acIcao,   sizeof(lp.acIcao),   7);
+    std::string livery   = clean(lp.livery,   sizeof(lp.livery),   15);
 
     sessions_.erase(from);                  // a re-login replaces the old session
 
@@ -227,6 +255,7 @@ void Core::onLogin(const Peer& from, const uint8_t* p, int len, double now) {
     s.peer     = from;
     s.callsign = callsign.empty() ? ("UNK" + std::to_string(s.sid)) : callsign;
     s.acIcao   = acIcao.empty() ? "ZZZZ" : acIcao;
+    s.livery   = livery;
     s.lastSeen = now;
     const uint32_t sid = s.sid;
     sessions_[from] = s;
@@ -423,6 +452,7 @@ void Core::sendTraffic(Session& me, const std::vector<Session*>& others, double 
         e.lights = o->lights; e.onGround = o->onGround;
         e.txActive = txActive; e.reserved = 0;
         e.timeMs = o->timeMs; e.trackTrue = o->track; e.vsMs = o->vsMs;
+        padInto(e.livery, sizeof(e.livery), o->livery);
 
         if (off + sizeof(e) > sizeof(payload)) break;
         memcpy(payload + off, &e, sizeof(e));
@@ -441,6 +471,7 @@ std::thread       g_thread;
 std::atomic<bool> g_run{false};
 std::mutex        g_statusMx;
 Status            g_status;
+std::string       g_password;
 
 double nowSeconds() {
     static const auto t0 = std::chrono::steady_clock::now();
@@ -452,7 +483,7 @@ void sinkFn(void*, const Peer& to, const void* data, int len) {
 }
 
 void serverThread() {
-    Core core(sinkFn, nullptr);
+    Core core(sinkFn, nullptr, g_password);
     uint8_t buf[kMaxPacket];
     uint64_t in = 0;
     double lastStatus = 0;
@@ -482,8 +513,9 @@ void serverThread() {
 
 }  // namespace
 
-bool start(uint16_t port, std::string* err) {
+bool start(uint16_t port, const std::string& password, std::string* err) {
     stop();
+    g_password = password;
     std::string e;
     if (!g_sock.open(port, "", &e)) {
         if (err) *err = e;

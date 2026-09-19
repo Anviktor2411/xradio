@@ -25,6 +25,7 @@
 namespace harness {
 
 std::map<std::string, double> g_values;
+std::map<std::string, std::string> g_strings;
 std::vector<std::string>      g_drawn;
 std::vector<Drawn>            g_drawnAt;   // same lines, with where they landed
 std::vector<std::string>      g_log;
@@ -46,10 +47,17 @@ int  g_screenL = 0, g_screenT = 1080, g_screenR = 1920, g_screenB = 0;
 struct Mon { int l, t, r, b; };
 std::vector<Mon> g_monitors;
 XPLMCommandCallback_f         g_pttHandler = nullptr;
+XPLMKeySniffer_f              g_sniffer    = nullptr;
+void*                         g_snifferRef = nullptr;
 XPLMMenuHandler_f             g_menuFunc   = nullptr;
 bool                          g_verbose    = false;
 
 void set(const std::string& name, double v) { g_values[name] = v; }
+void setString(const std::string& name, const std::string& v) { g_strings[name] = v; }
+std::string getString(const std::string& name) {
+    auto it = g_strings.find(name);
+    return it == g_strings.end() ? std::string() : it->second;
+}
 
 double get(const std::string& name) {
     auto it = g_values.find(name);
@@ -144,6 +152,13 @@ void windowTop(int id, int* t, int* l) {
     if (l) *l = w ? w->l : 0;
 }
 
+// A key pressed in the sim with no window focused: goes to the key sniffer.
+// Returns what the sniffer returned (0 = it ate the key), or 1 if none.
+int simKey(int vk, bool down) {
+    if (!g_sniffer) return 1;
+    return g_sniffer(0, down ? xplm_DownFlag : xplm_UpFlag, (char)vk, g_snifferRef);
+}
+
 void ptt(bool down) {
     if (g_pttHandler) {
         g_pttHandler((XPLMCommandRef)1, down ? xplm_CommandBegin : xplm_CommandEnd, nullptr);
@@ -190,6 +205,16 @@ static std::string refName(XPLMDataRef r) {
 float  XPLMGetDataf(XPLMDataRef r) { return (float)harness::get(refName(r)); }
 double XPLMGetDatad(XPLMDataRef r) { return harness::get(refName(r)); }
 int    XPLMGetDatai(XPLMDataRef r) { return (int)harness::get(refName(r)); }
+
+// String datarefs (acf_ICAO, livery path): the harness sets them with
+// setString(); a numeric-only ref reads back as empty.
+int XPLMGetDatab(XPLMDataRef r, void* out, int, int inMax) {
+    const std::string v = harness::getString(refName(r));
+    if (!out) return (int)v.size();
+    const int n = (int)v.size() < inMax ? (int)v.size() : inMax;
+    memcpy(out, v.data(), (size_t)n);
+    return n;
+}
 
 int XPLMGetDatavf(XPLMDataRef r, float* out, int, int inMax) {
     if (inMax < 1 || !out) return 0;
@@ -256,6 +281,16 @@ void XPLMDrawString(float*, int x, int y, char* s, int*, XPLMFontID) {
     if (!s) return;
     harness::g_drawn.push_back(s);
     harness::g_drawnAt.push_back({s, x, y});
+}
+
+int XPLMRegisterKeySniffer(XPLMKeySniffer_f cb, int, void* ref) {
+    harness::g_sniffer = cb;
+    harness::g_snifferRef = ref;
+    return 1;
+}
+int XPLMUnregisterKeySniffer(XPLMKeySniffer_f, int, void*) {
+    harness::g_sniffer = nullptr;
+    return 1;
 }
 
 XPLMMenuID XPLMFindPluginsMenu(void) { return (XPLMMenuID)1; }

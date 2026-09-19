@@ -23,7 +23,7 @@ constexpr double kTrafficHz        = 10.0;   // twice the clients' report rate
 constexpr double kTrafficRangeNm   = 80.0;
 constexpr double kSessionTimeoutS  = 15.0;
 constexpr double kTxHoldS          = 0.4;
-constexpr int    kMaxEntriesPerPacket = 15;  // 15 * 88 + 16 < 1400 bytes
+constexpr int    kMaxEntriesPerPacket = 13;  // 13 * 104 + 16 < 1400 bytes
 constexpr int    kMaxTextBytes     = 200;
 constexpr int    kMaxVoiceBytes    = 512;
 
@@ -39,7 +39,8 @@ struct Status {
 
 // Starts the listener and its own thread. Returns false (and fills `err`) if
 // the port cannot be bound -- almost always something else already on it.
-bool start(uint16_t port, std::string* err);
+// `password` empty means anyone may join.
+bool start(uint16_t port, const std::string& password, std::string* err);
 void stop();
 bool running();
 

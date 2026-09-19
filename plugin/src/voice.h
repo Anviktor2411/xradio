@@ -72,7 +72,18 @@ void setTransmitting(bool on);   // PTT
 bool transmitting();
 
 // A frame from another pilot, in the order the network delivered them.
-void onIncomingFrame(uint32_t sid, uint16_t seq, const uint8_t* data, int len);
+// `freqKhz` is the frequency it came in on, so the cockpit's per-radio
+// volume knob can be applied to it; 0 if unknown.
+void onIncomingFrame(uint32_t sid, uint16_t seq, const uint8_t* data, int len,
+                     uint32_t freqKhz = 0);
+
+// The cockpit audio panel: what COM1 and COM2 are tuned to and how far up
+// their volume knobs are (0..1). Incoming voice on a frequency one of them is
+// tuned to is scaled by that knob, like it would be in the aircraft.
+void setRadioVolumes(uint32_t com1Khz, float com1Vol, uint32_t com2Khz, float com2Vol);
+
+// Signal quality last set for a pilot (1 if never set): for the window's bars.
+float signalQualityOf(uint32_t sid);
 
 // Take frames the encoder has produced; the caller sends them.
 void pollOutgoing(std::vector<OutFrame>& out);

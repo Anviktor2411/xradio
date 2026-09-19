@@ -71,9 +71,10 @@ int  g_models  = 0;
 // One remote pilot, rendered by XPMP2 as a CSL model.
 class XRAircraft : public XPMP2::Aircraft {
 public:
-    XRAircraft(const std::string& icaoType, const std::string& callsign, XPMPPlaneID id)
+    XRAircraft(const std::string& icaoType, const std::string& livery,
+               const std::string& callsign, XPMPPlaneID id)
         : XPMP2::Aircraft(icaoType.empty() ? std::string("ZZZZ") : icaoType,
-                          /*icaoAirline=*/"", /*livery=*/"", id) {
+                          /*icaoAirline=*/"", livery, id) {
         label = callsign;
         strncpy(acInfoTexts.tailNum,  callsign.c_str(), sizeof(acInfoTexts.tailNum)  - 1);
         strncpy(acInfoTexts.icaoAcType, icaoType.c_str(), sizeof(acInfoTexts.icaoAcType) - 1);
@@ -233,11 +234,11 @@ void upsert(const RemoteState& s) {
     auto it = g_planes.find(s.sid);
     if (it == g_planes.end()) {
         try {
-            auto ac = std::make_unique<XRAircraft>(s.acIcao, s.callsign, modeSFor(s.sid));
+            auto ac = std::make_unique<XRAircraft>(s.acIcao, s.livery, s.callsign, modeSFor(s.sid));
             ac->ApplyNetworkUpdate(s);
             g_planes[s.sid] = std::move(ac);
-            logMsg("added %s (%s) sid=%u", s.callsign.c_str(), s.acIcao.c_str(),
-                   (unsigned)s.sid);
+            logMsg("added %s (%s %s) sid=%u", s.callsign.c_str(), s.acIcao.c_str(),
+                   s.livery.c_str(), (unsigned)s.sid);
         } catch (const XPMP2::XPMP2Error& e) {
             logMsg("cannot create aircraft for %s: %s", s.callsign.c_str(), e.what());
         }

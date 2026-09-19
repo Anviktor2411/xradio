@@ -10,6 +10,8 @@
 #include <string>
 #include <vector>
 
+#include "joincode.h"
+
 namespace xr {
 
 struct Settings {
@@ -17,7 +19,8 @@ struct Settings {
     std::string host       = "127.0.0.1";
     std::string port       = "49100";      // text so the field can be cleared
     std::string callsign   = "XRADIO1";
-    std::string acIcao     = "C172";
+    std::string acIcao;                    // empty: read from the aircraft you are flying
+    std::string password;                  // flight password: needed to join, required to host
     bool        autoConnect = true;
     float       reportHz   = 5.f;          // position reports per second
     float       smoothMs   = 350.f;        // interpolation delay
@@ -29,6 +32,7 @@ struct Settings {
     bool        sidetone   = false;        // hear yourself while keyed
     float       hiss       = 0.35f;        // every bit of noise the radio makes
     bool        radioFilter = true;        // the whole radio sound; off = clean audio
+    int         pttKey     = 0;            // keyboard key that keys the radio; 0 = none
 
     // --- hosting ---
     // With this on the plugin runs the relay server itself and connects to
@@ -47,13 +51,27 @@ struct Settings {
     int         port_i() const { return atoi(port.c_str()); }
     int         hostPort_i() const { return atoi(hostPort.c_str()); }
 
+    // The host field may hold a join code ("K7M2Q-X4PB9") instead of an
+    // address; then the port field is ignored and both come from the code.
+    bool        hostIsCode() const { return joincode::looksLikeCode(host); }
+
     // Where the client should actually connect: hosting means our own server.
-    std::string activeHost() const { return hostEnabled ? "127.0.0.1" : host; }
-    int         activePort() const { return hostEnabled ? hostPort_i() : port_i(); }
+    std::string activeHost() const {
+        if (hostEnabled) return "127.0.0.1";
+        std::string ip; uint16_t p = 0;
+        if (hostIsCode() && joincode::decode(host, &ip, &p)) return ip;
+        return host;
+    }
+    int activePort() const {
+        if (hostEnabled) return hostPort_i();
+        std::string ip; uint16_t p = 0;
+        if (hostIsCode() && joincode::decode(host, &ip, &p)) return p;
+        return port_i();
+    }
 };
 
 // --- descriptor table -------------------------------------------------------
-enum class Kind { Text, Bool, Slider, Choice };
+enum class Kind { Text, Bool, Slider, Choice, KeyBind };
 
 struct FieldRef {
     const char* key;       // config-file key
@@ -72,10 +90,11 @@ struct FieldRef {
 
 inline std::vector<FieldRef> describe(Settings& s) {
     return {
-        {"host",      "Server host",    Kind::Text,   0, &s.host,       0,0,"",0, 63},
+        {"host",      "Server host or join code", Kind::Text, 0, &s.host, 0,0,"",0, 63},
         {"port",      "Port",           Kind::Text,   0, &s.port,       0,0,"",0,  5, true},
         {"callsign",  "Callsign",       Kind::Text,   0, &s.callsign,   0,0,"",0, 15},
-        {"actype",    "Aircraft type",  Kind::Text,   0, &s.acIcao,     0,0,"",0,  7},
+        {"actype",    "Aircraft type (blank = from the sim)", Kind::Text, 0, &s.acIcao, 0,0,"",0, 7},
+        {"password",  "Flight password", Kind::Text,  0, &s.password,   0,0,"",0, 31},
         {"autoconnect", "Connect on startup", Kind::Bool, 0, &s.autoConnect},
         {"reporthz",  "Report rate",    Kind::Slider, 0, &s.reportHz,   1.f, 10.f, " Hz", 0},
         {"smoothms",  "Smoothing delay", Kind::Slider, 0, &s.smoothMs, 100.f, 1000.f, " ms", 0},
@@ -86,6 +105,7 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"sidetone",  "Hear own voice", Kind::Bool,   1, &s.sidetone},
         {"hiss",      "Radio noise",    Kind::Slider, 1, &s.hiss,       0.f, 1.f, "%", 0},
         {"radiofilter", "Radio sound (limiter, squelch, filter)", Kind::Bool, 1, &s.radioFilter},
+        {"pttkey",    "Push-to-talk key", Kind::KeyBind, 1, &s.pttKey},
 
         {"showtraffic", "Draw other aircraft", Kind::Bool, 2, &s.showTraffic},
         {"showlabels",  "Callsign labels",     Kind::Bool, 2, &s.showLabels},
@@ -107,6 +127,32 @@ inline const char* tabName(int i) {
     }
 }
 inline constexpr int kNumTabs = 4;
+
+// The name of an X-Plane virtual key, for the window. Letters and digits are
+// their ASCII; the rest are the handful people actually bind.
+inline std::string keyName(int vk) {
+    if (vk <= 0) return "none";
+    if ((vk >= 0x30 && vk <= 0x39) || (vk >= 0x41 && vk <= 0x5A)) return std::string(1, (char)vk);
+    if (vk >= 0x70 && vk <= 0x7B) return "F" + std::to_string(vk - 0x70 + 1);
+    if (vk >= 0x60 && vk <= 0x69) return "Numpad " + std::to_string(vk - 0x60);
+    switch (vk) {
+        case 0x08: return "Backspace";  case 0x09: return "Tab";       case 0x0D: return "Enter";
+        case 0x1B: return "Escape";     case 0x20: return "Space";     case 0x21: return "Page Up";
+        case 0x22: return "Page Down";  case 0x23: return "End";       case 0x24: return "Home";
+        case 0x25: return "Left";       case 0x26: return "Up";        case 0x27: return "Right";
+        case 0x28: return "Down";       case 0x2D: return "Insert";    case 0x2E: return "Delete";
+        case 0x6A: return "Numpad *";   case 0x6B: return "Numpad +";  case 0x6C: return "Numpad Enter";
+        case 0x6D: return "Numpad -";   case 0x6E: return "Numpad .";  case 0x6F: return "Numpad /";
+        case 0xA0: return "Left Shift"; case 0xA1: return "Right Shift";
+        case 0xA2: return "Left Ctrl";  case 0xA3: return "Right Ctrl";
+        case 0xA4: return "Left Alt";   case 0xA5: return "Right Alt";
+        case 0xB5: return ";";  case 0xB6: return "=";  case 0xB7: return ",";  case 0xB8: return "-";
+        case 0xB9: return ".";  case 0xBA: return "`";  case 0xBB: return "/";  case 0xBC: return "[";
+        case 0xBD: return "\\"; case 0xBE: return "]";  case 0xBF: return "'";
+        default: break;
+    }
+    return "key " + std::to_string(vk);
+}
 
 // --- file I/O ---------------------------------------------------------------
 namespace detail {
@@ -144,6 +190,9 @@ inline bool saveSettings(const Settings& s, const std::string& path) {
             case Kind::Slider:
                 fprintf(f, "%s = %g\n", fld.key, (double)*(float*)fld.ptr);
                 break;
+            case Kind::KeyBind:
+                fprintf(f, "%s = %d\n", fld.key, *(int*)fld.ptr);
+                break;
         }
     }
     fclose(f);
@@ -177,6 +226,11 @@ inline bool loadSettings(Settings& s, const std::string& path) {
                 case Kind::Slider:
                     *(float*)fld.ptr = detail::clampf((float)atof(v.c_str()), fld.lo, fld.hi);
                     break;
+                case Kind::KeyBind: {
+                    const int k = atoi(v.c_str());
+                    *(int*)fld.ptr = (k < 0 || k > 255) ? 0 : k;
+                    break;
+                }
             }
             break;
         }
@@ -194,6 +248,11 @@ inline std::string validate(const Settings& s) {
         return "";                         // the server field is unused while hosting
     }
     if (detail::trim(s.host).empty())      return "Host cannot be empty";
+    if (s.hostIsCode()) {
+        std::string ip; uint16_t p = 0;
+        if (!joincode::decode(s.host, &ip, &p)) return "That join code is not right -- check the letters";
+        return "";
+    }
     const int p = s.port_i();
     if (p < 1 || p > 65535)                return "Port must be 1-65535";
     return "";

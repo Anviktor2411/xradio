@@ -29,7 +29,6 @@
 #  include <fcntl.h>
 #  include <netdb.h>
 #  include <netinet/in.h>
-#  include <sys/select.h>
 #  include <sys/socket.h>
 #  include <unistd.h>
 #  define XR_INVALID (-1)
@@ -161,22 +160,7 @@ bool httpRequest(const Url& u, const std::string& request, std::string* out,
         res->ai_addr, (socklen_t)res->ai_addrlen);
     freeaddrinfo(res);
 
-    auto waitReady = [&](bool forWrite) {
-        fd_set s;
-        FD_ZERO(&s);
-#ifdef _WIN32
-        FD_SET((SOCKET)f, &s);
-        const int nfds = 0;
-#else
-        FD_SET((int)f, &s);
-        const int nfds = (int)f + 1;
-#endif
-        timeval tv;
-        tv.tv_sec  = timeoutMs / 1000;
-        tv.tv_usec = (timeoutMs % 1000) * 1000;
-        return select(nfds, forWrite ? nullptr : &s, forWrite ? &s : nullptr,
-                      nullptr, &tv) > 0;
-    };
+    auto waitReady = [&](bool forWrite) { return waitSocket(f, forWrite, timeoutMs) > 0; };
 
     if (rc != 0) {
         if (!waitReady(true)) { XR_CLOSE(f); return false; }
@@ -413,19 +397,7 @@ std::vector<std::string> discover(int timeoutMs) {
     char buf[2048];
     while (elapsedMs() < budget && !g_abort.load()) {
         if (!resent && elapsedMs() > budget / 2) { search(); resent = true; }
-        fd_set rd;
-        FD_ZERO(&rd);
-#ifdef _WIN32
-        FD_SET((SOCKET)f, &rd);
-        const int nfds = 0;
-#else
-        FD_SET((int)f, &rd);
-        const int nfds = (int)f + 1;
-#endif
-        timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 200 * 1000;
-        if (select(nfds, &rd, nullptr, nullptr, &tv) <= 0) continue;
+        if (waitSocket(f, false, 200) <= 0) continue;
 
         sockaddr_in from{};
         socklen_t fromLen = sizeof(from);
@@ -612,6 +584,14 @@ std::atomic<bool> g_busy{false};
 std::thread       g_worker;
 uint16_t          g_mappedPort = 0;
 Service           g_mappedVia;             // the service the mapping was made through
+std::chrono::steady_clock::time_point g_mappedAt;
+int               g_mappedLease = 0;       // seconds; 0 = permanent
+
+// A request that arrived while the worker was busy (the pilot changed the
+// port twice in quick succession, say). The worker picks it up when done
+// instead of the request being dropped.
+struct Pending { bool any = false; uint16_t port = 0; std::string desc; bool askRouter = true; };
+Pending           g_pending;
 
 void joinWorker() {
     if (g_worker.joinable()) g_worker.join();
@@ -726,35 +706,80 @@ bool removeMapping(uint16_t port, int timeoutMs) {
 
 std::string publicAddress(int timeoutMs) { return fetchPublicIp(timeoutMs); }
 
+// One request: release whatever was mapped before if it is a different
+// port, then map the new one, then find out our public address if the
+// router did not say.
+void doRequest(uint16_t port, const std::string& desc, bool askRouter) {
+    uint16_t old = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        old = g_mappedPort;
+    }
+    if (old != 0 && old != port) removeMapping(old, 1500);
+
+    Result r;
+    if (askRouter) {
+        r = addMapping(port, localAddress(), desc);
+    } else {
+        r.error = "not asked";
+    }
+    // No public address from the router? Ask the internet, so the pilot
+    // still has something to pass on once they have forwarded the port.
+    if (r.externalIp.empty() && !r.doubleNat && !g_abort.load()) {
+        r.externalIp = fetchPublicIp(2500);
+        r.externalFromWeb = !r.externalIp.empty();
+    }
+    r.done = true;
+    std::lock_guard<std::mutex> lk(g_mx);
+    g_latest = r;
+    g_mappedPort  = r.mapped ? port : 0;
+    g_mappedLease = r.mapped ? r.leaseSeconds : 0;
+    g_mappedAt    = std::chrono::steady_clock::now();
+}
+
 void requestAsync(uint16_t port, const std::string& description, bool askRouter) {
-    if (g_busy.exchange(true)) return;          // one at a time
+    if (g_busy.exchange(true)) {
+        // Queue it; the running worker finishes with it.
+        std::lock_guard<std::mutex> lk(g_mx);
+        g_pending = {true, port, description, askRouter};
+        return;
+    }
     joinWorker();
     {
         std::lock_guard<std::mutex> lk(g_mx);
         g_latest = Result{};
+        g_pending = Pending{};
     }
-    const std::string desc = description;
-    g_worker = std::thread([port, desc, askRouter] {
-        Result r;
-        if (askRouter) {
-            r = addMapping(port, localAddress(), desc);
-        } else {
-            r.error = "not asked";
-        }
-        // No public address from the router? Ask the internet, so the pilot
-        // still has something to pass on once they have forwarded the port.
-        if (r.externalIp.empty() && !r.doubleNat && !g_abort.load()) {
-            r.externalIp = fetchPublicIp(2500);
-            r.externalFromWeb = !r.externalIp.empty();
-        }
-        r.done = true;
-        {
-            std::lock_guard<std::mutex> lk(g_mx);
-            g_latest = r;
-            g_mappedPort = r.mapped ? port : 0;
+    g_worker = std::thread([port, description, askRouter] {
+        doRequest(port, description, askRouter);
+        for (;;) {
+            Pending next;
+            {
+                std::lock_guard<std::mutex> lk(g_mx);
+                next = g_pending;
+                g_pending = Pending{};
+            }
+            if (!next.any || g_abort.load()) break;
+            doRequest(next.port, next.desc, next.askRouter);
         }
         g_busy.store(false);
     });
+}
+
+// A router that only gave a timed lease needs asking again before it runs
+// out, or the port quietly closes an hour into the flight. Call this from
+// the flight loop now and then.
+void tick(const std::string& description) {
+    uint16_t port = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        if (g_mappedPort == 0 || g_mappedLease <= 0) return;
+        const double age = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - g_mappedAt).count();
+        if (age < g_mappedLease * 0.5) return;
+        port = g_mappedPort;
+    }
+    requestAsync(port, description, true);
 }
 
 void releaseAsync() {
@@ -772,6 +797,7 @@ void releaseAsync() {
         {
             std::lock_guard<std::mutex> lk(g_mx);
             g_mappedVia = Service{};
+            g_mappedLease = 0;
         }
         g_busy.store(false);
     });

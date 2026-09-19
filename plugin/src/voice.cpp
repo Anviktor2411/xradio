@@ -38,7 +38,9 @@ bool available() { return false; }
 bool haveMicrophone() { return false; }
 void setTransmitting(bool) {}
 bool transmitting() { return false; }
-void onIncomingFrame(uint32_t, uint16_t, const uint8_t*, int) {}
+void onIncomingFrame(uint32_t, uint16_t, const uint8_t*, int, uint32_t) {}
+void setRadioVolumes(uint32_t, float, uint32_t, float) {}
+float signalQualityOf(uint32_t) { return 1.f; }
 void pollOutgoing(std::vector<OutFrame>& out) { out.clear(); }
 void tick() {}
 void setVolume(float) {}
@@ -110,6 +112,8 @@ struct Speaker {
     bool                             haveSeq = false;
     bool                             playing = false;
     bool                             dropped = false;   // this frame lost to fading
+    uint32_t                         freqKhz = 0;       // what radio it is coming in on
+    float                            txEnv = 0.f;       // their transmitter's limiter
     int                              concealed = 0;
     std::chrono::steady_clock::time_point lastRx;
 
@@ -135,6 +139,18 @@ std::atomic<bool>  g_filter{true};
 std::atomic<float> g_hiss{0.35f};
 std::atomic<float> g_micLevel{0.f};
 std::atomic<float> g_volume{1.f};
+// the audio panel: tuned frequencies and knob positions, main thread -> playback
+std::atomic<uint32_t> g_com1Khz{0}, g_com2Khz{0};
+std::atomic<float>    g_com1Vol{1.f}, g_com2Vol{1.f};
+
+// How far up the knob is for the radio this frequency is on. A frequency
+// neither radio has (or 0) plays at full: better heard than silently lost.
+float radioGain(uint32_t freqKhz) {
+    if (freqKhz == 0) return 1.f;
+    if (freqKhz == g_com1Khz.load()) return g_com1Vol.load();
+    if (freqKhz == g_com2Khz.load()) return g_com2Vol.load();
+    return 1.f;
+}
 std::atomic<uint64_t> g_nEncoded{0}, g_nReceived{0}, g_nPlayed{0}, g_nConcealed{0};
 
 std::vector<int16_t> g_capAccum;     // capture thread only
@@ -227,7 +243,7 @@ constexpr int   kSettle       = 1440;     // 30 ms: let the filters ring down
 
 struct Radio {
     Biquad hp1, hp2, lp1, lp2;            // 4th order each side
-    float  env = 0.f;                     // limiter envelope
+    float  env = 0.f;                     // our own transmitter's envelope (sidetone)
     bool   open = false;                  // squelch state
     int    burst = 0, tail = 0, click = 0, settle = 0;
     float  clickSign = 1.f;
@@ -247,8 +263,9 @@ struct Radio {
         return (float)(noise >> 16) / 32768.f - 1.f;
     }
 
-    // The transmitter: modulation limiter, then overdrive. Speech only.
-    float transmitter(float x) {
+    // The transmitter: modulation limiter, then overdrive. Speech only. Each
+    // pilot's radio has its own limiter, so the envelope is theirs, not ours.
+    static float transmitter(float& env, float x) {
         const float a = x < 0.f ? -x : x;
         // ~1 ms attack, ~120 ms release
         env += (a > env ? 0.02f : 0.00017f) * (a - env);
@@ -396,7 +413,7 @@ void render(int16_t* out, int count) {
         for (int i = 0; i < count && !g_sidechain.empty(); ++i) {
             float v = (float)g_sidechain.front();
             g_sidechain.pop_front();
-            if (fx) v = Radio::amplifier(g_radio.filter(g_radio.transmitter(v)));
+            if (fx) v = Radio::amplifier(g_radio.filter(Radio::transmitter(g_radio.env, v)));
             v *= vol * 0.5f;                         // quieter than incoming
             out[i] = (int16_t)(v > 32767.f ? 32767.f : (v < -32768.f ? -32768.f : v));
         }
@@ -418,6 +435,7 @@ void render(int16_t* out, int count) {
             sp.playing = true;
         }
         const float q = qualityOf(kv.first);
+        const float knob = radioGain(sp.freqKhz);
         bool contributed = false;
         for (int i = 0; i < count; ++i) {
             if (sp.pcmPos >= sp.pcm.size()) {
@@ -432,9 +450,11 @@ void render(int16_t* out, int count) {
                     sp.dropped = false;
                 }
             }
-            const float smp = sp.dropped ? 0.f : (float)sp.pcm[sp.pcmPos];
+            // Their transmitter, then the cockpit's volume knob for that radio.
+            float smp = sp.dropped ? 0.f : (float)sp.pcm[sp.pcmPos];
+            if (fx) smp = Radio::transmitter(sp.txEnv, smp);
             ++sp.pcmPos;
-            mix[(size_t)i] += smp;
+            mix[(size_t)i] += smp * knob;
             contributed = true;
         }
         if (contributed) { ++carriers; if (q > best) best = q; }
@@ -454,7 +474,7 @@ void render(int16_t* out, int count) {
     g_radio.gate(carrier);
     if (!g_radio.active()) return;               // silence, and the filters stay put
     for (int i = 0; i < count; ++i) {
-        const float speech = carrier ? g_radio.transmitter(mix[(size_t)i]) : 0.f;
+        const float speech = carrier ? mix[(size_t)i] : 0.f;
         float v = g_radio.receiver(speech, carrier, carriers, best, hiss) * vol;
         out[i] = (int16_t)(v > 32767.f ? 32767.f : (v < -32768.f ? -32768.f : v));
     }
@@ -638,7 +658,8 @@ void setTransmitting(bool on) {
 }
 bool transmitting() { return g_tx.load(); }
 
-void onIncomingFrame(uint32_t sid, uint16_t seq, const uint8_t* data, int len) {
+void onIncomingFrame(uint32_t sid, uint16_t seq, const uint8_t* data, int len,
+                     uint32_t freqKhz) {
     if (!data || len <= 0 || len > kMaxOpusBytes) return;
     std::lock_guard<std::mutex> lk(g_mx);
     auto found = g_speakers.find(sid);
@@ -651,6 +672,7 @@ void onIncomingFrame(uint32_t sid, uint16_t seq, const uint8_t* data, int len) {
         if (e != OPUS_OK) { g_speakers.erase(sid); return; }
     }
     Speaker& sp = *slot;
+    if (freqKhz) sp.freqKhz = freqKhz;
     // Drop anything older than what we already have; sequence wraps at 65536.
     if (sp.haveSeq && (int16_t)(seq - sp.lastSeq) <= 0) return;
     sp.lastSeq = seq;
@@ -699,6 +721,16 @@ void  setSidetone(bool on) {
     }
 }
 void  setHiss(float level)     { g_hiss.store(level < 0.f ? 0.f : (level > 1.f ? 1.f : level)); }
+void setRadioVolumes(uint32_t com1Khz, float com1Vol, uint32_t com2Khz, float com2Vol) {
+    g_com1Khz.store(com1Khz);
+    g_com2Khz.store(com2Khz);
+    g_com1Vol.store(com1Vol < 0.f ? 0.f : (com1Vol > 1.f ? 1.f : com1Vol));
+    g_com2Vol.store(com2Vol < 0.f ? 0.f : (com2Vol > 1.f ? 1.f : com2Vol));
+}
+float signalQualityOf(uint32_t sid) {
+    std::lock_guard<std::mutex> lk(g_mx);
+    return qualityOf(sid);
+}
 void  setSignalQuality(uint32_t sid, float q) {
     q = q < 0.f ? 0.f : (q > 1.f ? 1.f : q);
     std::lock_guard<std::mutex> lk(g_mx);

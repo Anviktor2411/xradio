@@ -47,8 +47,7 @@ class Client:
         self.sid = 0
 
     def login(self):
-        self.sock.sendto(P.pack(P.PT_LOGIN, 0, P.LOGIN.pack(
-            P.pad(self.callsign, 16), P.pad("C172", 8), P.PROTO_VERSION, 0)), self.dest)
+        self.sock.sendto(P.pack(P.PT_LOGIN, 0, P.login(self.callsign, "C172")), self.dest)
         pkt = self.recv(P.PT_LOGIN_ACK)
         if pkt is not None:
             self.sid, _ = P.LOGIN_ACK.unpack_from(pkt, 0)
@@ -134,8 +133,8 @@ def run():
 
     print("\nwire format")
     check("C++/Python struct sizes agree", all([
-        P.HEADER.size == 12, P.LOGIN.size == 28, P.POSITION.size == 68,
-        P.TRAFFIC_ENTRY.size == 88, P.TEXT_HDR.size == 26, P.VOICE_HDR.size == 12,
+        P.HEADER.size == 12, P.LOGIN.size == 76, P.POSITION.size == 68,
+        P.TRAFFIC_ENTRY.size == 104, P.TEXT_HDR.size == 26, P.VOICE_HDR.size == 12,
     ]))
     check("bad magic is rejected",
           P.unpack_header(struct.pack("<IBBHI", 0xDEADBEEF, 1, 1, 0, 0)) is None)
@@ -281,7 +280,7 @@ def run():
     ctl = Client("ESCTL1", 57.85, 27.02)
     ctl.sock.sendto(P.pack(P.PT_LOGIN, 0, P.LOGIN.pack(
         b"AB\x07\x1b[31mCD\x00\x00\x00\x00\x00\x00\x00", P.pad("C172", 8),
-        P.PROTO_VERSION, 0)), ctl.dest)
+        P.PROTO_VERSION, 0, P.pad("", 16), P.pad("", 32))), ctl.dest)
     pkt = ctl.recv(P.PT_LOGIN_ACK)
     pump(0.2)
     names = [x.callsign for x in srv.sessions.values()]

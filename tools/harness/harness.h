@@ -12,10 +12,13 @@ struct Drawn {
 
 void   set(const std::string& dataref, double value);
 double get(const std::string& dataref);
+void   setString(const std::string& dataref, const std::string& value);   // byte-array refs
+std::string getString(const std::string& dataref);
 
 void tick(float dt);                      // run one flight-loop callback
 std::vector<std::string> draw();          // run the window draw, capture its text
 void ptt(bool down);                      // press / release the PTT command
+int  simKey(int vk, bool down);           // a key with no window focused (key sniffer)
 void menu(int item);                      // click a plugin menu item
 
 // second window (settings) -- id 2 in creation order

@@ -12,6 +12,7 @@
 #include "server.h"
 #include "upnp.h"
 #include "settings.h"
+#include "joincode.h"
 #include "smoothing.h"
 #include "ui.h"
 #include "voice.h"
@@ -102,7 +103,7 @@ void loadConfig() {
         logMsg("wrote default config to %s", g_cfgPath.c_str());
     }
     logMsg("config: %s:%d as %s (%s)", g_cfg.host.c_str(), g_cfg.port_i(),
-           g_cfg.callsign.c_str(), g_cfg.acIcao.c_str());
+           g_cfg.callsign.c_str(), g_cfg.acIcao.empty() ? "type from the sim" : g_cfg.acIcao.c_str());
 }
 
 // ---------------------------------------------------------------------------
@@ -111,8 +112,9 @@ void loadConfig() {
 struct Refs {
     XPLMDataRef lat, lon, elev, psi, theta, phi, gs, hpath, vh;
     XPLMDataRef gear, flap, onGround;
-    XPLMDataRef com1, com2, audioComSel, rxCom1, rxCom2;
+    XPLMDataRef com1, com2, audioComSel, rxCom1, rxCom2, volCom1, volCom2;
     XPLMDataRef ltNav, ltBeacon, ltStrobe, ltLanding, ltTaxi;
+    XPLMDataRef acfIcao, acfLivery;
 } g_ref;
 
 int g_missingRefs = 0;
@@ -150,12 +152,19 @@ void findRefs() {
     g_ref.audioComSel = findRef("sim/cockpit2/radios/actuators/audio_com_selection");
     g_ref.rxCom1      = findRef("sim/cockpit2/radios/actuators/audio_selection_com1");
     g_ref.rxCom2      = findRef("sim/cockpit2/radios/actuators/audio_selection_com2");
+    g_ref.volCom1     = findRef("sim/cockpit2/radios/actuators/audio_volume_com1");
+    g_ref.volCom2     = findRef("sim/cockpit2/radios/actuators/audio_volume_com2");
 
     g_ref.ltNav     = findRef("sim/cockpit2/switches/navigation_lights_on");
     g_ref.ltBeacon  = findRef("sim/cockpit2/switches/beacon_on");
     g_ref.ltStrobe  = findRef("sim/cockpit2/switches/strobe_lights_on");
     g_ref.ltLanding = findRef("sim/cockpit2/switches/landing_lights_on");
     g_ref.ltTaxi    = findRef("sim/cockpit2/switches/taxi_light_on");
+
+    // What we are flying, so nobody has to type it: the ICAO type of the
+    // loaded aircraft and the folder name of its livery.
+    g_ref.acfIcao   = findRef("sim/aircraft/view/acf_ICAO");
+    g_ref.acfLivery = findRef("sim/aircraft/view/acf_livery_path");
 
     if (g_missingRefs) {
         logMsg("%d dataref(s) missing -- those values will be sent as zero",
@@ -166,6 +175,51 @@ void findRefs() {
 float  fd(XPLMDataRef r) { return r ? XPLMGetDataf(r) : 0.f; }
 double dd(XPLMDataRef r) { return r ? XPLMGetDatad(r) : 0.0; }
 int    id(XPLMDataRef r) { return r ? XPLMGetDatai(r) : 0; }
+
+// A byte-array dataref as a trimmed string.
+std::string sd(XPLMDataRef r, int maxLen) {
+    if (!r) return "";
+    char buf[1024] = {0};
+    const int n = XPLMGetDatab(r, buf, 0, maxLen < (int)sizeof(buf) - 1 ? maxLen : (int)sizeof(buf) - 1);
+    if (n <= 0) return "";
+    std::string v(buf, (size_t)n);
+    const size_t z = v.find('\0');
+    if (z != std::string::npos) v.resize(z);
+    size_t a = v.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    size_t b = v.find_last_not_of(" \t\r\n");
+    return v.substr(a, b - a + 1);
+}
+
+// The ICAO type to tell everyone: the settings override if set, else what
+// the sim says about the loaded aircraft, else a default so the CSL matcher
+// has something to work with.
+std::string effectiveIcao() {
+    if (!g_cfg.acIcao.empty()) return g_cfg.acIcao;
+    std::string v = sd(g_ref.acfIcao, 40);
+    std::string out;
+    for (char c : v) {
+        if (isalnum((unsigned char)c)) out += (char)toupper((unsigned char)c);
+        if (out.size() >= 7) break;
+    }
+    return out.empty() ? std::string("C172") : out;
+}
+
+// The livery folder name: ".../liveries/Delta/" -> "Delta". Empty for the
+// default paint. Printable ASCII only, it goes on the wire.
+std::string effectiveLivery() {
+    std::string path = sd(g_ref.acfLivery, 1023);
+    while (!path.empty() && (path.back() == '/' || path.back() == '\\')) path.pop_back();
+    const size_t slash = path.find_last_of("/\\");
+    std::string name = slash == std::string::npos ? path : path.substr(slash + 1);
+    std::string out;
+    for (char c : name) {
+        const unsigned char u = (unsigned char)c;
+        if (u >= 32 && u < 127) out += c;
+        if (out.size() >= 15) break;
+    }
+    return out;
+}
 
 float firstOfArray(XPLMDataRef r) {
     if (!r) return 0.f;
@@ -187,7 +241,7 @@ uint32_t nowMs() {
 // ---------------------------------------------------------------------------
 struct Remote {
     uint32_t    sid = 0;
-    std::string callsign, acIcao;
+    std::string callsign, acIcao, livery;
     double      lat = 0, lon = 0;
     float       altMslM = 0, heading = 0, pitch = 0, roll = 0, gsMs = 0;
     float       gear = 0, flap = 0;
@@ -200,6 +254,7 @@ int g_rejected = 0;   // traffic entries dropped as implausible
 
 // Defined with the hosting code further down; the main window needs it.
 std::string shareAddress();
+void reconnect();
 double distanceNm(double lat1, double lon1, double lat2, double lon2);
 
 // How well another pilot's radio reaches us, from distance against the VHF
@@ -227,10 +282,19 @@ std::atomic<uint32_t> g_txFreqKhz{0};      // radio the PTT keys, for voice pack
 bool             g_connected    = false;
 float            g_elapsed      = 0.f;
 float            g_lastLogin    = -99.f;
+float            g_firstLogin   = -1.f;     // when this connection attempt began
+std::string      g_loginProblem;            // why the server will not have us
+std::string      g_loginIcao, g_loginLivery;   // what the current session was logged in as
 float            g_lastRxTime   = -99.f;
 bool             g_pttDown      = false;
 std::string      g_status       = "not connected";
 std::vector<std::string> g_chatLog;   // newest last, capped
+
+// The one-line text input at the bottom of the main window. Only the main
+// thread touches it, so keys are applied as they arrive.
+std::string g_chatInput;
+bool        g_chatFocus = false;
+int         g_chatInputY = 0;          // where the draw put the row, for the click test
 
 XPLMWindowID     g_window       = nullptr;
 XPLMFlightLoopID g_loop         = nullptr;
@@ -260,13 +324,18 @@ void sendLogin() {
     uint8_t buf[sizeof(xr::Header) + sizeof(xr::LoginPayload)];
     int off = writeHeader(buf, xr::PT_LOGIN, sizeof(xr::LoginPayload));
     xr::LoginPayload p{};
+    g_loginIcao   = effectiveIcao();
+    g_loginLivery = effectiveLivery();
     strncpy(p.callsign, g_cfg.callsign.c_str(), sizeof(p.callsign) - 1);
-    strncpy(p.acIcao,   g_cfg.acIcao.c_str(),   sizeof(p.acIcao)   - 1);
+    strncpy(p.acIcao,   g_loginIcao.c_str(),    sizeof(p.acIcao)   - 1);
+    strncpy(p.livery,   g_loginLivery.c_str(),  sizeof(p.livery)   - 1);
+    strncpy(p.password, g_cfg.password.c_str(), sizeof(p.password) - 1);
     p.protoVer = xr::kProtoVersion;
     memcpy(buf + off, &p, sizeof(p));
     g_sock.send(buf, off + (int)sizeof(p));
     g_lastLogin = g_elapsed;
-    g_status = "logging in to " + g_sock.endpoint() + "...";
+    if (g_firstLogin < 0.f) g_firstLogin = g_elapsed;
+    if (g_loginProblem.empty()) g_status = "logging in to " + g_sock.endpoint() + "...";
 }
 
 void sendPosition() {
@@ -334,6 +403,12 @@ void sendText(const std::string& text) {
     memcpy(buf + off, &th, sizeof(th));
     memcpy(buf + off + sizeof(th), text.data(), len);
     g_sock.send(buf, off + (int)sizeof(th) + len);
+
+    // The server does not echo to the sender, so show it ourselves.
+    char line[320];
+    snprintf(line, sizeof(line), "[%.3f] %s: %.*s", (double)(th.freqKhz % 1000000u) / 1000.0,
+             g_cfg.callsign.c_str(), (int)len, text.data());
+    addChat(line);
 }
 
 // Everything below arrives over UDP from a server we do not control, so it is
@@ -384,11 +459,13 @@ void handleTraffic(const uint8_t* payload, int len) {
 
         const std::string cs = sanitizeText(e.callsign, sizeof(e.callsign));
         const std::string ic = sanitizeText(e.acIcao, sizeof(e.acIcao));
+        const std::string lv = sanitizeText(e.livery, sizeof(e.livery));
 
         Remote& r   = g_remote[e.sessionId];
         r.sid       = e.sessionId;
         r.callsign  = cs.empty() ? std::string("?") : cs;
         r.acIcao    = ic;
+        r.livery    = lv;
         r.lat       = e.lat;
         r.lon       = e.lon;
         r.altMslM   = e.altMslM;
@@ -407,6 +484,7 @@ void handleTraffic(const uint8_t* payload, int len) {
         st.sid      = r.sid;
         st.callsign = r.callsign;
         st.acIcao   = r.acIcao;
+        st.livery   = r.livery;
         st.lat      = r.lat;
         st.lon      = r.lon;
         st.altFt    = r.altMslM * 3.28084f;
@@ -467,6 +545,16 @@ void handleText(const uint8_t* payload, int len) {
 // for the main thread, which is the only place the sim may be touched.
 std::thread                       g_netThread;
 std::atomic<bool>                 g_netRun{false};
+// The socket is opened on the network thread, because opening it means
+// resolving the host name and a name that does not resolve (offline, a VPN
+// that ate DNS, a typo) blocks for several seconds -- which on the main
+// thread freezes the whole sim. Until it is open, the main thread only
+// reads these two.
+std::atomic<bool>                 g_sockReady{false};
+std::mutex                        g_netErrMx;
+std::string                       g_netErr;         // why the socket could not be opened
+std::string                       g_netHost;        // what the thread should connect to
+uint16_t                          g_netPort = 0;
 std::mutex                        g_inboxMx;
 std::deque<std::vector<uint8_t>>  g_inbox;
 const size_t                      kInboxCap = 256;
@@ -478,7 +566,7 @@ void handleVoicePacket(const uint8_t* payload, int len) {
     const int avail = len - (int)sizeof(vh);
     const int n = std::min<int>(vh.opusLen, avail);
     if (n <= 0) return;
-    xr::voice::onIncomingFrame(vh.fromSession, vh.seq, payload + sizeof(vh), n);
+    xr::voice::onIncomingFrame(vh.fromSession, vh.seq, payload + sizeof(vh), n, vh.freqKhz);
 }
 
 void sendVoiceFrames() {
@@ -504,6 +592,15 @@ void sendVoiceFrames() {
 }
 
 void netLoop() {
+    {
+        std::string err;
+        if (!g_sock.open(g_netHost, g_netPort, &err)) {
+            std::lock_guard<std::mutex> lk(g_netErrMx);
+            g_netErr = err;
+            return;
+        }
+        g_sockReady.store(true);
+    }
     uint8_t buf[xr::kMaxPacket];
     while (g_netRun.load()) {
         sendVoiceFrames();
@@ -526,16 +623,29 @@ void netLoop() {
     }
 }
 
+// Open the socket and start receiving, to whatever the settings say now.
+// Returns at once; the flight loop logs in once the socket reports ready.
 void netStart() {
     if (g_netRun.load()) return;
+    g_sockReady.store(false);
+    {
+        std::lock_guard<std::mutex> lk(g_netErrMx);
+        g_netErr.clear();
+    }
+    g_netHost = g_cfg.activeHost();
+    g_netPort = (uint16_t)g_cfg.activePort();
+    g_firstLogin = -1.f;
+    g_loginProblem.clear();
+    g_lastLogin = -99.f;
+    g_status = "connecting to " + g_netHost + ":" + std::to_string(g_netPort) + "...";
     g_netRun.store(true);
     g_netThread = std::thread(netLoop);
 }
 
 void netStop() {
-    if (!g_netRun.load()) return;
     g_netRun.store(false);
     if (g_netThread.joinable()) g_netThread.join();   // recvWait returns within 20 ms
+    g_sockReady.store(false);
 }
 
 // Main thread: dispatch what the network thread queued.
@@ -558,8 +668,28 @@ void pumpNetwork() {
                 memcpy(&a, payload, sizeof(a));
                 g_sessionId.store(a.sessionId);
                 g_connected = true;
+                g_loginProblem.clear();
                 g_status    = "connected to " + g_sock.endpoint();
-                logMsg("connected, session %u", (unsigned)g_sessionId.load());
+                logMsg("connected, session %u, as %s%s%s", (unsigned)g_sessionId.load(),
+                       g_loginIcao.c_str(), g_loginLivery.empty() ? "" : " / ",
+                       g_loginLivery.c_str());
+                break;
+            }
+            case xr::PT_LOGIN_REJECT: {
+                if (h.payloadLen < sizeof(xr::LoginRejectPayload)) break;
+                xr::LoginRejectPayload rj{};
+                memcpy(&rj, payload, sizeof(rj));
+                if (rj.reason == xr::RJ_PASSWORD) {
+                    g_loginProblem = g_cfg.password.empty()
+                        ? "this flight needs a password (Settings > Connection)"
+                        : "wrong flight password";
+                } else if (rj.reason == xr::RJ_VERSION) {
+                    g_loginProblem = "the server runs a different XRadio version";
+                } else {
+                    g_loginProblem = "login refused";
+                }
+                g_status = g_loginProblem;
+                logMsg("login refused: %s", g_loginProblem.c_str());
                 break;
             }
             case xr::PT_TRAFFIC: handleTraffic(payload, h.payloadLen); break;
@@ -577,11 +707,21 @@ void pumpNetwork() {
 // it arrives; draining at 5 Hz would add up to 200 ms of latency on top of
 // the network's, and a jittery 200 ms at that. Sending stays at 5 Hz.
 float g_lastSend = -99.f;
+float g_lastAircraftCheck = 0.f;
 
 float flightLoop(float elapsedSinceLast, float, int, void*) {
     g_elapsed += elapsedSinceLast;
 
-    if (!g_sock.isOpen()) return 1.0f;
+    if (!g_sockReady.load()) {
+        // Not open yet: either still resolving, or it failed and the thread
+        // has left the reason for us.
+        std::lock_guard<std::mutex> lk(g_netErrMx);
+        if (!g_netErr.empty() && g_status.compare(0, 12, "socket error") != 0) {
+            g_status = "socket error: " + g_netErr;
+            logMsg("%s", g_status.c_str());
+        }
+        return 0.5f;
+    }
 
     pumpNetwork();
     xr::voice::tick();
@@ -601,9 +741,34 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
     // audio_com_selection: 6 == COM1, 7 == COM2.
     g_txFreqKhz.store((uint32_t)id(id(g_ref.audioComSel) == 7 ? g_ref.com2 : g_ref.com1));
 
+    // The audio panel's volume knobs, so turning a radio down in the cockpit
+    // turns it down in the headset. A missing dataref reads 0, which would
+    // mute everything, so an absent knob counts as fully up.
+    xr::voice::setRadioVolumes((uint32_t)id(g_ref.com1), g_ref.volCom1 ? fd(g_ref.volCom1) : 1.f,
+                               (uint32_t)id(g_ref.com2), g_ref.volCom2 ? fd(g_ref.volCom2) : 1.f);
+
     if (!g_connected) {
-        if (g_elapsed - g_lastLogin > 2.0f) sendLogin();   // retry until acked
+        // Retry until acked -- slowly once the server has said no, since the
+        // answer will not change until the settings do -- and after a while
+        // with no answer at all, say what that usually means.
+        const float every = g_loginProblem.empty() ? 2.0f : 10.0f;
+        if (g_elapsed - g_lastLogin > every) sendLogin();
+        if (g_loginProblem.empty() && g_firstLogin >= 0.f && g_elapsed - g_firstLogin > 8.0f) {
+            g_status = "no answer from " + g_sock.endpoint() +
+                       " (offline, wrong address, or a different XRadio version)";
+        }
         return -1.0f;
+    }
+
+    // Changed aircraft mid-session? Log in again so everyone sees the new one.
+    if (g_elapsed - g_lastAircraftCheck > 3.0f) {
+        g_lastAircraftCheck = g_elapsed;
+        if (xr::relay::running() && g_cfg.hostUpnp) xr::upnp::tick("XRadio");
+        if (effectiveIcao() != g_loginIcao || effectiveLivery() != g_loginLivery) {
+            logMsg("aircraft changed to %s, re-logging in", effectiveIcao().c_str());
+            reconnect();
+            return -1.0f;
+        }
     }
 
     // the server drops us after 15 s of silence, so position doubles as keepalive
@@ -627,17 +792,33 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
 // ---------------------------------------------------------------------------
 // PTT command
 // ---------------------------------------------------------------------------
+void setPtt(bool down) {
+    if (down == g_pttDown) return;
+    g_pttDown = down;
+    xr::voice::setTransmitting(g_pttDown);
+    // Tell the server straight away rather than at the next 5 Hz tick, so
+    // the [TX] label on our aircraft follows the key without a lag.
+    if (g_connected) sendPosition();
+}
+
 int pttHandler(XPLMCommandRef, XPLMCommandPhase phase, void*) {
-    bool changed = false;
-    if (phase == xplm_CommandBegin)      { g_pttDown = true;  changed = true; }
-    else if (phase == xplm_CommandEnd)   { g_pttDown = false; changed = true; }
-    if (changed) {
-        xr::voice::setTransmitting(g_pttDown);
-        // Tell the server straight away rather than at the next 5 Hz tick, so
-        // the [TX] label on our aircraft follows the key without a lag.
-        if (g_connected) sendPosition();
-    }
+    if (phase == xplm_CommandBegin)      setPtt(true);
+    else if (phase == xplm_CommandEnd)   setPtt(false);
     return 0;   // let other plugins see it too
+}
+
+// The push-to-talk key from the settings window. A hot key would only tell
+// us about the press, and a radio needs the release too, so the key is
+// sniffed instead -- after the windows have had it, so typing that letter
+// into the chat box or a settings field does not key the transmitter.
+int g_pttKeyVk = 0;
+
+int pttKeySniffer(char, XPLMKeyFlags flags, char vk, void*) {
+    const int k = (unsigned char)vk;
+    if (g_pttKeyVk == 0 || k != g_pttKeyVk) return 1;      // not ours, pass it on
+    if (flags & xplm_DownFlag) setPtt(true);
+    else if (flags & xplm_UpFlag) setPtt(false);
+    return 0;                                              // eaten
 }
 
 // ---------------------------------------------------------------------------
@@ -666,9 +847,10 @@ void drawWindow(XPLMWindowID win, void*) {
                    nullptr, xplmFont_Proportional);
     y -= 16;
     char who[200];
-    snprintf(who, sizeof(who), "%s as %s (%s)   Plugins > XRadio > Settings to change",
+    snprintf(who, sizeof(who), "%s as %s (%s%s%s)   Plugins > XRadio > Settings to change",
              g_sock.endpoint().empty() ? "no server" : g_sock.endpoint().c_str(),
-             g_cfg.callsign.c_str(), g_cfg.acIcao.c_str());
+             g_cfg.callsign.c_str(), effectiveIcao().c_str(),
+             effectiveLivery().empty() ? "" : " ", effectiveLivery().c_str());
     XPLMDrawString(white, x, y, who, nullptr, xplmFont_Basic);
     y -= 16;
 
@@ -705,6 +887,11 @@ void drawWindow(XPLMWindowID win, void*) {
             for (uint32_t sid : rx) {
                 auto it = g_remote.find(sid);
                 line += " " + (it != g_remote.end() ? it->second.callsign : std::to_string(sid));
+                // signal bars, like a phone: five for next door, one at the horizon
+                const int bars = 1 + (int)(xr::voice::signalQualityOf(sid) * 4.f + 0.5f);
+                line += " [";
+                for (int i = 0; i < 5; ++i) line += (i < bars) ? '|' : '.';
+                line += "]";
             }
         }
         const bool ok = xr::voice::available() && xr::voice::haveMicrophone();
@@ -741,11 +928,70 @@ void drawWindow(XPLMWindowID win, void*) {
     y -= 8;
     XPLMDrawString(white, x, y, (char*)"Radio", nullptr, xplmFont_Proportional);
     y -= 16;
+    // Newest messages win the space; the input row at the bottom is reserved.
+    const int inputY = b + 12;
     for (auto& msg : g_chatLog) {
-        if (y < b + 10) break;
+        if (y < inputY + 22) break;
         XPLMDrawString(white, x, y, (char*)msg.c_str(), nullptr, xplmFont_Basic);
         y -= 14;
     }
+
+    // Type here, Enter sends on the radio the audio panel has selected.
+    g_chatInputY = inputY;
+    char prompt[260];
+    const bool blink = ((int)(g_elapsed * 2.f) % 2) == 0;
+    if (g_chatFocus) {
+        snprintf(prompt, sizeof(prompt), "Say: > %s%s", g_chatInput.c_str(), blink ? "_" : "");
+    } else if (!g_chatInput.empty()) {
+        snprintf(prompt, sizeof(prompt), "Say:   %s", g_chatInput.c_str());
+    } else {
+        snprintf(prompt, sizeof(prompt), "Say:   (click here to type, Enter to send)");
+    }
+    XPLMDrawString(g_chatFocus ? green : (g_chatInput.empty() ? amber : white), x, inputY,
+                   prompt, nullptr, xplmFont_Basic);
+}
+
+// Clicking the "Say:" row takes the keyboard; clicking anywhere else in the
+// window gives it back, so the sim's own key bindings keep working.
+int mainWindowClick(XPLMWindowID win, int, int y, XPLMMouseStatus status, void*) {
+    if (status != xplm_MouseDown) return 1;
+    if (y >= g_chatInputY - 6 && y <= g_chatInputY + 15) {
+        g_chatFocus = true;
+        XPLMTakeKeyboardFocus(win);
+    } else if (g_chatFocus) {
+        g_chatFocus = false;
+        XPLMTakeKeyboardFocus(nullptr);
+    }
+    return 1;
+}
+
+void mainWindowKey(XPLMWindowID, char key, XPLMKeyFlags flags, char vk, void*, int losingFocus) {
+    if (losingFocus) { g_chatFocus = false; return; }
+    if (!(flags & xplm_DownFlag) || !g_chatFocus) return;
+    const unsigned char uvk = (unsigned char)vk;
+    const unsigned char ch  = (unsigned char)key;
+    if (uvk == XPLM_VK_RETURN || uvk == XPLM_VK_ENTER || ch == '\r' || ch == '\n') {
+        if (!g_chatInput.empty()) {
+            if (g_connected) {
+                sendText(g_chatInput);
+            } else {
+                addChat("(not connected -- nothing sent)");
+            }
+            g_chatInput.clear();
+        }
+        return;
+    }
+    if (uvk == XPLM_VK_ESCAPE || ch == 27) {
+        g_chatInput.clear();
+        g_chatFocus = false;
+        XPLMTakeKeyboardFocus(nullptr);
+        return;
+    }
+    if (uvk == XPLM_VK_BACK || ch == 8) {
+        if (!g_chatInput.empty()) g_chatInput.pop_back();
+        return;
+    }
+    if (ch >= 32 && ch < 127 && g_chatInput.size() < 200) g_chatInput += (char)ch;
 }
 
 // ---------------------------------------------------------------------------
@@ -810,10 +1056,10 @@ void createWindow() {
     p.bottom                = wb;
     p.visible               = 1;
     p.drawWindowFunc        = drawWindow;
-    p.handleMouseClickFunc  = [](XPLMWindowID, int, int, XPLMMouseStatus, void*) { return 1; };
+    p.handleMouseClickFunc  = mainWindowClick;
     p.handleRightClickFunc  = [](XPLMWindowID, int, int, XPLMMouseStatus, void*) { return 1; };
     p.handleMouseWheelFunc  = [](XPLMWindowID, int, int, int, int, void*) { return 1; };
-    p.handleKeyFunc         = [](XPLMWindowID, char, XPLMKeyFlags, char, void*, int) {};
+    p.handleKeyFunc         = mainWindowKey;
     p.handleCursorFunc      = [](XPLMWindowID, int, int, void*) -> XPLMCursorStatus {
         return xplm_CursorDefault;
     };
@@ -847,11 +1093,9 @@ void applyHosting() {
         return;
     }
 
-    if (xr::relay::running() && xr::relay::status().port == port) return;
-
     xr::relay::stop();
     std::string err;
-    if (!xr::relay::start(port, &err)) {
+    if (!xr::relay::start(port, g_cfg.password, &err)) {
         g_hostNote = "cannot host: " + err;
         logMsg("%s", g_hostNote.c_str());
         return;
@@ -877,7 +1121,9 @@ std::string lanAddress() {
 std::string shareAddress() {
     const xr::upnp::Result u = xr::upnp::latest();
     if (u.mapped && !u.externalIp.empty()) {
-        return u.externalIp + ":" + std::to_string(g_cfg.hostPort_i());
+        const std::string code = xr::joincode::encode(u.externalIp, (uint16_t)g_cfg.hostPort_i());
+        return u.externalIp + ":" + std::to_string(g_cfg.hostPort_i()) +
+               (code.empty() ? "" : "  (code " + code + ")");
     }
     return lanAddress() + " (your network only)";
 }
@@ -893,15 +1139,8 @@ void reconnect() {
         std::lock_guard<std::mutex> lk(g_inboxMx);
         g_inbox.clear();
     }
-    std::string err;
     g_sock.close();
-    if (!g_sock.open(g_cfg.activeHost(), (uint16_t)g_cfg.activePort(), &err)) {
-        g_status = "socket error: " + err;
-        logMsg("%s", g_status.c_str());
-    } else {
-        sendLogin();
-        netStart();
-    }
+    netStart();
 }
 
 // ---------------------------------------------------------------------------
@@ -914,6 +1153,7 @@ XPLMWindowID g_settingsWin = nullptr;
 Settings     g_edit;               // working copy while the window is open
 int          g_tab = 0;
 std::string  g_settingsNote;       // one-line feedback under the buttons
+bool         g_captureKey = false; // the PTT-key row is waiting for a key press
 xr::ui::Ctx  g_ui;
 std::vector<std::string> g_micList, g_outList;
 
@@ -946,6 +1186,7 @@ void applyLiveSettings() {
     xr::voice::setHiss(g_cfg.hiss);
     xr::voice::setRadioFilter(g_cfg.radioFilter);
     xr::Smoother::setDefaultPlayout(g_cfg.smoothMs / 1000.0);
+    g_pttKeyVk = g_cfg.pttKey;
     xr::csl::setTrafficVisible(g_cfg.showTraffic);
     xr::csl::setLabels(g_cfg.showLabels, g_cfg.labelDistNm);
     g_sendInterval = 1.0f / (g_cfg.reportHz < 1.f ? 1.f : g_cfg.reportHz);
@@ -954,6 +1195,7 @@ void applyLiveSettings() {
 void openSettings() {
     g_edit = g_cfg;
     g_settingsNote.clear();
+    g_captureKey = false;
     g_ui.focus = -1;
     g_keyQueue.clear();
     g_specialKey = kSpecialNone;
@@ -969,6 +1211,7 @@ void openSettings() {
 
 void closeSettings() {
     g_ui.focus = -1;
+    g_captureKey = false;
     g_keyQueue.clear();
     if (XPLMHasKeyboardFocus(g_settingsWin)) XPLMTakeKeyboardFocus(nullptr);
     XPLMSetWindowIsVisible(g_settingsWin, 0);
@@ -978,7 +1221,7 @@ void applySettings() {
     g_edit.callsign = upper(trim(g_edit.callsign));
     g_edit.acIcao   = upper(trim(g_edit.acIcao));
     g_edit.host     = trim(g_edit.host);
-    if (g_edit.acIcao.empty()) g_edit.acIcao = "C172";
+    g_edit.password = trim(g_edit.password);
 
     const std::string problem = xr::validate(g_edit);
     if (!problem.empty()) {
@@ -990,10 +1233,12 @@ void applySettings() {
                             (g_edit.port != g_cfg.port) ||
                             (g_edit.callsign != g_cfg.callsign) ||
                             (g_edit.acIcao != g_cfg.acIcao) ||
+                            (g_edit.password != g_cfg.password) ||
                             (g_edit.hostEnabled != g_cfg.hostEnabled) ||
                             (g_edit.hostPort != g_cfg.hostPort);
     const bool hostChanged = (g_edit.hostEnabled != g_cfg.hostEnabled) ||
                              (g_edit.hostPort != g_cfg.hostPort) ||
+                             (g_edit.password != g_cfg.password) ||
                              (g_edit.hostUpnp != g_cfg.hostUpnp);
     const bool devChanged = (g_edit.micDevice != g_cfg.micDevice) ||
                             (g_edit.outDevice != g_cfg.outDevice);
@@ -1083,6 +1328,9 @@ void drawSettings(XPLMWindowID win, void*) {
                                isMic ? g_micList : g_outList, "system default");
                 break;
             }
+            case xr::Kind::KeyBind:
+                xr::ui::keybind(g_ui, f.label, xr::keyName(*(int*)f.ptr), g_captureKey);
+                break;
         }
     }
 
@@ -1108,6 +1356,12 @@ void drawSettings(XPLMWindowID win, void*) {
             if (u.mapped && !u.externalIp.empty()) {
                 snprintf(line, sizeof(line), "Friends type:  %s:%s", u.externalIp.c_str(), port.c_str());
                 xr::ui::text(g_ui, line, 0);
+                const std::string code = xr::joincode::encode(u.externalIp, st.port);
+                if (!code.empty()) {
+                    snprintf(line, sizeof(line), "   or the join code:  %s   (goes in their Server host field)",
+                             code.c_str());
+                    xr::ui::text(g_ui, line, 2);
+                }
                 snprintf(line, sizeof(line), "Router opened the port (%s)%s",
                          u.router.empty() ? "UPnP" : u.router.c_str(),
                          u.leaseSeconds ? ", an hour at a time" : "");
@@ -1146,6 +1400,11 @@ void drawSettings(XPLMWindowID win, void*) {
                              u.externalIp.empty() ? "<your public address>" : u.externalIp.c_str(),
                              port.c_str());
                     xr::ui::text(g_ui, line, 1);
+                    const std::string code = u.externalIp.empty() ? "" : xr::joincode::encode(u.externalIp, st.port);
+                    if (!code.empty()) {
+                        snprintf(line, sizeof(line), "   or the join code:  %s", code.c_str());
+                        xr::ui::text(g_ui, line, 1);
+                    }
                 }
             }
 
@@ -1206,8 +1465,15 @@ int settingsClick(XPLMWindowID win, int x, int y, XPLMMouseStatus status, void*)
 }
 
 void settingsKey(XPLMWindowID, char key, XPLMKeyFlags flags, char vk, void*, int losingFocus) {
-    if (losingFocus) { g_ui.focus = -1; g_keyQueue.clear(); return; }
+    if (losingFocus) { g_ui.focus = -1; g_keyQueue.clear(); g_captureKey = false; return; }
     if (!(flags & xplm_DownFlag)) return;
+    if (g_captureKey) {
+        // Whatever was pressed becomes the PTT key; Escape means "none".
+        const int k = (unsigned char)vk;
+        g_edit.pttKey = (k == XPLM_VK_ESCAPE || k == 0) ? 0 : k;
+        g_captureKey = false;
+        return;
+    }
     // Everything, Enter and Escape included, goes through the queue so the
     // draw applies it in the order it was typed. 256 is far more than a
     // frame's worth; the cap only matters if the window stops drawing.
@@ -1294,7 +1560,7 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     createSettingsWindow();
 
     std::string cslErr;
-    if (!xr::csl::init(pluginRootDir(), g_cfg.acIcao, &cslErr)) {
+    if (!xr::csl::init(pluginRootDir(), effectiveIcao(), &cslErr)) {
         logMsg("3D traffic unavailable: %s", cslErr.c_str());
     }
 
@@ -1314,6 +1580,7 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
 
     g_cmdPtt = XPLMCreateCommand("xradio/ptt", "XRadio: push to talk");
     XPLMRegisterCommandHandler(g_cmdPtt, pttHandler, 1, nullptr);
+    XPLMRegisterKeySniffer(pttKeySniffer, 0 /* after windows */, nullptr);
 
     int idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "XRadio", nullptr, 0);
     g_menu = XPLMCreateMenu("XRadio", XPLMFindPluginsMenu(), idx, menuHandler, nullptr);
@@ -1343,14 +1610,7 @@ PLUGIN_API int XPluginEnable(void) {
         return 1;
     }
 
-    std::string err;
-    if (!g_sock.open(g_cfg.activeHost(), (uint16_t)g_cfg.activePort(), &err)) {
-        g_status = "socket error: " + err;
-        logMsg("%s", g_status.c_str());
-    } else {
-        sendLogin();
-        netStart();
-    }
+    netStart();
     XPLMScheduleFlightLoop(g_loop, -1.0f, 1);   // every frame
     return 1;
 }
@@ -1382,6 +1642,7 @@ PLUGIN_API void XPluginStop(void) {
     if (g_window)      { XPLMDestroyWindow(g_window);      g_window = nullptr; }
     if (g_settingsWin) { XPLMDestroyWindow(g_settingsWin); g_settingsWin = nullptr; }
     if (g_cmdPtt) { XPLMUnregisterCommandHandler(g_cmdPtt, pttHandler, 1, nullptr); }
+    XPLMUnregisterKeySniffer(pttKeySniffer, 0, nullptr);
     if (g_menu)   { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
 }
 

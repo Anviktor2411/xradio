@@ -86,30 +86,40 @@ public:
     }
     ~Peer() { if (fd_ >= 0) CLOSESOCK(fd_); }
 
-    bool login() {
+    bool login(const char* password = "", const char* livery = "Ryanair") {
         xr::LoginPayload lp{};
         snprintf(lp.callsign, sizeof(lp.callsign), "%s", callsign_.c_str());
         snprintf(lp.acIcao, sizeof(lp.acIcao), "%s", "B738");
+        snprintf(lp.livery, sizeof(lp.livery), "%s", livery);
+        snprintf(lp.password, sizeof(lp.password), "%s", password);
         lp.protoVer = xr::kProtoVersion;
+        rejected_ = 0;
         send(xr::PT_LOGIN, 0, &lp, sizeof(lp));
 
         uint8_t buf[xr::kMaxPacket];
         for (int i = 0; i < 25; ++i) {
             const int n = recvAny(buf, sizeof(buf));
-            if (n >= (int)(sizeof(xr::Header) + sizeof(xr::LoginAckPayload))) {
+            if (n >= (int)(sizeof(xr::Header) + 4)) {
                 xr::Header h{};
                 memcpy(&h, buf, sizeof(h));
-                if (h.type == xr::PT_LOGIN_ACK) {
+                if (h.type == xr::PT_LOGIN_ACK && n >= (int)(sizeof(h) + sizeof(xr::LoginAckPayload))) {
                     xr::LoginAckPayload ack{};
                     memcpy(&ack, buf + sizeof(h), sizeof(ack));
                     sid_ = ack.sessionId;
                     return sid_ != 0;
+                }
+                if (h.type == xr::PT_LOGIN_REJECT) {
+                    xr::LoginRejectPayload rj{};
+                    memcpy(&rj, buf + sizeof(h), sizeof(rj));
+                    rejected_ = rj.reason;
+                    return false;
                 }
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(40));
         }
         return false;
     }
+    uint16_t rejectedWith() const { return rejected_; }
 
     void position(uint32_t com1 = 122800) {
         xr::PositionPayload p{};
@@ -140,6 +150,7 @@ public:
     struct Bag {
         int traffic = 0;
         std::vector<std::string> sawCallsigns;
+        std::vector<std::string> sawTypes;      // "B738/Ryanair" per entry
         std::vector<std::string> texts;
     };
     Bag drain(int ms) {
@@ -165,6 +176,10 @@ public:
                     char cs[17] = {0};
                     memcpy(cs, e.callsign, 16);
                     bag.sawCallsigns.push_back(cs);
+                    char ty[9] = {0}, lv[17] = {0};
+                    memcpy(ty, e.acIcao, 8);
+                    memcpy(lv, e.livery, 16);
+                    bag.sawTypes.push_back(std::string(ty) + "/" + lv);
                 }
             } else if (h.type == xr::PT_TEXT) {
                 xr::TextHeader th{};
@@ -200,6 +215,7 @@ private:
     }
 
     std::string callsign_;
+    uint16_t    rejected_ = 0;
     double      lat_, lon_;
     int         fd_ = -1;
     uint32_t    sid_ = 0;
@@ -242,7 +258,7 @@ int main(int argc, char** argv) {
     {
         xr::Settings s;
         s.callsign = "HOSTER";
-        s.acIcao = "C172";
+        s.acIcao = "";                     // from the sim
         s.host = "127.0.0.1";
         s.port = "1";                      // deliberately useless
         s.hostPort = std::to_string(g_port);
@@ -256,6 +272,11 @@ int main(int argc, char** argv) {
     harness::set("sim/cockpit2/radios/actuators/audio_selection_com1", 1);
     harness::set("sim/cockpit2/radios/actuators/audio_com_selection", 6);
     harness::set("sim/flightmodel/position/elevation", 914.0);
+    // What the sim says we are flying. The config leaves the type blank, so
+    // this is what everyone else must see.
+    harness::setString("sim/aircraft/view/acf_ICAO", "A20N");
+    harness::setString("sim/aircraft/view/acf_livery_path",
+                       "Aircraft/ToLiss/A320/liveries/Lufthansa/");
 
     harness::resetWindows();
     char n[256], sg[256], d[256];
@@ -308,6 +329,26 @@ int main(int argc, char** argv) {
         check("and sees the host's aircraft in it",
               contains(bag.sawCallsigns, "HOSTER"),
               bag.sawCallsigns.empty() ? "nothing" : bag.sawCallsigns[0]);
+        check("as the type and livery the sim reported, not a typed-in default",
+              contains(bag.sawTypes, "A20N/Lufthansa"),
+              bag.sawTypes.empty() ? "nothing" : bag.sawTypes[0]);
+        auto w2 = harness::draw();
+        check("the host sees the peer's type too", shows(w2, "B738"));
+    }
+
+    printf("\nchanging aircraft mid-flight\n");
+    {
+        harness::setString("sim/aircraft/view/acf_ICAO", "B738");
+        harness::setString("sim/aircraft/view/acf_livery_path", "Aircraft/Zibo/liveries/Delta/");
+        // The plugin checks every 3 s and logs in again; give it time to
+        // reconnect and the peer time to get a traffic packet with the new type.
+        bool seen = false;
+        for (int i = 0; i < 12 && !seen; ++i) {
+            for (int j = 0; j < 5; ++j) { peer.position(); fly(0.1); }
+            auto bag = peer.drain(200);
+            seen = contains(bag.sawTypes, "B738/Delta");
+        }
+        check("everyone sees the new aircraft within a few seconds", seen);
     }
 
     printf("\nthe radio works through the hosted server\n");
@@ -325,6 +366,29 @@ int main(int argc, char** argv) {
         auto bag = peer.drain(400);
         check("and the peer hears the host", !bag.texts.empty(),
               bag.texts.empty() ? "nothing" : bag.texts[0]);
+
+        // Typed into the main window: click the Say row, type, Enter.
+        auto w0 = harness::draw();
+        int sx = 0, sy = 0;
+        check("the main window has a place to type", harness::drawnAt("Say:", &sx, &sy));
+        harness::click(1, sx + 40, sy);
+        harness::typeText(1, "Hoster here, taxiing to 26");
+        auto typing = harness::draw();
+        check("what is typed shows in the window", shows(typing, "> Hoster here, taxiing to 26"));
+        harness::pressVk(1, 0x0D);
+        for (int i = 0; i < 6; ++i) { peer.position(); fly(0.1); }
+        auto typedBag = peer.drain(400);
+        bool got = false;
+        for (const auto& t : typedBag.texts) if (t == "Hoster here, taxiing to 26") got = true;
+        check("Enter sends it to the other pilot", got,
+              typedBag.texts.empty() ? "nothing" : typedBag.texts.back());
+        auto after = harness::draw();
+        check("the field clears and the line appears in our own log",
+              shows(after, "HOSTER: Hoster here, taxiing to 26") && !shows(after, "> Hoster"));
+        // A click elsewhere in the window hands the keyboard back to the sim.
+        harness::click(1, sx + 40, sy + 200);
+        harness::typeText(1, "zzz");
+        check("clicking away stops capturing keys", !shows(harness::draw(), "zzz"));
     }
 
     printf("\nthe hosting tab reports what is going on\n");
@@ -344,9 +408,53 @@ int main(int argc, char** argv) {
         if (failures) dump(v);
     }
 
+    printf("\na flight password\n");
+    {
+        // Set one through the window; the hosted server restarts requiring it
+        // and our own client logs back in with it.
+        harness::menu(1);
+        drawSettings();
+        int tx = 0, ty = 0, top = 0, left = 0;
+        harness::windowTop(kWin, &top, &left);
+        harness::drawnAt("Connection", &tx, &ty);
+        harness::click(kWin, tx + 10, ty);
+        drawSettings();
+        int lx = 0, ly = 0;
+        check("there is a password field", harness::drawnAt("Flight password", &lx, &ly));
+        harness::click(kWin, left + xr::ui::Ctx::kValueX + 10, ly);
+        drawSettings();
+        harness::typeText(kWin, "cumulus");
+        drawSettings();
+        int bx = 0, by = 0;
+        harness::drawnAt("Save & apply", &bx, &by);
+        harness::click(kWin, bx + 20, by);
+        drawSettings();
+        fly(1.5);
+        auto w = harness::draw();
+        check("the host reconnected to its own server with the password",
+              shows(w, "connected to 127.0.0.1"));
+        if (!shows(w, "connected to 127.0.0.1")) dump(w);
+
+        Peer stranger("NOPASS", 57.86, 27.03);
+        check("a pilot without the password is refused", !stranger.login(""));
+        check("...and told why", stranger.rejectedWith() == xr::RJ_PASSWORD,
+              std::to_string(stranger.rejectedWith()));
+        Peer wrong("WRONGPW", 57.86, 27.03);
+        check("a wrong password is refused", !wrong.login("nimbus") &&
+                                             wrong.rejectedWith() == xr::RJ_PASSWORD);
+        Peer friendly("FRIEND2", 57.86, 27.03);
+        check("the right password gets in", friendly.login("cumulus"));
+    }
+
     printf("\nswitching hosting off again\n");
     {
         // Untick it and save: the server must stop and let the port go.
+        harness::menu(1);
+        drawSettings();
+        int tx = 0, ty = 0;
+        harness::drawnAt("Hosting", &tx, &ty);
+        harness::click(kWin, tx + 10, ty);
+        drawSettings();
         int lx = 0, ly = 0, top = 0, left = 0;
         harness::windowTop(kWin, &top, &left);
         harness::drawnAt("Host a flight here", &lx, &ly);
