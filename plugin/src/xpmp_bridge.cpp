@@ -10,6 +10,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 #ifdef XRADIO_USE_XPMP2
 #  include "XPMPAircraft.h"
@@ -42,7 +43,8 @@ void logMsg(const char* fmt, ...) {
 // ---------------------------------------------------------------------------
 bool available() { return false; }
 
-bool init(const std::string&, const std::string&, std::string* err) {
+bool init(const std::string&, const std::string&, const std::string&,
+          std::string* err) {
     if (err) *err = "built without XPMP2 (configure with -DXRADIO_USE_XPMP2=ON)";
     return false;
 }
@@ -54,6 +56,7 @@ void upsert(const RemoteState&) {}
 void remove(uint32_t) {}
 void removeAll() {}
 int  cslModelCount() { return 0; }
+std::string cslModelSource() { return ""; }
 void setTrafficVisible(bool) {}
 void setLabels(bool, float) {}
 
@@ -67,6 +70,41 @@ bool g_ready   = false;   // XPMPMultiplayerInit succeeded
 bool g_enabled = false;
 bool g_visible = true;    // the "draw other aircraft" setting
 int  g_models  = 0;
+std::string g_modelSource;   // which library the models came from, for the UI
+
+// .../Resources/plugins, from .../Resources/plugins/XRadio.
+std::string pluginsDir(const std::string& pluginRoot) {
+    const size_t cut = pluginRoot.find_last_of("/\\");
+    return cut == std::string::npos ? pluginRoot : pluginRoot.substr(0, cut);
+}
+
+// Windows hands us a path with backslashes and we append with slashes, so
+// logs end up looking like "D:\\SteamLibrary/steamapps/...". Harmless to
+// XPMP2, confusing to read in Log.txt.
+std::string nativePath(std::string p) {
+#ifdef _WIN32
+    for (char& c : p) if (c == '/') c = '\\';
+#endif
+    return p;
+}
+
+// Hand a folder to XPMP2 and note whether it produced anything. XPMP2 walks
+// the tree itself, so one call covers a whole library of packages.
+void loadPackages(const std::string& rawDir, const char* who) {
+    const std::string dir = nativePath(rawDir);
+    const int before = (int)XPMPGetNumberOfInstalledModels();
+    const char* res = XPMPLoadCSLPackage(dir.c_str());
+    const int after = (int)XPMPGetNumberOfInstalledModels();
+    if (res && *res && after == before) {
+        logMsg("nothing in %s (%s)", dir.c_str(), res);
+        return;
+    }
+    if (after > before) {
+        logMsg("%d models from %s (%s)", after - before, who, dir.c_str());
+        if (g_modelSource.empty()) g_modelSource = who;
+    }
+    g_models = after;
+}
 
 // One remote pilot, rendered by XPMP2 as a CSL model.
 class XRAircraft : public XPMP2::Aircraft {
@@ -160,7 +198,8 @@ XPMPPlaneID modeSFor(uint32_t sid) {
 // XPMPMultiplayerEnable has to have taken the AI planes as well.
 bool available() { return g_ready && g_enabled; }
 
-bool init(const std::string& pluginRoot, const std::string& defaultIcao, std::string* err) {
+bool init(const std::string& pluginRoot, const std::string& defaultIcao,
+          const std::string& extraCslDir, std::string* err) {
     if (g_ready) return true;
 
     const std::string resourceDir = pluginRoot + "/Resources";
@@ -173,16 +212,41 @@ bool init(const std::string& pluginRoot, const std::string& defaultIcao, std::st
         return false;
     }
 
-    // CSL models live in Resources/CSL. Each subfolder with an xsb_aircraft.txt
-    // is a package; XPMPLoadCSLPackage walks the tree.
-    const std::string cslDir = resourceDir + "/CSL";
-    res = XPMPLoadCSLPackage(cslDir.c_str());
-    if (res && *res) {
-        logMsg("no CSL models in %s (%s) -- traffic will use the default model",
-               cslDir.c_str(), res);
+    // Our own Resources/CSL first. Each subfolder with an xsb_aircraft.txt is
+    // a package; XPMPLoadCSLPackage walks the tree.
+    loadPackages(resourceDir + "/CSL", "XRadio");
+
+    // A folder the pilot typed in wins over anything we go looking for.
+    if (!extraCslDir.empty() && g_models == 0)
+        loadPackages(extraCslDir, "the folder in Settings");
+
+    // Still nothing: almost every X-Plane install that wants CSL traffic
+    // already has a library sitting in another plugin, and asking people to
+    // copy a gigabyte of models around to use a second plugin is silly.
+    if (g_models == 0) {
+        const std::string plugins = pluginsDir(pluginRoot);
+        struct Candidate { const char* path; const char* who; };
+        static const Candidate kKnown[] = {
+            {"/xPilot/Resources/CSL",       "xPilot"},
+            {"/LiveTraffic/Resources/CSL",  "LiveTraffic"},
+            {"/swift/Resources/CSL",        "swift"},
+            {"/XSquawkBox/Resources/CSL",   "XSquawkBox"},
+            {"/IVAO_CSL/CSL",               "IVAO Altitude"},
+            {"/CSL",                        "Resources/plugins/CSL"},
+        };
+        for (const auto& c : kKnown) {
+            if (g_models > 0) break;
+            loadPackages(plugins + c.path, c.who);
+        }
     }
-    g_models = (int)XPMPGetNumberOfInstalledModels();
-    logMsg("initialised, %d CSL models loaded", g_models);
+
+    if (g_models == 0)
+        logMsg("no CSL models found -- other aircraft will be invisible; "
+               "put a package in %s/CSL or name a folder in Settings > Traffic",
+               resourceDir.c_str());
+    else
+        logMsg("initialised, %d CSL models loaded from %s",
+               g_models, g_modelSource.c_str());
 
     g_ready = true;
     return true;
@@ -190,6 +254,20 @@ bool init(const std::string& pluginRoot, const std::string& defaultIcao, std::st
 
 void enable() {
     if (!g_ready || g_enabled) return;
+
+    // Taking the AI planes takes TCAS away from every other traffic plugin --
+    // only one of us can have it. With no models loaded, or with traffic
+    // switched off, we would hold it and draw nothing, so we leave it for
+    // whoever can use it (PlanePals, SayIntentions, LiveTraffic, ...).
+    if (g_models == 0) {
+        logMsg("no CSL models, leaving TCAS and the AI planes to other plugins");
+        return;
+    }
+    if (!g_visible) {
+        logMsg("traffic switched off, leaving TCAS to other plugins");
+        return;
+    }
+
     const char* res = XPMPMultiplayerEnable();
     if (res && *res) {
         logMsg("enable failed: %s", res);
@@ -218,7 +296,15 @@ void shutdown() {
 void setTrafficVisible(bool on) {
     if (g_visible == on) return;
     g_visible = on;
-    if (!on) removeAll();      // upsert() will recreate them when switched back
+    if (!on) {
+        removeAll();           // upsert() will recreate them when switched back
+        if (g_enabled) {       // and give TCAS back while we are not using it
+            XPMPMultiplayerDisable();
+            g_enabled = false;
+        }
+    } else {
+        enable();              // takes the AI planes again if we have models
+    }
     logMsg("traffic rendering %s", on ? "on" : "off");
 }
 
@@ -257,6 +343,7 @@ void remove(uint32_t sid) {
 void removeAll() { g_planes.clear(); }
 
 int cslModelCount() { return g_models; }
+std::string cslModelSource() { return g_modelSource; }
 
 #endif  // XRADIO_USE_XPMP2
 

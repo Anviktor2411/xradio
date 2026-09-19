@@ -905,8 +905,10 @@ void drawWindow(XPLMWindowID win, void*) {
 
     char title[96];
     if (xr::csl::available()) {
-        snprintf(title, sizeof(title), "Traffic (%d)  ·  %d CSL models%s",
+        const std::string src = xr::csl::cslModelSource();
+        snprintf(title, sizeof(title), "Traffic (%d)  ·  %d CSL models%s%s%s",
                  (int)g_remote.size(), xr::csl::cslModelCount(),
+                 src.empty() ? "" : " from ", src.c_str(),
                  g_rejected ? "  · bad data rejected" : "");
     } else {
         snprintf(title, sizeof(title), "Traffic (%d)  ·  no 3D models%s",
@@ -1132,8 +1134,20 @@ std::string shareAddress() {
 }
 
 // Drop the current session and log in again with whatever g_cfg says now.
+// Tell the server we are going, so it frees the session now instead of
+// waiting out its 15 s timeout. Without this, saving a settings change left
+// the old session alive on the server and the pilot watched their previous
+// callsign sitting in their own traffic list at 0.0 nm.
+void sendLogout() {
+    if (!g_sock.isOpen() || !g_connected) return;
+    uint8_t buf[sizeof(xr::Header)];
+    writeHeader(buf, xr::PT_LOGOUT, 0);
+    g_sock.send(buf, (int)sizeof(buf));
+}
+
 void reconnect() {
     netStop();
+    sendLogout();
     g_connected = false;
     g_sessionId.store(0);
     g_remote.clear();
@@ -1566,7 +1580,7 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     createSettingsWindow();
 
     std::string cslErr;
-    if (!xr::csl::init(pluginRootDir(), effectiveIcao(), &cslErr)) {
+    if (!xr::csl::init(pluginRootDir(), effectiveIcao(), g_cfg.cslPath, &cslErr)) {
         logMsg("3D traffic unavailable: %s", cslErr.c_str());
     }
 
@@ -1624,11 +1638,7 @@ PLUGIN_API int XPluginEnable(void) {
 PLUGIN_API void XPluginDisable(void) {
     xr::voice::setTransmitting(false);
     netStop();
-    if (g_sock.isOpen() && g_connected) {
-        uint8_t buf[sizeof(xr::Header)];
-        writeHeader(buf, xr::PT_LOGOUT, 0);
-        g_sock.send(buf, (int)sizeof(buf));
-    }
+    sendLogout();
     g_sock.close();
     g_connected = false;
     g_sessionId.store(0);

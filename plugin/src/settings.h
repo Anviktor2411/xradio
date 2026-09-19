@@ -47,6 +47,10 @@ struct Settings {
     bool        showLabels  = true;
     float       labelDistNm = 20.f;
     float       trafficRangeNm = 80.f;
+    // Blank means: our own Resources/CSL, and if that is empty, whatever CSL
+    // library another traffic plugin already installed. A path here overrides
+    // that search.
+    std::string cslPath = "";
 
     int         port_i() const { return atoi(port.c_str()); }
     int         hostPort_i() const { return atoi(hostPort.c_str()); }
@@ -111,6 +115,8 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"showlabels",  "Callsign labels",     Kind::Bool, 2, &s.showLabels},
         {"labeldist",   "Label range",   Kind::Slider, 2, &s.labelDistNm,   1.f, 100.f, " nm", 0},
         {"range",       "Traffic range", Kind::Slider, 2, &s.trafficRangeNm, 5.f, 200.f, " nm", 0},
+        {"cslpath",     "CSL folder (blank = find one)", Kind::Text, 2, &s.cslPath,
+                        0, 0, "", 0, 255},
 
         {"hosting",     "Host a flight here", Kind::Bool, 3, &s.hostEnabled},
         {"hostport",    "Port to host on",    Kind::Text, 3, &s.hostPort, 0,0,"",0, 5, true},

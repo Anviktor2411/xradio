@@ -408,6 +408,47 @@ int main(int argc, char** argv) {
         if (failures) dump(v);
     }
 
+    printf("\nchanging the callsign leaves no ghost behind\n");
+    {
+        // Saving a new callsign reconnects, which the server sees as a second
+        // pilot unless the old session says goodbye. It used to not say it,
+        // so the pilot watched their own previous callsign sitting in their
+        // traffic list at 0.0 nm until the server's 15 s timeout ran out.
+        harness::menu(1);
+        drawSettings();
+        int tx = 0, ty = 0, top = 0, left = 0;
+        harness::windowTop(kWin, &top, &left);
+        harness::drawnAt("Connection", &tx, &ty);
+        harness::click(kWin, tx + 10, ty);
+        drawSettings();
+
+        int lx = 0, ly = 0;
+        check("the callsign field is there", harness::drawnAt("Callsign", &lx, &ly));
+        harness::click(kWin, left + xr::ui::Ctx::kValueX + 10, ly);
+        drawSettings();
+        for (int i = 0; i < 7; ++i) harness::pressVk(kWin, 0x08);   // backspace HOSTER
+        harness::typeText(kWin, "SH6767");
+        drawSettings();
+
+        int bx = 0, by = 0;
+        harness::drawnAt("Save & apply", &bx, &by);
+        harness::click(kWin, bx + 20, by);
+        drawSettings();
+        fly(2.0);
+
+        auto w = harness::draw();
+        check("we are back on under the new callsign", shows(w, "SH6767"));
+
+        // Only the traffic rows matter: chat the old callsign sent earlier
+        // stays in the radio log, and should.
+        bool ghost = false;
+        for (const auto& line : w)
+            if (line.find(" ft ") != std::string::npos &&
+                line.find("HOSTER") != std::string::npos) ghost = true;
+        check("the old callsign is not in our own traffic list", !ghost);
+        if (ghost) dump(w);
+    }
+
     printf("\na flight password\n");
     {
         // Set one through the window; the hosted server restarts requiring it

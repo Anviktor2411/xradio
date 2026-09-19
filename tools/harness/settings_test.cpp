@@ -184,6 +184,7 @@ int main() {
         a.showLabels = false;
         a.labelDistNm = 45.f;
         a.trafficRangeNm = 120.f;
+        a.cslPath = "D:\\X-Plane 12\\Resources\\plugins\\xPilot\\Resources\\CSL";
         check("save writes the file", xr::saveSettings(a, kCfgPath));
 
         xr::Settings b;
@@ -197,6 +198,9 @@ int main() {
                                   b.radioFilter == false && b.showTraffic == false);
         check("numbers survive", b.reportHz == 8.f && b.smoothMs == 500.f &&
                                  b.labelDistNm == 45.f && b.trafficRangeNm == 120.f);
+        // Windows paths have backslashes, drive letters and spaces; the config
+        // parser must hand them back exactly.
+        check("a CSL folder path survives", b.cslPath == a.cslPath, "'" + b.cslPath + "'");
         check("volume survives", b.volume > 0.41f && b.volume < 0.43f,
               std::to_string(b.volume));
 
@@ -331,7 +335,7 @@ int main() {
             auto traffic = draw();
             check("traffic tab shows its fields",
                   shows(traffic, "Draw other aircraft") && shows(traffic, "Label range") &&
-                  shows(traffic, "Traffic range"));
+                  shows(traffic, "Traffic range") && shows(traffic, "CSL folder"));
             check("audio fields are gone", !shows(traffic, "Radio noise"));
             if (failures) dump(traffic);
         }

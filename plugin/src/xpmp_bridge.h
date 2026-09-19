@@ -41,7 +41,12 @@ bool available();
 // platform subdirectories, i.e. .../Resources/plugins/XRadio.
 // On failure the reason lands in `err` and the plugin keeps running without
 // 3D traffic.
-bool init(const std::string& pluginRoot, const std::string& defaultIcao, std::string* err);
+// `extraCslDir` is the folder the pilot named in Settings, empty for none.
+// When neither our own Resources/CSL nor that folder yields a model, init
+// looks in the CSL libraries other traffic plugins install (xPilot,
+// LiveTraffic, IVAO and friends) rather than leaving the sky empty.
+bool init(const std::string& pluginRoot, const std::string& defaultIcao,
+          const std::string& extraCslDir, std::string* err);
 
 void enable();    // XPluginEnable: start drawing, take over AI planes
 void disable();   // XPluginDisable: remove all aircraft, release AI planes
@@ -54,8 +59,10 @@ void upsert(const RemoteState& s);
 void remove(uint32_t sid);
 void removeAll();
 
-// How many CSL models were loaded, for the status window.
+// How many CSL models were loaded, for the status window, and the name of
+// the library they came from ("xPilot", "XRadio", ...) or "" for none.
 int cslModelCount();
+std::string cslModelSource();
 
 // Settings: draw other aircraft at all, and how their labels behave.
 void setTrafficVisible(bool on);
