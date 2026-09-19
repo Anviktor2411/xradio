@@ -4,6 +4,12 @@
 
 namespace harness {
 
+// One captured XPLMDrawString call: the text and where it was drawn.
+struct Drawn {
+    std::string text;
+    int x = 0, y = 0;
+};
+
 void   set(const std::string& dataref, double value);
 double get(const std::string& dataref);
 
@@ -26,6 +32,10 @@ void clearMonitors();
 void addMonitor(int l, int t, int r, int b);
 
 bool drawnContains(const std::vector<std::string>& lines, const std::string& needle);
+
+// Position of a line from the most recent draw()/drawWindow() call.
+bool drawnAt(const std::string& needle, int* x, int* y);
+const std::vector<Drawn>& drawnPositions();
 const std::vector<std::string>& log();
 
 extern bool g_verbose;

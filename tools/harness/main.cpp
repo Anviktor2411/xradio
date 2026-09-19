@@ -89,10 +89,23 @@ int main(int argc, char** argv) {
 
     int top = 0, left = 0;
     harness::windowTop(2, &top, &left);
-    auto rowY = [&](int i) { return top - 52 - i * 26; };
+
+    // Click the row a label was actually drawn on. A click only takes focus
+    // on the frame it is processed, so the field is redrawn before anything
+    // is typed into it -- exactly the order the sim produces.
+    auto focusField = [&](const char* label) {
+        harness::drawWindow(2);
+        int lx = 0, ly = 0;
+        if (!harness::drawnAt(label, &lx, &ly)) {
+            fprintf(stderr, "FAIL: no '%s' row in the settings window\n", label);
+            exit(1);
+        }
+        harness::click(2, left + 200, ly);
+        harness::drawWindow(2);
+    };
 
     // Port field: click it, wipe it, type the right one.
-    harness::click(2, left + 60, rowY(1));
+    focusField("Port");
     for (int i = 0; i < 8; ++i) harness::pressVk(2, 0x08);   // XPLM_VK_BACK
     harness::typeText(2, port);
     sw = harness::drawWindow(2);
@@ -105,15 +118,23 @@ int main(int argc, char** argv) {
     // Callsign: Tab to it (from port), wipe, type ours in lower case --
     // the plugin should upper-case it on save.
     harness::pressVk(2, 0x09);                                // XPLM_VK_TAB
+    harness::drawWindow(2);                                   // Tab takes effect
     for (int i = 0; i < 20; ++i) harness::pressVk(2, 0x08);
     std::string lower = cs;
     for (auto& ch : lower) ch = (char)tolower((unsigned char)ch);
     harness::typeText(2, lower);
+    sw = harness::drawWindow(2);
+    if (!harness::drawnContains(sw, std::string("> ") + lower)) {
+        fprintf(stderr, "FAIL: Tab did not move focus to the callsign field\n");
+        for (auto& l : sw) fprintf(stderr, "   %s\n", l.c_str());
+        return 1;
+    }
 
     // Validation: an empty host must be refused, not saved.
-    harness::click(2, left + 60, rowY(0));
+    focusField("Server host");
     for (int i = 0; i < 70; ++i) harness::pressVk(2, 0x08);
     harness::pressVk(2, 0x0D);                                // XPLM_VK_RETURN
+    harness::drawWindow(2);                                   // Enter acts on draw
     if (!harness::windowVisible(2)) {
         fprintf(stderr, "FAIL: settings accepted an empty host\n");
         return 1;
@@ -125,6 +146,7 @@ int main(int argc, char** argv) {
     }
     harness::typeText(2, host);
     harness::pressVk(2, 0x0D);                                // save & reconnect
+    harness::drawWindow(2);
 
     if (harness::windowVisible(2)) {
         fprintf(stderr, "FAIL: settings window stayed open after save\n");

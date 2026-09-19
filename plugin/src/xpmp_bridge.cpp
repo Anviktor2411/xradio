@@ -54,6 +54,8 @@ void upsert(const RemoteState&) {}
 void remove(uint32_t) {}
 void removeAll() {}
 int  cslModelCount() { return 0; }
+void setTrafficVisible(bool) {}
+void setLabels(bool, float) {}
 
 #else
 // ---------------------------------------------------------------------------
@@ -63,6 +65,7 @@ namespace {
 
 bool g_ready   = false;   // XPMPMultiplayerInit succeeded
 bool g_enabled = false;
+bool g_visible = true;    // the "draw other aircraft" setting
 int  g_models  = 0;
 
 // One remote pilot, rendered by XPMP2 as a CSL model.
@@ -211,8 +214,21 @@ void shutdown() {
     g_ready = false;
 }
 
+void setTrafficVisible(bool on) {
+    if (g_visible == on) return;
+    g_visible = on;
+    if (!on) removeAll();      // upsert() will recreate them when switched back
+    logMsg("traffic rendering %s", on ? "on" : "off");
+}
+
+void setLabels(bool on, float maxDistNm) {
+    if (!g_ready) return;
+    XPMPEnableAircraftLabels(on);
+    if (on) XPMPSetAircraftLabelDist(maxDistNm, true);
+}
+
 void upsert(const RemoteState& s) {
-    if (!g_ready || !g_enabled) return;
+    if (!g_ready || !g_enabled || !g_visible) return;
 
     auto it = g_planes.find(s.sid);
     if (it == g_planes.end()) {

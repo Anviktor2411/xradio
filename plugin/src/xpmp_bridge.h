@@ -56,5 +56,9 @@ void removeAll();
 // How many CSL models were loaded, for the status window.
 int cslModelCount();
 
+// Settings: draw other aircraft at all, and how their labels behave.
+void setTrafficVisible(bool on);
+void setLabels(bool on, float maxDistNm);
+
 }  // namespace csl
 }  // namespace xr

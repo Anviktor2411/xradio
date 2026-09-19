@@ -26,6 +26,7 @@ namespace harness {
 
 std::map<std::string, double> g_values;
 std::vector<std::string>      g_drawn;
+std::vector<Drawn>            g_drawnAt;   // same lines, with where they landed
 std::vector<std::string>      g_log;
 XPLMFlightLoop_f              g_loopFunc   = nullptr;
 XPLMDrawWindow_f              g_drawFunc   = nullptr;   // first window (main)
@@ -59,6 +60,7 @@ void tick(float dt) { if (g_loopFunc) g_loopFunc(dt, dt, 0, nullptr); }
 
 std::vector<std::string> draw() {
     g_drawn.clear();
+    g_drawnAt.clear();
     if (g_drawFunc) g_drawFunc((XPLMWindowID)1, nullptr);
     return g_drawn;
 }
@@ -70,9 +72,24 @@ static Win* win(int id) {
 
 std::vector<std::string> drawWindow(int id) {
     g_drawn.clear();
+    g_drawnAt.clear();
     if (Win* w = win(id); w && w->draw) w->draw((XPLMWindowID)(intptr_t)id, nullptr);
     return g_drawn;
 }
+
+// Where the most recent draw put a line. Lets a test click the row a label is
+// actually on instead of re-deriving the layout and drifting out of sync.
+bool drawnAt(const std::string& needle, int* x, int* y) {
+    for (const auto& d : g_drawnAt) {
+        if (d.text.find(needle) == std::string::npos) continue;
+        if (x) *x = d.x;
+        if (y) *y = d.y;
+        return true;
+    }
+    return false;
+}
+
+const std::vector<Drawn>& drawnPositions() { return g_drawnAt; }
 
 bool windowVisible(int id) { Win* w = win(id); return w && w->visible; }
 
@@ -235,8 +252,10 @@ void XPLMSetWindowGeometry(XPLMWindowID id, int l, int t, int r, int b) {
     }
 }
 
-void XPLMDrawString(float*, int, int, char* s, int*, XPLMFontID) {
-    if (s) harness::g_drawn.push_back(s);
+void XPLMDrawString(float*, int x, int y, char* s, int*, XPLMFontID) {
+    if (!s) return;
+    harness::g_drawn.push_back(s);
+    harness::g_drawnAt.push_back({s, x, y});
 }
 
 XPLMMenuID XPLMFindPluginsMenu(void) { return (XPLMMenuID)1; }

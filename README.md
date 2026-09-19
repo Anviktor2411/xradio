@@ -82,6 +82,7 @@ cmake --build build-tests -j
 
 ./build-tests/voice_test
 ./build-tests/placement_test
+./build-tests/settings_test
 
 python3 server/server.py --port 49400 &
 python3 tools/fake_client.py --port 49400 --callsign PEER01 --lat 57.86 --lon 27.03 --talk --parrot &
@@ -103,6 +104,14 @@ approach through the same scenario first, to prove the test catches the bug.
 Opus, a simulated network and the playback mixer with no audio hardware, and
 checks half-duplex muting, packet-loss concealment, sequence wrap-around and
 garbage frames.
+
+`tools/harness/settings_test.cpp` covers the settings window the way a pilot
+uses it: it reads back the strings the window draws, clicks the rows those
+strings were actually drawn on, switches tabs, drags sliders, flips toggles,
+types into fields, and checks what lands in `xradio.cfg`. It also asserts the
+things that are easy to get wrong and impossible to see — that a burst of
+keystrokes arriving in one frame all land in the field that was focused when
+each was typed, and that Enter saves the character typed just before it.
 
 `tools/harness/placement_test.cpp` drives `XPluginStart` under several monitor
 layouts — including a second monitor to the *left* of the main one, which makes
@@ -213,10 +222,47 @@ a v1 client gets no error beyond being ignored.
 
 ## Configuration
 
-Easiest way: **Plugins → XRadio → Settings...** in the sim. Click a field,
-type, Tab to move on, Enter to save. Saving writes the config file and
-reconnects immediately — no restart, no text editor. Escape or Cancel backs
-out without changing anything.
+Easiest way: **Plugins → XRadio → Settings...** in the sim. The window has
+three tabs; click a field and type, click a toggle to flip it, click anywhere
+on a slider's bar to set it, click the `< >` arrows to step through the audio
+devices. Tab moves to the next field, Enter saves, Escape or Cancel backs out
+without changing anything. Saving writes the config file and applies
+everything immediately — no restart, no text editor; only a change to the
+server, port, callsign or aircraft type causes a reconnect.
+
+**Connection**
+
+| setting | what it does |
+|---|---|
+| Server host / Port | where to connect |
+| Callsign | how you appear to everyone else; upper-cased on save |
+| Aircraft type | ICAO type code that picks the CSL model others see you as |
+| Connect on startup | off means you connect by hand from the menu |
+| Report rate | position reports per second, 1–10. Lower it on a weak uplink |
+| Smoothing delay | how far behind the newest report other aircraft are drawn, 100–1000 ms. Higher rides out worse jitter at the cost of lag |
+
+**Audio**
+
+| setting | what it does |
+|---|---|
+| Microphone / Output | pick a device, or leave empty for the system default |
+| Volume | incoming radio volume |
+| Hear own voice | sidetone: hear yourself while keyed, like a real headset |
+| Carrier hiss | background noise while someone is transmitting; 0 for clean audio |
+| Radio filter | the 300–3400 Hz band-pass that makes it sound like a radio |
+
+The audio tab also shows a live mic level meter and the voice status line, so
+you can hold the PTT and confirm the right microphone is being heard before
+you go looking for someone to talk to.
+
+**Traffic**
+
+| setting | what it does |
+|---|---|
+| Draw other aircraft | off removes the CSL models; the radio keeps working |
+| Callsign labels | the floating name tags |
+| Label range | how far away labels stay readable, 1–100 nm |
+| Traffic range | how far away aircraft are drawn, 5–200 nm |
 
 The same values live in `X-Plane 12/Output/preferences/xradio.cfg`, written on
 first run:
@@ -226,11 +272,27 @@ host = your.server.address
 port = 49100
 callsign = ESNA12
 actype = C172
+autoconnect = yes
+reporthz = 5
+smoothms = 350
+
+mic =
+speakers =
+volume = 0.8
+sidetone = no
+hiss = 0.35
+radiofilter = yes
+
+showtraffic = yes
+showlabels = yes
+labeldist = 20
+range = 80
 ```
 
-`actype` is the ICAO type code that decides which CSL model other pilots see
-you as. If you edit the file by hand while X-Plane is running, pick up the
-changes with *Plugins → XRadio → Reconnect*.
+Out-of-range numbers are clamped to the limits above rather than rejected, and
+unknown keys are ignored, so a hand-edited file cannot stop the plugin
+loading. If you edit it while X-Plane is running, pick up the changes with
+*Plugins → XRadio → Reconnect*.
 
 If a window ever ends up somewhere you cannot reach it — dragged off-screen,
 or the monitor layout changed while X-Plane was running — use
@@ -254,7 +316,8 @@ The window's `Voice:` line tells you what is going on:
 | `MIC [######....]` | live level while the PTT is held — if this stays at dots, X-Plane is not getting your microphone |
 | `RX: SU-CBB` | who you are hearing right now |
 
-Voice uses the system default microphone and output device. Windows: check
+Pick the microphone and output device on the settings window's *Audio* tab,
+or leave them empty for the system default. Windows: check
 *Settings → System → Sound → Input* is the headset you mean. macOS: the first
 key press may trigger the microphone permission prompt; grant it and press
 again.
@@ -279,8 +342,10 @@ A 300–3400 Hz band-pass and a faint carrier hiss give it the radio sound.
 - **Voice on the COM frequencies** — push-to-talk, Opus at 24 kbit/s, 20 ms
   frames, packet-loss concealment, half-duplex, radio band-pass; runs on its
   own network thread so audio never waits for a frame
-- In-sim settings window for server, port, callsign and aircraft type, with
-  validation and immediate reconnect
+- **Tabbed in-sim settings window** — connection, audio (device pickers,
+  volume, sidetone, hiss, radio filter, live mic meter) and traffic (models,
+  labels, ranges) — with validation, live mic level, and changes applied
+  without a restart
 - Windows placed against the monitor X-Plane is actually using, so they do not
   spawn off-screen on multi-monitor setups
 - Builds on Windows, macOS and Linux; CI checks all three
@@ -311,11 +376,11 @@ do not reuse it for anything sensitive.
 
 ## Roadmap
 
-1. **Microphone and output device selection** in the settings window, plus a
-   volume slider — right now it is the system default device.
-2. **Radio effects** — signal fading towards the edge of range, a "blocked"
+1. **Radio effects** — signal fading towards the edge of range, a "blocked"
    squeal when two people transmit at once.
-3. **Text chat input field** in the window (receive-only for now).
+2. **Text chat input field** in the window (receive-only for now).
+3. **Key binding from the settings window** — the PTT is bound through
+   X-Plane's own keyboard settings for now.
 4. **Bandwidth** — traffic is relayed at 10 Hz to every client in range;
    scaling past a couple of dozen pilots wants per-client rate limiting by
    distance.

@@ -66,6 +66,7 @@ endif()
 set(XR_PLUGIN_SOURCES
     plugin/src/main.cpp
     plugin/src/net.cpp
+    plugin/src/ui.cpp
     plugin/src/voice.cpp
     plugin/src/xpmp_bridge.cpp
 )
@@ -204,6 +205,7 @@ if(XRADIO_BUILD_TESTS)
     xradio_test_exe(plugin_harness tools/harness/main.cpp)
     xradio_test_exe(placement_test tools/harness/placement_test.cpp)
     xradio_test_exe(voice_test     tools/harness/voice_test.cpp)
+    xradio_test_exe(settings_test  tools/harness/settings_test.cpp)
 
     # Pure maths, no plugin sources needed.
     add_executable(smoothing_test tools/harness/smoothing_test.cpp)

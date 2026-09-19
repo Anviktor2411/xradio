@@ -40,9 +40,30 @@ struct Stats {
     uint64_t framesConcealed = 0;   // packet-loss concealment ran
 };
 
-// Opens devices and codec. On failure `err` says why and the plugin keeps
-// working without voice.
+// A capture or playback device the system offers.
+struct Device {
+    std::string name;
+    bool        isDefault = false;
+};
+
+// Opens devices and codec. `micName` / `outName` select a device by the name
+// listDevices() reported; empty means the system default. On failure `err`
+// says why and the plugin keeps working without voice.
 bool init(Mode mode, std::string* err);
+bool init(Mode mode, const std::string& micName, const std::string& outName,
+          std::string* err);
+
+// What the system offers right now. Empty before init(), or on the null
+// backend. Safe to call from the main thread while audio is running.
+std::vector<Device> listDevices(bool capture);
+
+// Reopen just the audio devices, keeping the codec and any active streams.
+// Used when the settings window picks a different microphone or output.
+bool reopenDevices(const std::string& micName, const std::string& outName,
+                   std::string* err);
+
+const std::string& currentMic();
+const std::string& currentOutput();
 void shutdown();
 bool available();       // encoder + playback ready
 bool haveMicrophone();  // capture device opened
@@ -60,6 +81,9 @@ void pollOutgoing(std::vector<OutFrame>& out);
 void tick();
 
 void  setVolume(float v);        // 0..1
+void  setSidetone(bool on);      // hear your own voice while keyed
+void  setHiss(float level);      // 0..1, carrier noise floor
+void  setRadioFilter(bool on);   // 300-3400 Hz band-pass
 float micLevel();                // 0..1, peak of the most recent capture block
 std::vector<uint32_t> activeSpeakers();
 std::string status();            // one line for the window

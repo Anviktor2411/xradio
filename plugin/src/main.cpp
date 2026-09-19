@@ -9,6 +9,9 @@
 #include "net.h"
 #include "protocol.h"
 #include "mathconst.h"
+#include "settings.h"
+#include "smoothing.h"
+#include "ui.h"
 #include "voice.h"
 #include "xpmp_bridge.h"
 
@@ -44,15 +47,12 @@ namespace {
 // ---------------------------------------------------------------------------
 // configuration
 // ---------------------------------------------------------------------------
-struct Config {
-    std::string host     = "127.0.0.1";
-    int         port     = 49100;
-    std::string callsign = "XRADIO1";
-    std::string acIcao   = "C172";
-};
+using xr::Settings;
 
-Config      g_cfg;
+Settings    g_cfg;
 std::string g_cfgPath;
+int         g_focusCount = 0;      // focusable widgets the settings window drew
+float       g_sendInterval = 0.2f; // seconds between position reports
 
 std::string trim(const std::string& s) {
     size_t a = s.find_first_not_of(" \t\r\n");
@@ -91,45 +91,15 @@ void resolveConfigPath() {
     g_cfgPath = std::string(prefs) + XPLMGetDirectorySeparator() + "xradio.cfg";
 }
 
-// Writes g_cfg to disk. Used for the first-run defaults and by Settings.
-bool saveConfig() {
-    FILE* f = fopen(g_cfgPath.c_str(), "w");
-    if (!f) {
-        logMsg("cannot write %s", g_cfgPath.c_str());
-        return false;
-    }
-    fprintf(f,
-            "# XRadio configuration\n"
-            "host = %s\n"
-            "port = %d\n"
-            "callsign = %s\n"
-            "actype = %s\n",
-            g_cfg.host.c_str(), g_cfg.port, g_cfg.callsign.c_str(), g_cfg.acIcao.c_str());
-    fclose(f);
-    logMsg("saved config to %s", g_cfgPath.c_str());
-    return true;
-}
+
 
 void loadConfig() {
     resolveConfigPath();
-    FILE* f = fopen(g_cfgPath.c_str(), "r");
-    if (!f) { saveConfig(); return; }
-
-    char line[512];
-    while (fgets(line, sizeof(line), f)) {
-        std::string s = trim(line);
-        if (s.empty() || s[0] == '#') continue;
-        size_t eq = s.find('=');
-        if (eq == std::string::npos) continue;
-        std::string k = trim(s.substr(0, eq));
-        std::string v = trim(s.substr(eq + 1));
-        if      (k == "host")     g_cfg.host = v;
-        else if (k == "port")     g_cfg.port = atoi(v.c_str());
-        else if (k == "callsign") g_cfg.callsign = v;
-        else if (k == "actype")   g_cfg.acIcao = v;
+    if (!xr::loadSettings(g_cfg, g_cfgPath)) {
+        xr::saveSettings(g_cfg, g_cfgPath);     // first run: write the defaults
+        logMsg("wrote default config to %s", g_cfgPath.c_str());
     }
-    fclose(f);
-    logMsg("config: %s:%d as %s (%s)", g_cfg.host.c_str(), g_cfg.port,
+    logMsg("config: %s:%d as %s (%s)", g_cfg.host.c_str(), g_cfg.port_i(),
            g_cfg.callsign.c_str(), g_cfg.acIcao.c_str());
 }
 
@@ -584,7 +554,6 @@ void pumpNetwork() {
 // Receiving happens every frame so a report reaches the renderer the moment
 // it arrives; draining at 5 Hz would add up to 200 ms of latency on top of
 // the network's, and a jittery 200 ms at that. Sending stays at 5 Hz.
-const float kSendIntervalS = 0.2f;
 float g_lastSend = -99.f;
 
 float flightLoop(float elapsedSinceLast, float, int, void*) {
@@ -605,7 +574,7 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
     }
 
     // the server drops us after 15 s of silence, so position doubles as keepalive
-    if (g_elapsed - g_lastSend >= kSendIntervalS) {
+    if (g_elapsed - g_lastSend >= g_sendInterval) {
         sendPosition();
         g_lastSend = g_elapsed;
     }
@@ -825,7 +794,7 @@ void reconnect() {
     }
     std::string err;
     g_sock.close();
-    if (!g_sock.open(g_cfg.host, (uint16_t)g_cfg.port, &err)) {
+    if (!g_sock.open(g_cfg.host, (uint16_t)g_cfg.port_i(), &err)) {
         g_status = "socket error: " + err;
         logMsg("%s", g_status.c_str());
     } else {
@@ -835,51 +804,62 @@ void reconnect() {
 }
 
 // ---------------------------------------------------------------------------
-// settings window -- edit host / port / callsign / type inside the sim
+// settings window
 // ---------------------------------------------------------------------------
+// Tabbed, driven by the descriptor table in settings.h so a new setting shows
+// up here automatically. Drawn with the text widgets in ui.h, which means the
+// whole thing is a list of strings the test harness can read back.
 XPLMWindowID g_settingsWin = nullptr;
-Config       g_edit;               // working copy while the window is open
-int          g_focusField = -1;    // which field has keyboard focus, -1 none
+Settings     g_edit;               // working copy while the window is open
+int          g_tab = 0;
 std::string  g_settingsNote;       // one-line feedback under the buttons
+xr::ui::Ctx  g_ui;
+std::vector<std::string> g_micList, g_outList;
 
-struct Field {
-    const char*  label;
-    std::string* value;
-    size_t       maxLen;
-    bool         digitsOnly;
-};
+// Keystrokes arrive whenever X-Plane feels like it, several per frame under a
+// low frame rate, but the widgets only exist during a draw. Queue them raw and
+// let the draw apply them in order; see drainKeys() for why Enter and Tab are
+// not acted on the moment they arrive.
+struct PendingKey { char ch; unsigned char vk; };
+std::vector<PendingKey> g_keyQueue;
+enum { kSpecialNone = 0, kSpecialApply, kSpecialClose, kSpecialTab };
+int g_specialKey = kSpecialNone;
 
-// The port field is stored as text while editing so the user can clear it.
-std::string g_editPort;
+std::string upper(std::string v) {
+    for (auto& c : v) c = (char)toupper((unsigned char)c);
+    return v;
+}
 
-Field fields[] = {
-    {"Server host",   &g_edit.host,     63, false},
-    {"Port",          &g_editPort,       5, true },
-    {"Callsign",      &g_edit.callsign, 15, false},
-    {"Aircraft type", &g_edit.acIcao,    7, false},
-};
-const int kNumFields = (int)(sizeof(fields) / sizeof(fields[0]));
+void refreshDeviceLists() {
+    g_micList.clear();
+    g_outList.clear();
+    for (const auto& d : xr::voice::listDevices(true))  g_micList.push_back(d.name);
+    for (const auto& d : xr::voice::listDevices(false)) g_outList.push_back(d.name);
+}
 
-// Geometry shared by draw and click handling.
-const int kRowH      = 26;
-const int kFirstRowY = 52;    // below the window top
-const int kValueX    = 130;   // where the editable text starts
-
-int rowY(int top, int i) { return top - kFirstRowY - i * kRowH; }
-int buttonRowY(int top)  { return rowY(top, kNumFields) - 8; }
-
-std::string upper(std::string s) {
-    for (auto& c : s) c = (char)toupper((unsigned char)c);
-    return s;
+// Push the live settings into the subsystems that care about them. Called on
+// save and at startup, so there is one path rather than two.
+void applyLiveSettings() {
+    xr::voice::setVolume(g_cfg.volume);
+    xr::voice::setSidetone(g_cfg.sidetone);
+    xr::voice::setHiss(g_cfg.hiss);
+    xr::voice::setRadioFilter(g_cfg.radioFilter);
+    xr::Smoother::setDefaultPlayout(g_cfg.smoothMs / 1000.0);
+    xr::csl::setTrafficVisible(g_cfg.showTraffic);
+    xr::csl::setLabels(g_cfg.showLabels, g_cfg.labelDistNm);
+    g_sendInterval = 1.0f / (g_cfg.reportHz < 1.f ? 1.f : g_cfg.reportHz);
 }
 
 void openSettings() {
-    g_edit     = g_cfg;
-    g_editPort = std::to_string(g_cfg.port);
-    g_focusField = 0;
+    g_edit = g_cfg;
     g_settingsNote.clear();
+    g_ui.focus = -1;
+    g_keyQueue.clear();
+    g_specialKey = kSpecialNone;
+    refreshDeviceLists();
+
     int l, t, r, b;
-    safeWindowRect(360, 220, 520, &l, &t, &r, &b);
+    safeWindowRect(560, 330, 520, &l, &t, &r, &b);
     XPLMSetWindowGeometry(g_settingsWin, l, t, r, b);
     XPLMSetWindowIsVisible(g_settingsWin, 1);
     XPLMBringWindowToFront(g_settingsWin);
@@ -887,113 +867,175 @@ void openSettings() {
 }
 
 void closeSettings() {
-    g_focusField = -1;
+    g_ui.focus = -1;
+    g_keyQueue.clear();
     if (XPLMHasKeyboardFocus(g_settingsWin)) XPLMTakeKeyboardFocus(nullptr);
     XPLMSetWindowIsVisible(g_settingsWin, 0);
 }
 
 void applySettings() {
-    const std::string host = trim(g_edit.host);
-    const int port = atoi(g_editPort.c_str());
-    if (host.empty())               { g_settingsNote = "Host cannot be empty";   return; }
-    if (port < 1 || port > 65535)   { g_settingsNote = "Port must be 1-65535";  return; }
-    if (trim(g_edit.callsign).empty()) { g_settingsNote = "Callsign cannot be empty"; return; }
+    g_edit.callsign = upper(trim(g_edit.callsign));
+    g_edit.acIcao   = upper(trim(g_edit.acIcao));
+    g_edit.host     = trim(g_edit.host);
+    if (g_edit.acIcao.empty()) g_edit.acIcao = "C172";
 
-    g_cfg.host     = host;
-    g_cfg.port     = port;
-    g_cfg.callsign = upper(trim(g_edit.callsign));
-    g_cfg.acIcao   = upper(trim(g_edit.acIcao));
-    if (g_cfg.acIcao.empty()) g_cfg.acIcao = "C172";
+    const std::string problem = xr::validate(g_edit);
+    if (!problem.empty()) {
+        g_settingsNote = problem;
+        return;
+    }
 
-    saveConfig();
+    const bool netChanged = (g_edit.host != g_cfg.host) ||
+                            (g_edit.port != g_cfg.port) ||
+                            (g_edit.callsign != g_cfg.callsign) ||
+                            (g_edit.acIcao != g_cfg.acIcao);
+    const bool devChanged = (g_edit.micDevice != g_cfg.micDevice) ||
+                            (g_edit.outDevice != g_cfg.outDevice);
+
+    g_cfg = g_edit;
+    xr::saveSettings(g_cfg, g_cfgPath);
+    applyLiveSettings();
+
+    if (devChanged) {
+        std::string err;
+        if (!xr::voice::reopenDevices(g_cfg.micDevice, g_cfg.outDevice, &err)) {
+            logMsg("could not switch audio device: %s", err.c_str());
+        } else {
+            logMsg("audio devices: mic '%s', out '%s'",
+                   xr::voice::currentMic().c_str(), xr::voice::currentOutput().c_str());
+        }
+    }
     closeSettings();
-    reconnect();
+    if (netChanged) reconnect();
+}
+
+// Hand the widgets every key up to the next Enter/Escape/Tab, and remember
+// that one for the end of the frame. Acting on Enter the instant it arrives
+// would save the field as it was *before* the characters typed just ahead of
+// it in the same frame -- the last thing typed would silently not be saved.
+void drainKeys() {
+    g_specialKey = kSpecialNone;
+    g_ui.keys.clear();
+
+    size_t taken = 0;
+    for (; taken < g_keyQueue.size(); ++taken) {
+        const PendingKey& k = g_keyQueue[taken];
+        int special = kSpecialNone;
+        if (k.vk == XPLM_VK_RETURN || k.vk == XPLM_VK_ENTER ||
+            k.ch == '\r' || k.ch == '\n') {
+            special = kSpecialApply;
+        } else if (k.vk == XPLM_VK_ESCAPE || k.ch == 27) {
+            special = kSpecialClose;
+        } else if (k.vk == XPLM_VK_TAB || k.ch == '\t') {
+            special = kSpecialTab;
+        }
+        if (special != kSpecialNone) {
+            g_specialKey = special;
+            ++taken;                 // consumed; the rest waits for next frame
+            break;
+        }
+        g_ui.pushKey(k.ch, k.vk);
+    }
+    g_keyQueue.erase(g_keyQueue.begin(), g_keyQueue.begin() + (long)taken);
 }
 
 void drawSettings(XPLMWindowID win, void*) {
     int l, t, r, b;
     XPLMGetWindowGeometry(win, &l, &t, &r, &b);
-    float white[] = {1.f, 1.f, 1.f};
-    float grey[]  = {0.7f, 0.7f, 0.7f};
-    float green[] = {0.4f, 1.f, 0.4f};
-    float amber[] = {1.f, 0.8f, 0.3f};
 
-    XPLMDrawString(white, l + 10, t - 24, (char*)"Click a field, type, Enter to save. Tab moves on.",
-                   nullptr, xplmFont_Proportional);
+    drainKeys();
 
-    for (int i = 0; i < kNumFields; ++i) {
-        const int y = rowY(t, i);
-        const bool focused = (i == g_focusField);
-        XPLMDrawString(focused ? white : grey, l + 10, y, (char*)fields[i].label,
-                       nullptr, xplmFont_Proportional);
-        std::string v = *fields[i].value;
-        // a blinking cursor on the field being edited
-        if (focused && ((int)(g_elapsed * 2.f) % 2 == 0)) v += "_";
-        char line[96];
-        snprintf(line, sizeof(line), "%s%s", focused ? "> " : "  ", v.c_str());
-        XPLMDrawString(focused ? green : white, l + kValueX, y, line,
-                       nullptr, xplmFont_Proportional);
+    g_ui.blink = ((int)(g_elapsed * 2.f) % 2) == 0;
+    g_ui.begin(l, t, r, b, 24);
+
+    const char* names[xr::kNumTabs];
+    for (int i = 0; i < xr::kNumTabs; ++i) names[i] = xr::tabName(i);
+    xr::ui::tabs(g_ui, names, xr::kNumTabs, g_tab);
+    g_ui.nextRow();
+
+    auto fields = xr::describe(g_edit);
+    for (auto& f : fields) {
+        if (f.tab != g_tab) continue;
+        switch (f.kind) {
+            case xr::Kind::Text:
+                xr::ui::textField(g_ui, f.label, *(std::string*)f.ptr, f.maxLen, f.digitsOnly);
+                break;
+            case xr::Kind::Bool:
+                xr::ui::toggle(g_ui, f.label, *(bool*)f.ptr);
+                break;
+            case xr::Kind::Slider:
+                xr::ui::slider(g_ui, f.label, *(float*)f.ptr, f.lo, f.hi, f.unit,
+                               std::string(f.unit) == "%");
+                break;
+            case xr::Kind::Choice: {
+                const bool isMic = std::string(f.key) == "mic";
+                xr::ui::choice(g_ui, f.label, *(std::string*)f.ptr,
+                               isMic ? g_micList : g_outList, "system default");
+                break;
+            }
+        }
     }
 
-    const int by = buttonRowY(t);
-    XPLMDrawString(green, l + 10,  by, (char*)"[ Save & reconnect ]", nullptr, xplmFont_Proportional);
-    XPLMDrawString(grey,  l + 200, by, (char*)"[ Cancel ]",           nullptr, xplmFont_Proportional);
-
-    if (!g_settingsNote.empty()) {
-        XPLMDrawString(amber, l + 10, by - 22, (char*)g_settingsNote.c_str(),
-                       nullptr, xplmFont_Proportional);
+    // Live feedback on the audio tab: a meter beats guessing.
+    if (g_tab == 1) {
+        g_ui.nextRow();
+        char meter[96];
+        const int bars = (int)(xr::voice::micLevel() * 16.f + 0.5f);
+        char bar[20];
+        bar[0] = '[';
+        for (int i = 0; i < 16; ++i) bar[i + 1] = i < bars ? '#' : '.';
+        bar[17] = ']'; bar[18] = '\0';
+        snprintf(meter, sizeof(meter), "Mic level %s  %s", bar,
+                 g_pttDown ? "(keyed)" : "(hold PTT to test)");
+        xr::ui::text(g_ui, meter, bars > 0 ? 2 : 1);
+        xr::ui::text(g_ui, ("Voice: " + xr::voice::status()).c_str(), 1);
     }
+
+    g_ui.nextRow();
+    static const char* btns[] = {"Save & apply", "Cancel"};
+    const int hit = xr::ui::buttons(g_ui, btns, 2);
+    if (hit == 0) applySettings();
+    else if (hit == 1) closeSettings();
+
+    if (!g_settingsNote.empty()) xr::ui::text(g_ui, g_settingsNote.c_str(), 3);
+
+    g_focusCount = g_ui.index;
+    g_ui.endInput();
+
+    // Now that the fields hold what was typed, act on the key that ended the
+    // burst. Tab needs g_focusCount, which only this pass knows.
+    switch (g_specialKey) {
+        case kSpecialApply: applySettings(); break;
+        case kSpecialClose: closeSettings(); break;
+        case kSpecialTab:
+            if (g_focusCount > 0) g_ui.focus = (g_ui.focus + 1) % g_focusCount;
+            break;
+        default: break;
+    }
+    g_specialKey = kSpecialNone;
 }
 
 int settingsClick(XPLMWindowID win, int x, int y, XPLMMouseStatus status, void*) {
     if (status != xplm_MouseDown) return 1;
-    int l, t, r, b;
-    XPLMGetWindowGeometry(win, &l, &t, &r, &b);
-
-    for (int i = 0; i < kNumFields; ++i) {
-        const int ry = rowY(t, i);
-        if (y >= ry - 6 && y <= ry + 16) {
-            g_focusField = i;
-            XPLMTakeKeyboardFocus(win);
-            return 1;
-        }
-    }
-    const int by = buttonRowY(t);
-    if (y >= by - 6 && y <= by + 16) {
-        if (x >= l + 10 && x < l + 190)       applySettings();
-        else if (x >= l + 200 && x < l + 290) closeSettings();
-    }
-    return 1;
+    g_ui.clicked = true;
+    g_ui.clickX = x;
+    g_ui.clickY = y;
+    XPLMTakeKeyboardFocus(win);
+    return 1;   // the next draw consumes it
 }
 
 void settingsKey(XPLMWindowID, char key, XPLMKeyFlags flags, char vk, void*, int losingFocus) {
-    if (losingFocus) { g_focusField = -1; return; }
+    if (losingFocus) { g_ui.focus = -1; g_keyQueue.clear(); return; }
     if (!(flags & xplm_DownFlag)) return;
-    if (g_focusField < 0 || g_focusField >= kNumFields) return;
-
-    Field& f = fields[g_focusField];
-    std::string& v = *f.value;
-    const unsigned char uvk = (unsigned char)vk;
-    const unsigned char c   = (unsigned char)key;
-
-    if (uvk == XPLM_VK_BACK || c == 8) {
-        if (!v.empty()) v.pop_back();
-    } else if (uvk == XPLM_VK_RETURN || uvk == XPLM_VK_ENTER || c == '\r' || c == '\n') {
-        applySettings();
-    } else if (uvk == XPLM_VK_ESCAPE || c == 27) {
-        closeSettings();
-    } else if (uvk == XPLM_VK_TAB || c == '\t') {
-        g_focusField = (g_focusField + 1) % kNumFields;
-    } else if (c >= 32 && c < 127 && v.size() < f.maxLen) {
-        if (f.digitsOnly && !isdigit(c)) return;
-        if (c == ' ' && g_focusField != 0) return;   // no spaces in callsign / type
-        v += (char)c;
-    }
+    // Everything, Enter and Escape included, goes through the queue so the
+    // draw applies it in the order it was typed. 256 is far more than a
+    // frame's worth; the cap only matters if the window stops drawing.
+    if (g_keyQueue.size() < 256) g_keyQueue.push_back({key, (unsigned char)vk});
 }
 
 void createSettingsWindow() {
     int wl, wt, wr, wb;
-    safeWindowRect(360, 220, 520, &wl, &wt, &wr, &wb);   // offset clear of the main window
+    safeWindowRect(560, 330, 520, &wl, &wt, &wr, &wb);
 
     XPLMCreateWindow_t p{};
     p.structSize            = sizeof(p);
@@ -1015,7 +1057,7 @@ void createSettingsWindow() {
 
     g_settingsWin = XPLMCreateWindowEx(&p);
     XPLMSetWindowTitle(g_settingsWin, "XRadio Settings");
-    XPLMSetWindowResizingLimits(g_settingsWin, 360, 220, 600, 400);
+    XPLMSetWindowResizingLimits(g_settingsWin, 520, 280, 900, 700);
 }
 
 // Last resort if a window is dragged off-screen, or the monitor layout
@@ -1029,7 +1071,7 @@ void resetWindowPositions() {
         XPLMBringWindowToFront(g_window);
     }
     if (g_settingsWin && XPLMGetWindowIsVisible(g_settingsWin)) {
-        safeWindowRect(360, 220, 520, &l, &t, &r, &b);
+        safeWindowRect(560, 330, 520, &l, &t, &r, &b);
         XPLMSetWindowGeometry(g_settingsWin, l, t, r, b);
         XPLMBringWindowToFront(g_settingsWin);
     }
@@ -1081,11 +1123,12 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
 #else
     const xr::voice::Mode voiceMode = xr::voice::Mode::Real;
 #endif
-    if (!xr::voice::init(voiceMode, &voiceErr)) {
+    if (!xr::voice::init(voiceMode, g_cfg.micDevice, g_cfg.outDevice, &voiceErr)) {
         logMsg("voice unavailable: %s", voiceErr.c_str());
     } else {
         logMsg("voice: %s", xr::voice::status().c_str());
     }
+    applyLiveSettings();
 
     g_cmdPtt = XPLMCreateCommand("xradio/ptt", "XRadio: push to talk");
     XPLMRegisterCommandHandler(g_cmdPtt, pttHandler, 1, nullptr);
@@ -1110,9 +1153,16 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
 
 PLUGIN_API int XPluginEnable(void) {
     xr::csl::enable();
+    xr::csl::setLabels(g_cfg.showLabels, g_cfg.labelDistNm);
+
+    if (!g_cfg.autoConnect) {
+        g_status = "not connected (autoconnect off)";
+        XPLMScheduleFlightLoop(g_loop, -1.0f, 1);
+        return 1;
+    }
 
     std::string err;
-    if (!g_sock.open(g_cfg.host, (uint16_t)g_cfg.port, &err)) {
+    if (!g_sock.open(g_cfg.host, (uint16_t)g_cfg.port_i(), &err)) {
         g_status = "socket error: " + err;
         logMsg("%s", g_status.c_str());
     } else {

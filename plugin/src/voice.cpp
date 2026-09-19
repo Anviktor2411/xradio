@@ -20,6 +20,18 @@ bool init(Mode, std::string* err) {
     if (err) *err = "built without voice (configure with -DXRADIO_USE_VOICE=ON)";
     return false;
 }
+bool init(Mode m, const std::string&, const std::string&, std::string* err) { return init(m, err); }
+std::vector<Device> listDevices(bool) { return {}; }
+bool reopenDevices(const std::string&, const std::string&, std::string* err) {
+    if (err) *err = "built without voice";
+    return false;
+}
+static const std::string g_none;
+const std::string& currentMic() { return g_none; }
+const std::string& currentOutput() { return g_none; }
+void setSidetone(bool) {}
+void setHiss(float) {}
+void setRadioFilter(bool) {}
 void shutdown() {}
 bool available() { return false; }
 bool haveMicrophone() { return false; }
@@ -116,6 +128,9 @@ bool              g_ctxOk = false, g_capOk = false, g_playOk = false;
 Mode              g_mode = Mode::NoDevices;
 
 std::atomic<bool>  g_tx{false};
+std::atomic<bool>  g_sidetone{false};
+std::atomic<bool>  g_filter{true};
+std::atomic<float> g_hiss{0.35f};
 std::atomic<float> g_micLevel{0.f};
 std::atomic<float> g_volume{1.f};
 std::atomic<uint64_t> g_nEncoded{0}, g_nReceived{0}, g_nPlayed{0}, g_nConcealed{0};
@@ -123,6 +138,17 @@ std::atomic<uint64_t> g_nEncoded{0}, g_nReceived{0}, g_nPlayed{0}, g_nConcealed{
 std::vector<int16_t> g_capAccum;     // capture thread only
 std::string          g_status = "off";
 std::string          g_capName, g_playName;
+std::string          g_wantMic, g_wantOut;      // names the user picked, "" = default
+
+// Device lists, refreshed on init/reopen. The ma_device_id is what actually
+// selects a device; the name is only how the user recognises it.
+struct DevEntry { std::string name; ma_device_id id; bool isDefault; };
+std::vector<DevEntry> g_capDevs, g_playDevs;
+
+// Sidetone: a copy of what the microphone just captured, queued for playback
+// so the speaker hears themselves. Guarded by g_mx like everything else.
+std::deque<int16_t> g_sidechain;
+constexpr size_t kSidechainMax = 48000 / 2;      // half a second
 
 // --- the "radio" sound: 300-3400 Hz band-pass ------------------------------
 // Two second-order sections (RBJ cookbook), state kept on the playback thread.
@@ -157,10 +183,15 @@ void designLowpass(Biquad& q, float fc) {
 
 uint32_t g_noise = 0x12345678u;
 inline float hiss() {
-    // cheap white noise, ~ -46 dBFS: the carrier you hear when a squelch opens
+    // cheap white noise: the carrier you hear when a squelch opens
+    const float level = g_hiss.load();
+    if (level <= 0.f) return 0.f;
     g_noise = g_noise * 1664525u + 1013904223u;
-    return ((float)(g_noise >> 16) / 32768.f - 1.f) * 160.f;
+    return ((float)(g_noise >> 16) / 32768.f - 1.f) * 320.f * level;
 }
+
+void captureCb(ma_device*, void*, const void* in, ma_uint32 n);
+void playbackCb(ma_device*, void* out, const void*, ma_uint32 n);
 
 // --- capture side ----------------------------------------------------------
 void capture(const int16_t* in, int count) {
@@ -174,6 +205,12 @@ void capture(const int16_t* in, int count) {
     if (!g_tx.load() || !g_enc) {
         g_capAccum.clear();
         return;
+    }
+
+    if (g_sidetone.load()) {
+        std::lock_guard<std::mutex> lk(g_mx);
+        g_sidechain.insert(g_sidechain.end(), in, in + count);
+        while (g_sidechain.size() > kSidechainMax) g_sidechain.pop_front();
     }
 
     g_capAccum.insert(g_capAccum.end(), in, in + count);
@@ -219,7 +256,21 @@ bool refill(Speaker& sp) {
 
 void render(int16_t* out, int count) {
     memset(out, 0, sizeof(int16_t) * (size_t)count);
-    if (g_tx.load()) return;                     // half duplex: you do not hear while keyed
+
+    // Half duplex: while keyed you hear only your own sidetone, if enabled.
+    if (g_tx.load()) {
+        if (!g_sidetone.load()) return;
+        std::unique_lock<std::mutex> lk(g_mx, std::try_to_lock);
+        if (!lk.owns_lock()) return;
+        const float vol = g_volume.load() * 0.5f;      // quieter than incoming
+        for (int i = 0; i < count && !g_sidechain.empty(); ++i) {
+            float v = (float)g_sidechain.front() * vol;
+            g_sidechain.pop_front();
+            if (g_filter.load()) v = g_lp.run(g_hp.run(v));
+            out[i] = (int16_t)(v > 32767.f ? 32767.f : (v < -32768.f ? -32768.f : v));
+        }
+        return;
+    }
 
     std::unique_lock<std::mutex> lk(g_mx, std::try_to_lock);
     if (!lk.owns_lock()) return;                 // never stall the audio thread
@@ -244,13 +295,79 @@ void render(int16_t* out, int count) {
 
     if (!anyone) return;
     const float vol = g_volume.load();
+    const bool filt = g_filter.load();
     for (int i = 0; i < count; ++i) {
         float v = (float)mix[(size_t)i] + hiss();
-        v = g_lp.run(g_hp.run(v)) * vol;
+        if (filt) v = g_lp.run(g_hp.run(v));
+        v *= vol;
         if (v > 32767.f) v = 32767.f;
         if (v < -32768.f) v = -32768.f;
         out[i] = (int16_t)v;
     }
+}
+
+// Ask the backend what exists. Called on init and whenever the user opens
+// the settings window's audio tab, since devices come and go.
+void refreshDevices() {
+    g_capDevs.clear();
+    g_playDevs.clear();
+    if (!g_ctxOk) return;
+
+    ma_device_info* play = nullptr; ma_uint32 nPlay = 0;
+    ma_device_info* cap  = nullptr; ma_uint32 nCap  = 0;
+    if (ma_context_get_devices(&g_ctx, &play, &nPlay, &cap, &nCap) != MA_SUCCESS) return;
+
+    for (ma_uint32 i = 0; i < nPlay; ++i) {
+        g_playDevs.push_back({play[i].name, play[i].id, play[i].isDefault != 0});
+    }
+    for (ma_uint32 i = 0; i < nCap; ++i) {
+        g_capDevs.push_back({cap[i].name, cap[i].id, cap[i].isDefault != 0});
+    }
+}
+
+// nullptr means "system default", which is what an empty or unknown name gets.
+const ma_device_id* findDevice(const std::vector<DevEntry>& list, const std::string& name) {
+    if (name.empty()) return nullptr;
+    for (const auto& d : list) {
+        if (d.name == name) return &d.id;
+    }
+    return nullptr;
+}
+
+bool openDevices(std::string* err) {
+    ma_device_config pc = ma_device_config_init(ma_device_type_playback);
+    pc.playback.format    = ma_format_s16;
+    pc.playback.channels  = 1;
+    pc.playback.pDeviceID = (ma_device_id*)findDevice(g_playDevs, g_wantOut);
+    pc.sampleRate         = kSampleRate;
+    pc.periodSizeInFrames = kFrameSamples;
+    pc.dataCallback       = playbackCb;
+    if (ma_device_init(&g_ctx, &pc, &g_play) == MA_SUCCESS &&
+        ma_device_start(&g_play) == MA_SUCCESS) {
+        g_playOk = true;
+        g_playName = g_play.playback.name;
+    }
+
+    ma_device_config cfg = ma_device_config_init(ma_device_type_capture);
+    cfg.capture.format    = ma_format_s16;
+    cfg.capture.channels  = 1;
+    cfg.capture.pDeviceID = (ma_device_id*)findDevice(g_capDevs, g_wantMic);
+    cfg.sampleRate        = kSampleRate;
+    cfg.periodSizeInFrames = kFrameSamples;
+    cfg.dataCallback      = captureCb;
+    if (ma_device_init(&g_ctx, &cfg, &g_cap) == MA_SUCCESS &&
+        ma_device_start(&g_cap) == MA_SUCCESS) {
+        g_capOk = true;
+        g_capName = g_cap.capture.name;
+    }
+
+    if (!g_playOk) {
+        if (err) *err = "could not open a playback device";
+        g_status = "no speakers";
+        return false;
+    }
+    g_status = g_capOk ? ("OK  mic: " + g_capName) : "no microphone (receive only)";
+    return true;
 }
 
 void captureCb(ma_device*, void*, const void* in, ma_uint32 n) {
@@ -298,39 +415,48 @@ bool init(Mode mode, std::string* err) {
         return false;
     }
     g_ctxOk = true;
+    refreshDevices();
+    return openDevices(err);
+}
 
-    ma_device_config pc = ma_device_config_init(ma_device_type_playback);
-    pc.playback.format   = ma_format_s16;
-    pc.playback.channels = 1;
-    pc.sampleRate        = kSampleRate;
-    pc.periodSizeInFrames = kFrameSamples;
-    pc.dataCallback      = playbackCb;
-    if (ma_device_init(&g_ctx, &pc, &g_play) == MA_SUCCESS &&
-        ma_device_start(&g_play) == MA_SUCCESS) {
-        g_playOk = true;
-        g_playName = g_play.playback.name;
+bool init(Mode mode, const std::string& micName, const std::string& outName,
+          std::string* err) {
+    g_wantMic = micName;
+    g_wantOut = outName;
+    return init(mode, err);
+}
+
+std::vector<Device> listDevices(bool capture) {
+    std::vector<Device> out;
+    for (const auto& d : (capture ? g_capDevs : g_playDevs)) {
+        out.push_back({d.name, d.isDefault});
     }
+    return out;
+}
 
-    ma_device_config cfg = ma_device_config_init(ma_device_type_capture);
-    cfg.capture.format   = ma_format_s16;
-    cfg.capture.channels = 1;
-    cfg.sampleRate       = kSampleRate;
-    cfg.periodSizeInFrames = kFrameSamples;
-    cfg.dataCallback     = captureCb;
-    if (ma_device_init(&g_ctx, &cfg, &g_cap) == MA_SUCCESS &&
-        ma_device_start(&g_cap) == MA_SUCCESS) {
-        g_capOk = true;
-        g_capName = g_cap.capture.name;
-    }
-
-    if (!g_playOk) {
-        if (err) *err = "could not open a playback device";
-        g_status = "no speakers";
+bool reopenDevices(const std::string& micName, const std::string& outName,
+                   std::string* err) {
+    if (!g_ctxOk) {
+        if (err) *err = "audio not initialised";
         return false;
     }
-    g_status = g_capOk ? ("OK  mic: " + g_capName) : "no microphone (receive only)";
-    return true;
+    const bool wasTx = g_tx.load();
+    g_tx.store(false);
+
+    if (g_capOk)  { ma_device_uninit(&g_cap);  g_capOk = false; }
+    if (g_playOk) { ma_device_uninit(&g_play); g_playOk = false; }
+
+    g_wantMic = micName;
+    g_wantOut = outName;
+    refreshDevices();
+    const bool ok = openDevices(err);
+
+    g_tx.store(wasTx);
+    return ok;
 }
+
+const std::string& currentMic()    { return g_capName; }
+const std::string& currentOutput() { return g_playName; }
 
 void shutdown() {
     g_tx.store(false);
@@ -341,6 +467,9 @@ void shutdown() {
     std::lock_guard<std::mutex> lk(g_mx);
     g_speakers.clear();
     g_out.clear();
+    g_sidechain.clear();
+    g_capDevs.clear();
+    g_playDevs.clear();
     g_status = "off";
 }
 
@@ -400,6 +529,15 @@ void tick() {
 }
 
 void  setVolume(float v) { g_volume.store(v < 0.f ? 0.f : (v > 1.f ? 1.f : v)); }
+void  setSidetone(bool on) {
+    g_sidetone.store(on);
+    if (!on) {
+        std::lock_guard<std::mutex> lk(g_mx);
+        g_sidechain.clear();
+    }
+}
+void  setHiss(float level)     { g_hiss.store(level < 0.f ? 0.f : (level > 1.f ? 1.f : level)); }
+void  setRadioFilter(bool on)  { g_filter.store(on); }
 float micLevel()         { return g_micLevel.load(); }
 
 std::vector<uint32_t> activeSpeakers() {
