@@ -295,6 +295,23 @@ int main() {
               !shows(lines, "Microphone") && !shows(lines, "Radio noise"));
         if (failures) dump(lines);
 
+        printf("\nthe XRadio mark\n");
+        {
+            // Three draws in three colours that have to line up as one row:
+            // stacked or overlapping pieces would read as a layout bug.
+            int wx = 0, wy = 0, nx = 0, ny = 0, vx = 0, vy = 0;
+            check("the signal arcs are drawn", harness::drawnAt(")))", &wx, &wy));
+            check("the name is drawn", harness::drawnAt("XRadio", &nx, &ny));
+            check("the version is drawn", harness::drawnAt("v0.1.5", &vx, &vy));
+            check("all three sit on one row", wy == ny && ny == vy);
+            check("they run left to right without overlapping",
+                  nx > wx + 3 * 7 && vx > nx + 6 * 7);
+
+            int ty2 = 0;
+            harness::drawnAt("Connection", nullptr, &ty2);
+            check("the mark sits above the tabs", wy > ty2);
+        }
+
         printf("\ntabs\n");
         {
             int top = 0, left = 0, tx = 0, ty = 0;

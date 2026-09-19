@@ -11,6 +11,7 @@
 #include "mathconst.h"
 #include "server.h"
 #include "upnp.h"
+#include "brand.h"
 #include "settings.h"
 #include "joincode.h"
 #include "smoothing.h"
@@ -843,6 +844,8 @@ void drawWindow(XPLMWindowID win, void*) {
     int y = t - 20;
     const int x = l + 10;
 
+    y -= xr::brand::draw(x, y, true);              // the mark is the first row
+
     XPLMDrawString(g_connected ? green : amber, x, y, (char*)g_status.c_str(),
                    nullptr, xplmFont_Proportional);
     y -= 16;
@@ -1302,6 +1305,9 @@ void drawSettings(XPLMWindowID win, void*) {
 
     g_ui.blink = ((int)(g_elapsed * 2.f) % 2) == 0;
     g_ui.begin(l, t, r, b, 24);
+
+    xr::brand::draw(l + 24, t - 24);
+    g_ui.nextRow();
 
     const char* names[xr::kNumTabs];
     for (int i = 0; i < xr::kNumTabs; ++i) names[i] = xr::tabName(i);

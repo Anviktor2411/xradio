@@ -283,6 +283,13 @@ void XPLMDrawString(float*, int x, int y, char* s, int*, XPLMFontID) {
     harness::g_drawnAt.push_back({s, x, y});
 }
 
+// X-Plane's fixed-pitch font is 7 x 10; the UI lays text out from these.
+void XPLMGetFontDimensions(XPLMFontID, int* w, int* h, int* digitsOnly) {
+    if (w) *w = 7;
+    if (h) *h = 10;
+    if (digitsOnly) *digitsOnly = 0;
+}
+
 int XPLMRegisterKeySniffer(XPLMKeySniffer_f cb, int, void* ref) {
     harness::g_sniffer = cb;
     harness::g_snifferRef = ref;
