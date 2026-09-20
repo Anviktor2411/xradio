@@ -69,6 +69,7 @@ set(XR_PLUGIN_SOURCES
     plugin/src/net.cpp
     plugin/src/server.cpp
     plugin/src/ui.cpp
+    plugin/src/update.cpp
     plugin/src/upnp.cpp
     plugin/src/voice.cpp
     plugin/src/weather.cpp
@@ -141,7 +142,8 @@ set_target_properties(XRadio PROPERTIES
 if(WIN32)
     find_library(XPLM_LIBRARY NAMES XPLM_64.lib XPLM
                  PATHS "${XPLANE_SDK}/Libraries/Win" REQUIRED)
-    target_link_libraries(XRadio PRIVATE ${XPLM_LIBRARY} wsock32 ws2_32 iphlpapi)
+    # winhttp: the update check, which uses the HTTP stack Windows already has
+    target_link_libraries(XRadio PRIVATE ${XPLM_LIBRARY} wsock32 ws2_32 iphlpapi winhttp)
     set(XR_PLATDIR "win_x64")
 
 elseif(APPLE)
@@ -239,6 +241,13 @@ if(XRADIO_BUILD_TESTS)
     # The UPnP client alone, against tools/harness/fake_igd.py.
     add_executable(upnp_test tools/harness/upnp_test.cpp plugin/src/upnp.cpp
                              plugin/src/natpmp.cpp plugin/src/net.cpp)
+
+    add_executable(update_test tools/harness/update_test.cpp plugin/src/update.cpp)
+    target_include_directories(update_test PRIVATE plugin/src)
+    target_link_libraries(update_test PRIVATE Threads::Threads)
+    if(WIN32)
+        target_link_libraries(update_test PRIVATE winhttp)
+    endif()
     target_include_directories(upnp_test PRIVATE plugin/src)
     target_link_libraries(upnp_test PRIVATE Threads::Threads)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

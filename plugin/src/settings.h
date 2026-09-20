@@ -22,6 +22,10 @@ struct Settings {
     std::string acIcao;                    // empty: read from the aircraft you are flying
     std::string password;                  // flight password: needed to join, required to host
     bool        autoConnect = true;
+    // One request to GitHub's releases page at startup, so a pilot on an old
+    // build learns about it before a flight refuses them. Off means nothing
+    // is sent anywhere.
+    bool        checkUpdates = true;
     float       reportHz   = 5.f;          // position reports per second
     float       smoothMs   = 350.f;        // interpolation delay
 
@@ -103,6 +107,7 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"callsign",  "Callsign",       Kind::Text,   0, &s.callsign,   0,0,"",0, 15},
         {"actype",    "Aircraft type (blank = from the sim)", Kind::Text, 0, &s.acIcao, 0,0,"",0, 7},
         {"password",  "Flight password", Kind::Text,  0, &s.password,   0,0,"",0, 31},
+        {"checkupdates", "Tell me about new versions", Kind::Bool, 0, &s.checkUpdates},
         {"autoconnect", "Connect on startup", Kind::Bool, 0, &s.autoConnect},
         {"reporthz",  "Report rate",    Kind::Slider, 0, &s.reportHz,   1.f, 10.f, " Hz", 0},
         {"smoothms",  "Smoothing delay", Kind::Slider, 0, &s.smoothMs, 100.f, 1000.f, " ms", 0},

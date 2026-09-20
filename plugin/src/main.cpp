@@ -16,6 +16,7 @@
 #include "joincode.h"
 #include "smoothing.h"
 #include "ui.h"
+#include "update.h"
 #include "voice.h"
 #include "weather.h"
 #include "xpmp_bridge.h"
@@ -847,6 +848,13 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
     }
 
     // Changed aircraft mid-session? Log in again so everyone sees the new one.
+    // Not at startup: the sim is busy loading scenery and the pilot is not
+    // reading the window yet. A test points XRADIO_UPDATE_URL somewhere
+    // local and does not want to wait out the delay.
+    static const float kUpdateDelayS = getenv("XRADIO_UPDATE_URL") ? 0.5f : 20.f;
+    if (g_cfg.checkUpdates && g_elapsed > kUpdateDelayS)
+        xr::update::checkAsync(xr::brand::version());
+
     if (g_elapsed - g_lastAircraftCheck > 3.0f) {
         g_lastAircraftCheck = g_elapsed;
         if (xr::relay::running() && g_cfg.hostUpnp) xr::upnp::tick("XRadio");
@@ -986,6 +994,26 @@ void drawWindow(XPLMWindowID win, void*) {
         y -= 16;
     }
     y -= 2;
+
+    {
+        // Two lines, because the address has to be readable enough to type:
+        // nothing in an X-Plane window is clickable.
+        const xr::update::Info up = xr::update::latest();
+        if (up.newer) {
+            char line[200];
+            snprintf(line, sizeof(line), "XRadio v%s is out -- you are on v%s",
+                     up.latest.c_str(), xr::brand::version());
+            drawFit(amber, x, y, r, line, xplmFont_Basic);
+            y -= 16;
+            std::string where = up.url;
+            const size_t scheme = where.find("://");
+            if (scheme != std::string::npos) where = where.substr(scheme + 3);
+            const size_t tag = where.find("/releases/");
+            if (tag != std::string::npos) where = where.substr(0, tag) + "/releases";
+            drawFit(amber, x + 14, y, r, where, xplmFont_Basic);
+            y -= 18;
+        }
+    }
 
     char hdr[160];
     const bool p1 = comPowered(1), p2 = comPowered(2);
@@ -1585,15 +1613,26 @@ void drawSettings(XPLMWindowID win, void*) {
     }
 
     g_ui.nextRow();
+    // A row is held back for the note that a refused save produces. It has
+    // to be drawn above the buttons, but its text only exists once the Save
+    // button has been handled -- hence reserving the row, then coming back
+    // to it.
+    const int noteRow = g_ui.y;
+    g_ui.nextRow();
+
     // Whatever happened above, the buttons have to be on screen and
     // clickable: a settings window you cannot save or close is a trap.
     if (g_ui.y < b + xr::ui::Ctx::kRowH) g_ui.y = b + 12;
+    const int buttonRow = g_ui.y;
     static const char* btns[] = {"Save & apply", "Cancel"};
     const int hit = xr::ui::buttons(g_ui, btns, 2);
     if (hit == 0) applySettings();
     else if (hit == 1) closeSettings();
 
-    if (!g_settingsNote.empty()) xr::ui::text(g_ui, g_settingsNote.c_str(), 3);
+    if (!g_settingsNote.empty()) {
+        g_ui.y = noteRow > buttonRow ? noteRow : buttonRow + xr::ui::Ctx::kRowH;
+        xr::ui::text(g_ui, g_settingsNote.c_str(), 3);
+    }
 
     // The Hosting tab says a great deal more than the others when a router
     // will not cooperate, so a window sized for Connection cuts it off.
@@ -1804,6 +1843,7 @@ PLUGIN_API void XPluginStop(void) {
     xr::relay::stop();
     xr::upnp::releaseAsync();      // give the router's port back if we can
     xr::upnp::shutdown();
+    xr::update::shutdown();
     xr::voice::shutdown();
     xr::csl::shutdown();
     if (g_loop)   { XPLMDestroyFlightLoop(g_loop); g_loop = nullptr; }

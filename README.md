@@ -120,6 +120,26 @@ machine without Python:
 ./server/lin_x64/xradio_server 49100        # or win_x64\ , mac_x64/
 ```
 
+## Telling pilots about a new version
+
+Everyone in a flight has to be on the same build, so a pilot on an old one
+does not merely miss features -- they cannot join at all. Once per sim
+session, twenty seconds after startup, the plugin asks GitHub's releases
+endpoint what the newest version is; if it is newer than the one running,
+the main window says so and prints the address:
+
+```
+  XRadio v0.6.0 is out -- you are on v0.5.2
+    github.com/Anviktor2411/xradio/releases
+```
+
+Nothing is downloaded and nothing is installed -- the pilot decides. The
+check is one request and can be switched off entirely in **Settings >
+Connection > Tell me about new versions**, after which nothing is sent
+anywhere. It uses the HTTP stack the operating system already has (WinHTTP
+on Windows, curl elsewhere) rather than carrying a TLS library into the sim,
+and a site that is down, slow or talking nonsense is simply ignored.
+
 ## Cutting a release
 
     bash release.sh          # or double-click release.bat on Windows

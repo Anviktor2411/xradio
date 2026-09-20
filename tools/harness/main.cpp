@@ -154,6 +154,7 @@ int main(int argc, char** argv) {
     sw = harness::drawWindow(2);
     if (!harness::drawnContains(sw, "Host cannot be empty")) {
         fprintf(stderr, "FAIL: no validation message for empty host\n");
+        XPluginStop();
         return 1;
     }
     harness::typeText(2, host);
@@ -247,6 +248,19 @@ int main(int argc, char** argv) {
         fprintf(stderr, "FAIL: echoed frames were received but never played (%llu)\n",
                 (unsigned long long)vs.framesPlayed);
         voiceOk = false;
+    }
+
+    // Pointed at a stand-in release endpoint, the window has to actually say so:
+    // the check working but the line never appearing would be invisible.
+    if (getenv("XRADIO_UPDATE_URL")) {
+        bool said = false;
+        for (const auto& l : harness::draw())
+            if (l.find("is out") != std::string::npos) said = true;
+        if (!said) {
+            printf("FAIL: an update was available but the window never said so\n");
+            return 1;
+        }
+        printf("the window offers the update\n");
     }
 
     XPluginDisable();
