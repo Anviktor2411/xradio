@@ -58,8 +58,36 @@ int main(int argc, char** argv) {
         check("and is not offered as something to share", r.externalIp.empty(), r.externalIp);
     } else if (mode == "deaf") {
         check("nobody answered", !r.mapped && r.router.empty());
-        check("it says so", r.error.find("no router answered") != std::string::npos, r.error);
+        check("it says so, naming both protocols it tried",
+              r.error.find("no router answered") != std::string::npos &&
+              r.error.find("NAT-PMP") != std::string::npos, r.error);
         check("and gave up within four seconds", secs < 4.0, std::to_string(secs));
+    } else if (mode == "natpmp") {
+        // UPnP silent, NAT-PMP answering: the router many pilots actually
+        // have, with UPnP switched off in its settings.
+        check("the port was opened anyway", r.mapped, r.error);
+        check("and it says which protocol did it", r.router == "NAT-PMP", r.router);
+        check("the WAN address came back", r.externalIp == "81.90.144.12", r.externalIp);
+        check("the lease it granted is reported", r.leaseSeconds == 3600,
+              std::to_string(r.leaseSeconds));
+        check("not flagged as double NAT", !r.doubleNat);
+        check("the mapping can be given back", xr::upnp::removeMapping(49100, 1500));
+    } else if (mode == "natpmp-refuse") {
+        check("the port stays shut", !r.mapped);
+        check("and the refusal names NAT-PMP, not just UPnP",
+              r.error.find("NAT-PMP") != std::string::npos, r.error);
+        check("the pilot is told port mapping is switched off",
+              r.error.find("switched off") != std::string::npos, r.error);
+    } else if (mode == "natpmp-otherport") {
+        // A port other than the one asked for is useless: the join code and
+        // the address the pilot hands out both name the port they chose.
+        check("a different external port is not treated as success", !r.mapped);
+        check("and the reason says which port it opened",
+              r.error.find("49101") != std::string::npos, r.error);
+    } else if (mode == "natpmp-private") {
+        check("the mapping succeeds", r.mapped);
+        check("but a private WAN address is double NAT", r.doubleNat);
+        check("so nothing is offered to share", r.externalIp.empty(), r.externalIp);
     }
 
     printf("\n");

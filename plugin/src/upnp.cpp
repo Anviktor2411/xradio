@@ -1,5 +1,6 @@
 #include "upnp.h"
 
+#include "natpmp.h"
 #include "net.h"
 
 #include <atomic>
@@ -38,6 +39,10 @@
 namespace xr {
 namespace upnp {
 namespace {
+
+// Set when the mapping was made by NAT-PMP rather than UPnP: releasing it
+// has to go back the same way.
+std::string g_pmpGateway;
 
 // Set when the plugin is unloading. Every phase checks it, so quitting
 // X-Plane never sits waiting on a router that has stopped answering.
@@ -613,7 +618,29 @@ Result addMapping(uint16_t port, const std::string& localIp,
     const std::vector<std::string> found = discover(timeoutMs);
     if (g_abort.load()) { r.error = "cancelled"; return r; }
     if (found.empty()) {
-        r.error = "no router answered (UPnP is probably switched off on it)";
+        // Plenty of routers ship with UPnP off but still answer NAT-PMP --
+        // Apple's, a lot of OpenWrt and Fritz!Box firmware, anything running
+        // miniupnpd. Worth asking before sending a pilot to the router's
+        // settings page.
+        const std::string gw = gatewayAddress();
+        const natpmp::Result pmp = natpmp::map(gw, port, 3600);
+        if (pmp.mapped) {
+            r.mapped = true;
+            r.router = "NAT-PMP";
+            r.leaseSeconds = pmp.leaseSeconds;
+            if (isPublicIPv4(pmp.externalIp))      r.externalIp = pmp.externalIp;
+            else if (looksLikeIPv4(pmp.externalIp)) r.doubleNat = true;
+            std::lock_guard<std::mutex> lk(g_mx);
+            g_pmpGateway = gw;
+            return r;
+        }
+        if (pmp.answered) {
+            r.error = "UPnP is switched off; NAT-PMP answered but " + pmp.error;
+            if (isPublicIPv4(pmp.externalIp)) r.externalIp = pmp.externalIp;
+        } else {
+            r.error = "no router answered (UPnP and NAT-PMP are both "
+                      "switched off on it)";
+        }
         return r;
     }
 
@@ -678,6 +705,21 @@ Result addMapping(uint16_t port, const std::string& localIp,
 }
 
 bool removeMapping(uint16_t port, int timeoutMs) {
+    // A NAT-PMP mapping has to be given back the same way it was taken.
+    {
+        std::string gw;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            gw = g_pmpGateway;
+        }
+        if (!gw.empty()) {
+            const bool ok = natpmp::unmap(gw, port, timeoutMs);
+            std::lock_guard<std::mutex> lk(g_mx);
+            g_pmpGateway.clear();
+            return ok;
+        }
+    }
+
     // The service the mapping went through is remembered, so releasing it is
     // one request rather than a fresh discovery -- which matters at quit,
     // when there is no time for one.

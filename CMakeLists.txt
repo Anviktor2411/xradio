@@ -65,6 +65,7 @@ endif()
 # --- common settings for anything that compiles the plugin sources ----------
 set(XR_PLUGIN_SOURCES
     plugin/src/main.cpp
+    plugin/src/natpmp.cpp
     plugin/src/net.cpp
     plugin/src/server.cpp
     plugin/src/ui.cpp
@@ -78,7 +79,8 @@ set(XR_PLUGIN_SOURCES
 # stay up without X-Plane running -- and so tools/test_server_parity.py can
 # hold it to the same behaviour as the Python one. Needs no X-Plane SDK.
 add_executable(xradio_server tools/server_main.cpp plugin/src/server.cpp
-                             plugin/src/net.cpp plugin/src/upnp.cpp)
+                             plugin/src/net.cpp plugin/src/upnp.cpp
+                             plugin/src/natpmp.cpp)
 target_include_directories(xradio_server PRIVATE plugin/src)
 find_package(Threads REQUIRED)
 target_link_libraries(xradio_server PRIVATE Threads::Threads)
@@ -235,7 +237,8 @@ if(XRADIO_BUILD_TESTS)
     xradio_test_exe(radio_demo     tools/harness/radio_demo.cpp)
 
     # The UPnP client alone, against tools/harness/fake_igd.py.
-    add_executable(upnp_test tools/harness/upnp_test.cpp plugin/src/upnp.cpp plugin/src/net.cpp)
+    add_executable(upnp_test tools/harness/upnp_test.cpp plugin/src/upnp.cpp
+                             plugin/src/natpmp.cpp plugin/src/net.cpp)
     target_include_directories(upnp_test PRIVATE plugin/src)
     target_link_libraries(upnp_test PRIVATE Threads::Threads)
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")

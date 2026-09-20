@@ -35,6 +35,14 @@ a carrier's NAT (mobile internet, some fibre providers) is recognised and the
 window says hosting over the internet cannot work from there, rather than
 handing out an address that goes nowhere.
 
+If UPnP is switched off, XRadio asks again over **NAT-PMP** before giving up.
+It is a different, much simpler protocol that plenty of routers answer while
+UPnP is disabled -- Apple's, a lot of OpenWrt and Fritz!Box firmware, and
+anything running miniupnpd. When it is NAT-PMP that opens the port, the
+window says so. `python3 tools/upnp_probe.py` asks the router the same way
+XRadio does, from outside the sim, and says whether the silence is the
+router's or a bug here.
+
 The UPnP search goes out of the network interface that carries the internet
 route and is also sent straight to the gateway, because on a PC with
 VirtualBox, VMware, Hyper-V or a VPN adapter installed the operating system's
