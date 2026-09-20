@@ -94,6 +94,21 @@ jobs:
             wait 2>/dev/null || true
           done
 
+      # The fallback for routers with UPnP switched off, which is the setup
+      # nobody has to hand when they need it.
+      - name: NAT-PMP fallback against a fake router
+        run: |
+          for pair in "ok natpmp" "refuse natpmp-refuse" "otherport natpmp-otherport" \
+                      "private natpmp-private"; do
+            set -- $pair
+            python3 tools/harness/fake_natpmp.py --mode $1 > /tmp/pmp.log 2>&1 &
+            sleep 1
+            XRADIO_UPNP_GATEWAY=127.0.0.1 ASAN_OPTIONS=detect_leaks=0 \
+              UBSAN_OPTIONS=halt_on_error=1 ./build-tests/upnp_test $2
+            kill %1 2>/dev/null || true
+            wait 2>/dev/null || true
+          done
+
       # Two relay servers, one protocol. This drives the same scenarios at
       # both over real UDP and diffs the transcripts, so a validation rule
       # fixed in one and forgotten in the other fails here.
