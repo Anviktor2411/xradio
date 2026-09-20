@@ -310,7 +310,7 @@ int main() {
             int wx = 0, wy = 0, nx = 0, ny = 0, vx = 0, vy = 0;
             check("the signal arcs are drawn", harness::drawnAt(")))", &wx, &wy));
             check("the name is drawn", harness::drawnAt("XRadio", &nx, &ny));
-            check("the version is drawn", harness::drawnAt("v0.5.1", &vx, &vy));
+            check("the version is drawn", harness::drawnAt("v0.5.2", &vx, &vy));
             check("all three sit on one row", wy == ny && ny == vy);
             check("they run left to right without overlapping",
                   nx > wx + 3 * 7 && vx > nx + 6 * 7);
