@@ -109,6 +109,20 @@ jobs:
             wait 2>/dev/null || true
           done
 
+      # The update check: the version comparison, and the whole path against
+      # a stand-in for GitHub in each of its moods, including down and lying.
+      - name: Update check against a fake release site
+        run: |
+          ASAN_OPTIONS=detect_leaks=0 ./build-tests/update_test offline
+          for mode in newer same older garbage error huge; do
+            python3 tools/harness/fake_release.py --mode $mode > /tmp/rel.log 2>&1 &
+            sleep 1
+            XRADIO_UPDATE_URL=http://127.0.0.1:5399/latest ASAN_OPTIONS=detect_leaks=0 \
+              UBSAN_OPTIONS=halt_on_error=1 ./build-tests/update_test $mode
+            kill %1 2>/dev/null || true
+            wait 2>/dev/null || true
+          done
+
       # Two relay servers, one protocol. This drives the same scenarios at
       # both over real UDP and diffs the transcripts, so a validation rule
       # fixed in one and forgotten in the other fails here.
@@ -117,12 +131,14 @@ jobs:
 
       - name: Plugin talks to a real server, voice round trip via a peer
         run: |
+          python3 tools/harness/fake_release.py --mode newer > /tmp/rel.log 2>&1 &
           python3 server/server.py --port 49400 > /tmp/srv.log 2>&1 &
           sleep 1
           python3 tools/fake_client.py --port 49400 --callsign PEER01 \
             --lat 57.86 --lon 27.03 --talk --parrot > /tmp/peer.log 2>&1 &
           sleep 1
-          ASAN_OPTIONS=detect_leaks=0 ./build-tests/plugin_harness 127.0.0.1 49400 CIRUN
+          XRADIO_UPDATE_URL=http://127.0.0.1:5399/latest \
+            ASAN_OPTIONS=detect_leaks=0 ./build-tests/plugin_harness 127.0.0.1 49400 CIRUN
           echo "--- server ---"; grep -E "login|voice|text" /tmp/srv.log || true
           echo "--- peer ---";   grep -E "voice" /tmp/peer.log || true
           kill %1 %2 2>/dev/null || true
