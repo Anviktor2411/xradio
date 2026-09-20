@@ -5,6 +5,7 @@
 // click -- the clicks below use the coordinates the draw actually reported,
 // not a re-derived copy of the layout that could drift out of sync with it.
 #include "harness.h"
+#include "brand.h"
 #include "settings.h"
 #include "joincode.h"
 #include "ui.h"
@@ -310,7 +311,10 @@ int main() {
             int wx = 0, wy = 0, nx = 0, ny = 0, vx = 0, vy = 0;
             check("the signal arcs are drawn", harness::drawnAt(")))", &wx, &wy));
             check("the name is drawn", harness::drawnAt("XRadio", &nx, &ny));
-            check("the version is drawn", harness::drawnAt("v0.5.2", &vx, &vy));
+            // Asked of the plugin rather than written out again here: two
+            // copies of a version number is one that gets forgotten.
+            const std::string ver = std::string("v") + xr::brand::version();
+            check("the version is drawn", harness::drawnAt(ver, &vx, &vy), ver);
             check("all three sit on one row", wy == ny && ny == vy);
             check("they run left to right without overlapping",
                   nx > wx + 3 * 7 && vx > nx + 6 * 7);

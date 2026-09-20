@@ -424,6 +424,11 @@ int main(int argc, char** argv) {
         check("it names who is connected", shows(v, "HOSTER") && shows(v, "FRIEND"));
         check("it does not claim the router opened anything",
               !shows(v, "Router opened"));
+        // A pilot whose router cannot be changed at all -- an ISP box with no
+        // settings page, a carrier's NAT -- must not be left thinking port
+        // forwarding is the only way to fly with friends.
+        check("it offers a way out when the router cannot be changed",
+              shows(v, "Tailscale") || shows(v, "let a friend host"));
         if (failures) dump(v);
     }
 

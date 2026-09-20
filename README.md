@@ -120,6 +120,28 @@ machine without Python:
 ./server/lin_x64/xradio_server 49100        # or win_x64\ , mac_x64/
 ```
 
+## Cutting a release
+
+    bash release.sh          # or double-click release.bat on Windows
+
+It asks for the version number, suggesting the next patch:
+
+    current version : v0.5.2
+    new version [v0.5.3]: v0.6.0
+
+Then it runs every check this machine is equipped for -- the portability
+scan, the Windows cross-compile, the C++ tests, the differential server
+test -- and only if they all pass does it set the version in
+`plugin/src/brand.h` (the one place it lives; the window and the tests both
+read it from there), write `dist/xradio-v0.6.0-source.zip`, and leave a
+release-notes skeleton beside it with the compare link filled in. A failed
+check leaves the tree untouched, so a broken build cannot become a release.
+
+Machines missing a tool skip that check and say so rather than failing, so
+it is usable from Windows without mingw-w64 installed. What it deliberately
+does not do is upload anything or tag anything: the binaries pilots install
+come from the CI run's `XRadio-all-platforms` artifact, not from this zip.
+
 ## Tests
 
 ```bash

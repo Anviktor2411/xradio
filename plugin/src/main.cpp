@@ -1551,6 +1551,13 @@ void drawSettings(XPLMWindowID win, void*) {
                         snprintf(line, sizeof(line), "   or the join code:  %s", code.c_str());
                         xr::ui::text(g_ui, line, 1);
                     }
+                    // Forwarding is not always possible: an ISP-managed box
+                    // with no settings page, a carrier's NAT, a network
+                    // somebody else runs. Saying only "forward the port"
+                    // leaves those pilots stuck with no idea there is a way.
+                    xr::ui::text(g_ui, "If you cannot change the router: let a friend host instead, or put", 1);
+                    xr::ui::text(g_ui, "everyone on a VPN like Tailscale or ZeroTier and host on the address", 1);
+                    xr::ui::text(g_ui, "it gives you -- no forwarding needed. server/ also runs on a VPS.", 1);
                 }
             }
 
