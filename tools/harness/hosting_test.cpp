@@ -418,7 +418,17 @@ int main(int argc, char** argv) {
         harness::drawnAt("Hosting", &tx, &ty);
         harness::click(kWin, tx + 10, ty);
         for (int i = 0; i < 6; ++i) { peer.position(); fly(0.1); }
+        int h0 = 0, t0 = 0, l0 = 0, r0 = 0;
+        harness::windowRect(kWin, &l0, &t0, &r0, &h0);
         auto v = drawSettings();
+        // This tab says far more than the others; the window grows to fit it
+        // on the next frame, which is what a pilot sees.
+        v = drawSettings();
+        int l1 = 0, t1 = 0, r1 = 0, b1 = 0;
+        harness::windowRect(kWin, &l1, &t1, &r1, &b1);
+        check("the window grew to fit the hosting tab", (t1 - b1) > (t0 - h0),
+              std::to_string(t0 - h0) + " -> " + std::to_string(t1 - b1) + " px");
+
         check("it says the server is running", shows(v, "Running on port"));
         check("it shows an address to give out", shows(v, "Friends type:"));
         check("it names who is connected", shows(v, "HOSTER") && shows(v, "FRIEND"));
@@ -429,6 +439,19 @@ int main(int argc, char** argv) {
         // forwarding is the only way to fly with friends.
         check("it offers a way out when the router cannot be changed",
               shows(v, "Tailscale") || shows(v, "let a friend host"));
+
+        // This tab says far more than the others, and a window sized for the
+        // Connection tab used to cut off the join code, who is connected,
+        // and the buttons -- drawing them over the cockpit below the window.
+        int wl = 0, wt = 0, wr = 0, wb = 0;
+        harness::windowRect(kWin, &wl, &wt, &wr, &wb);
+        int below = 0;
+        for (const auto& d : harness::drawnPositions())
+            if (d.y < wb) ++below;
+        check("nothing is drawn below the window", below == 0,
+              std::to_string(below) + " lines");
+        check("the buttons are still there", shows(v, "Save & apply") && shows(v, "Cancel"));
+        if (below || !shows(v, "Save & apply")) dump(v);
         if (failures) dump(v);
     }
 

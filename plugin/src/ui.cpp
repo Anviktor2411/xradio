@@ -30,6 +30,11 @@ float* colour(int c) {
 }
 
 void draw(const Ctx& c, int x, const char* s, int col) {
+    // Below the window's bottom edge is the cockpit, not the window: a row
+    // drawn there lands on the scenery. The caller grows the window when
+    // this happens, but a screen too short to grow into still must not
+    // paint over the sim.
+    if (c.y < c.bottom + 4) { const_cast<Ctx&>(c).clipped = true; return; }
     XPLMDrawString(colour(col), c.left + x, c.y, (char*)s, nullptr, xplmFont_Proportional);
 }
 

@@ -1585,12 +1585,30 @@ void drawSettings(XPLMWindowID win, void*) {
     }
 
     g_ui.nextRow();
+    // Whatever happened above, the buttons have to be on screen and
+    // clickable: a settings window you cannot save or close is a trap.
+    if (g_ui.y < b + xr::ui::Ctx::kRowH) g_ui.y = b + 12;
     static const char* btns[] = {"Save & apply", "Cancel"};
     const int hit = xr::ui::buttons(g_ui, btns, 2);
     if (hit == 0) applySettings();
     else if (hit == 1) closeSettings();
 
     if (!g_settingsNote.empty()) xr::ui::text(g_ui, g_settingsNote.c_str(), 3);
+
+    // The Hosting tab says a great deal more than the others when a router
+    // will not cooperate, so a window sized for Connection cuts it off.
+    // Grow to fit what is actually being drawn -- never shrink, because the
+    // pilot may have sized it deliberately.
+    if (g_ui.clipped) {
+        const int want = g_ui.neededHeight();
+        if (want > t - b) {
+            int sl, st, sr, sb;
+            XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);
+            int newBottom = t - want;
+            if (newBottom < sb + 20) newBottom = sb + 20;
+            if (newBottom < b) XPLMSetWindowGeometry(g_settingsWin, l, t, r, newBottom);
+        }
+    }
 
     g_focusCount = g_ui.index;
     g_ui.endInput();

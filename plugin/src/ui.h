@@ -43,6 +43,7 @@ struct Ctx {
     int  y = 0;               // baseline of the row about to be drawn
     int  index = 0;           // focusable-widget counter
     bool blink = true;        // cursor phase
+    bool clipped = false;     // a row did not fit: the window wants to be taller
 
     static constexpr int kRowH   = 22;
     static constexpr int kValueX = 190;   // where values start, from `left`
@@ -51,7 +52,12 @@ struct Ctx {
         left = l; top = t; right = r; bottom = b;
         y = t - firstRowOffset;
         index = 0;
+        clipped = false;
     }
+
+    // How tall the window would have to be for everything drawn so far to
+    // fit, including a bottom margin.
+    int neededHeight() const { return top - y + kRowH + 10; }
     void endInput() { clicked = false; keys.clear(); }
 
     bool rowHit() const {
