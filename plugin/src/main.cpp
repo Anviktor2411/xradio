@@ -1638,8 +1638,13 @@ void drawSettings(XPLMWindowID win, void*) {
     // will not cooperate, so a window sized for Connection cuts it off.
     // Grow to fit what is actually being drawn -- never shrink, because the
     // pilot may have sized it deliberately.
-    if (g_ui.clipped) {
+    // Only when the content itself changed size, not on every frame it does
+    // not fit: growing between a draw and the click that draw produced moves
+    // the row out from under the pilot's cursor.
+    static int g_lastGrownTo = 0;
+    if (g_ui.clipped && g_ui.neededHeight() != g_lastGrownTo) {
         const int want = g_ui.neededHeight();
+        g_lastGrownTo = want;
         if (want > t - b) {
             int sl, st, sr, sb;
             XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);

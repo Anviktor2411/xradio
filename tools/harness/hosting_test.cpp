@@ -780,14 +780,28 @@ int main(int argc, char** argv) {
         harness::drawnAt("Host a flight here", &lx, &ly);
         harness::click(kWin, left + xr::ui::Ctx::kValueX + 10, ly);
         drawSettings();
+        // Let the layout settle before reading a button's position: this tab
+        // can grow the window, and a coordinate taken from the frame before
+        // that would point at the wrong row -- which is what a pilot would
+        // experience as a click that did nothing.
+        drawSettings();
         int bx = 0, by = 0;
         harness::drawnAt("Save & apply", &bx, &by);
         harness::click(kWin, bx + 20, by);
         drawSettings();
         fly(0.4);
 
+        // Two separate things can go wrong here, and they need telling
+        // apart: the click never reaching the toggle, or the server not
+        // stopping once it did. CI once failed this and the single check
+        // could not say which.
+        xr::Settings saved;
+        xr::loadSettings(saved, kCfgPath);
+        check("the setting was saved as off", !saved.hostEnabled);
+
         auto w = harness::draw();
         check("the main window stops saying it is hosting", !shows(w, "Hosting  ·"));
+        if (shows(w, "Hosting  ·")) dump(w);
 
         Peer late("TOOLATE", 57.86, 27.03);
         check("nobody can join any more", !late.login());
