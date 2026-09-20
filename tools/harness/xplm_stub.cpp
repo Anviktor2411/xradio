@@ -147,6 +147,11 @@ void setScreen(int l, int t, int r, int b) {
 void clearMonitors() { g_monitors.clear(); }
 void addMonitor(int l, int t, int r, int b) { g_monitors.push_back({l, t, r, b}); }
 
+// Drag a window to a new size, as a pilot would.
+void setWindowRect(int id, int l, int t, int r, int b) {
+    if (Win* w = win(id)) { w->l = l; w->t = t; w->r = r; w->b = b; }
+}
+
 void windowRect(int id, int* l, int* t, int* r, int* b) {
     Win* w = win(id);
     if (l) *l = w ? w->l : 0;
@@ -311,6 +316,11 @@ void XPLMDrawString(float*, int x, int y, char* s, int*, XPLMFontID) {
     if (!s) return;
     harness::g_drawn.push_back(s);
     harness::g_drawnAt.push_back({s, x, y});
+}
+
+float XPLMMeasureString(XPLMFontID, const char* s, int n) {
+    (void)s;
+    return 7.f * (float)(n < 0 ? 0 : n);      // the fixed-pitch font's width
 }
 
 // X-Plane's fixed-pitch font is 7 x 10; the UI lays text out from these.

@@ -283,6 +283,12 @@ int main(int argc, char** argv) {
 
     harness::set("sim/cockpit2/radios/actuators/com1_frequency_hz_833", 122800);
     harness::set("sim/cockpit2/radios/actuators/audio_selection_com1", 1);
+    // A powered-up aircraft: the radios need the avionics bus, their own
+    // switches and volts behind them, exactly as in the sim.
+    harness::set("sim/cockpit2/switches/avionics_power_on", 1);
+    harness::set("sim/cockpit2/radios/actuators/com1_power", 1);
+    harness::set("sim/cockpit2/radios/actuators/com2_power", 1);
+    harness::set("sim/cockpit2/electrical/bus_volts", 24.0);
     harness::set("sim/cockpit2/radios/actuators/audio_com_selection", 6);
     harness::set("sim/flightmodel/position/elevation", 914.0);
     // What the sim says we are flying. The config leaves the type blank, so
@@ -419,6 +425,77 @@ int main(int argc, char** argv) {
         check("it does not claim the router opened anything",
               !shows(v, "Router opened"));
         if (failures) dump(v);
+    }
+
+    printf("\na cold and dark aircraft is off the air\n");
+    {
+        // A radio needs electricity. Nothing about this was true before:
+        // an aircraft parked with the master off was still transmitting.
+        Peer awake("PWR001", 57.858, 27.028);
+        check("another pilot is listening", awake.login());
+        for (int i = 0; i < 4; ++i) { awake.position(); fly(0.15); }
+
+        harness::set("sim/cockpit2/switches/avionics_power_on", 0);
+        harness::set("sim/cockpit2/electrical/bus_volts", 0.0);
+        fly(0.6);
+
+        auto w = harness::draw();
+        check("the window says the radios have no power", shows(w, "no power"));
+        if (!shows(w, "no power")) dump(w);
+
+        harness::ptt(true);
+        fly(0.5);
+        auto w2 = harness::draw();
+        check("keying does nothing at all", !shows(w2, "** TX **"));
+        harness::ptt(false);
+
+        awake.drain(200);
+        awake.text("anyone on frequency");
+        fly(0.8);
+        auto w3 = harness::draw();
+        check("and nothing is heard either",
+              !shows(w3, "anyone on frequency"));
+
+        // Master and avionics back on: the radio comes alive again.
+        harness::set("sim/cockpit2/switches/avionics_power_on", 1);
+        harness::set("sim/cockpit2/electrical/bus_volts", 24.0);
+        fly(0.6);
+        auto w4 = harness::draw();
+        check("power restored, the radios are back", !shows(w4, "no power"));
+        harness::ptt(true);
+        fly(0.4);
+        check("and keying works again", shows(harness::draw(), "** TX **"));
+        harness::ptt(false);
+        awake.text("reading you now");
+        fly(0.8);
+        check("so does hearing", shows(harness::draw(), "reading you now"));
+    }
+
+    printf("\nthe window is narrowed\n");
+    {
+        // X-Plane lets a pilot drag this window down to 320 px. Text drawn
+        // past the edge lands on the cockpit, which looks like a crash.
+        int l = 0, t = 0, r = 0, b = 0;
+        harness::windowRect(1, &l, &t, &r, &b);
+        harness::setWindowRect(1, l, t, l + 320, b);
+        auto w = harness::draw();
+        int over = 0;
+        for (const auto& d : harness::drawnPositions()) {
+            // 7 px per character in the harness's font
+            const int endX = d.x + 7 * (int)d.text.size();
+            if (endX > l + 320) ++over;
+        }
+        if (over) {
+            for (const auto& d : harness::drawnPositions()) {
+                const int endX = d.x + 7 * (int)d.text.size();
+                if (endX > l + 320)
+                    printf("        overflow by %d px: %s\n", endX - (l + 320), d.text.c_str());
+            }
+        }
+        check("nothing is drawn past the right edge", over == 0,
+              std::to_string(over) + " lines overflow");
+        check("and the window still shows its content", shows(w, "XRadio"));
+        harness::setWindowRect(1, l, t, r, b);
     }
 
     printf("\nthe host's sky reaches everyone else\n");

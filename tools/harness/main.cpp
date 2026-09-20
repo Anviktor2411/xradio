@@ -53,6 +53,12 @@ int main(int argc, char** argv) {
     setPos(lat, lon, altM, 90.0f, gsMs);
     harness::set("sim/cockpit2/radios/actuators/com1_frequency_hz_833", 122800);
     harness::set("sim/cockpit2/radios/actuators/audio_selection_com1", 1);
+    // A powered-up aircraft: the radios need the avionics bus, their own
+    // switches and volts behind them, exactly as in the sim.
+    harness::set("sim/cockpit2/switches/avionics_power_on", 1);
+    harness::set("sim/cockpit2/radios/actuators/com1_power", 1);
+    harness::set("sim/cockpit2/radios/actuators/com2_power", 1);
+    harness::set("sim/cockpit2/electrical/bus_volts", 24.0);
     harness::set("sim/cockpit2/radios/actuators/audio_com_selection", 6);
     harness::set("sim/cockpit2/switches/navigation_lights_on", 1);
 

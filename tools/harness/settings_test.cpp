@@ -277,6 +277,10 @@ int main() {
 
         harness::resetWindows();
         char n[256], sg[256], d[256];
+        harness::set("sim/cockpit2/switches/avionics_power_on", 1);
+        harness::set("sim/cockpit2/radios/actuators/com1_power", 1);
+        harness::set("sim/cockpit2/radios/actuators/com2_power", 1);
+        harness::set("sim/cockpit2/electrical/bus_volts", 24.0);
         XPluginStart(n, sg, d);
         XPluginEnable();
 

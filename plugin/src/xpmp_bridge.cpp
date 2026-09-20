@@ -17,6 +17,7 @@
 #  include "XPMPMultiplayer.h"
 #  include <map>
 #  include <memory>
+#  include <set>
 #endif
 
 namespace xr {
@@ -174,6 +175,12 @@ public:
 
 std::map<uint32_t, std::unique_ptr<XRAircraft>> g_planes;
 
+// Aircraft XPMP2 refused to build. Position updates arrive ten times a
+// second, so without remembering the refusal every one of them retries the
+// constructor and writes the same fatal assert to Log.txt again -- megabytes
+// of it on a flight with no CSL models installed.
+std::set<uint32_t> g_unmodelled;
+
 // XPMP2 asks us for its settings through this.
 int prefsCb(const char* section, const char* key, int dflt) {
     if (!strcmp(section, "planes")) {
@@ -316,6 +323,10 @@ void setLabels(bool on, float maxDistNm) {
 
 void upsert(const RemoteState& s) {
     if (!g_ready || !g_enabled || !g_visible) return;
+    // Nothing to draw them with: XPMP2 aborts the match and the aircraft
+    // cannot exist, so do not ask it to try.
+    if (g_models == 0) return;
+    if (g_unmodelled.count(s.sid)) return;
 
     auto it = g_planes.find(s.sid);
     if (it == g_planes.end()) {
@@ -326,7 +337,10 @@ void upsert(const RemoteState& s) {
             logMsg("added %s (%s %s) sid=%u", s.callsign.c_str(), s.acIcao.c_str(),
                    s.livery.c_str(), (unsigned)s.sid);
         } catch (const XPMP2::XPMP2Error& e) {
-            logMsg("cannot create aircraft for %s: %s", s.callsign.c_str(), e.what());
+            // Said once per aircraft, not once per position report.
+            g_unmodelled.insert(s.sid);
+            logMsg("no model for %s (%s): %s -- it will not be drawn",
+                   s.callsign.c_str(), s.acIcao.c_str(), e.what());
         }
         return;
     }
@@ -334,13 +348,14 @@ void upsert(const RemoteState& s) {
 }
 
 void remove(uint32_t sid) {
+    g_unmodelled.erase(sid);      // a rejoining pilot gets a fresh try
     auto it = g_planes.find(sid);
     if (it == g_planes.end()) return;
     logMsg("removed %s sid=%u", it->second->st.callsign.c_str(), (unsigned)sid);
     g_planes.erase(it);   // the Aircraft destructor tears down the instance
 }
 
-void removeAll() { g_planes.clear(); }
+void removeAll() { g_planes.clear(); g_unmodelled.clear(); }
 
 int cslModelCount() { return g_models; }
 std::string cslModelSource() { return g_modelSource; }

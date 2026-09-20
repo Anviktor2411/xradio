@@ -319,6 +319,18 @@ Each package root needs an `xsb_aircraft.txt`. A free, open set is
 common types. When no model matches, XPMP2 falls back to the `actype` from
 `xradio.cfg`.
 
+## A radio needs electricity
+
+COM1 and COM2 only work when the avionics bus is on, the radio's own power
+switch is on, and there are volts behind them -- the same three things a
+pilot checks when a radio is dead. An aircraft sitting cold and dark is off
+the air: push-to-talk does nothing, nobody hears you, and you hear nobody.
+The window says `COM1 122.800 (no power)` rather than looking broken, and
+switching the avionics off mid-transmission unkeys you.
+
+An aircraft that models none of this -- no avionics or bus datarefs at all --
+is treated as powered, so an unusual add-on does not go silent.
+
 ## One sky for the whole flight
 
 Two pilots flying together in different weather is worse than it sounds: one

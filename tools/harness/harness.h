@@ -31,6 +31,7 @@ void typeText(int id, const std::string& text);
 void pressVk(int id, int vk);
 void windowTop(int id, int* top, int* left);
 void windowRect(int id, int* l, int* t, int* r, int* b);
+void setWindowRect(int id, int l, int t, int r, int b);
 void resetWindows();
 void setScreen(int l, int t, int r, int b);
 void clearMonitors();

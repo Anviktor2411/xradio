@@ -116,6 +116,7 @@ struct Refs {
     XPLMDataRef gear, flap, onGround;
     XPLMDataRef com1, com2, audioComSel, rxCom1, rxCom2, volCom1, volCom2;
     XPLMDataRef ltNav, ltBeacon, ltStrobe, ltLanding, ltTaxi;
+    XPLMDataRef avionicsOn, com1Power, com2Power, busVolts;
     XPLMDataRef acfIcao, acfLivery;
 } g_ref;
 
@@ -157,6 +158,14 @@ void findRefs() {
     g_ref.volCom1     = findRef("sim/cockpit2/radios/actuators/audio_volume_com1");
     g_ref.volCom2     = findRef("sim/cockpit2/radios/actuators/audio_volume_com2");
 
+    // A radio needs electricity. Without these an aircraft sitting cold and
+    // dark would still be transmitting, which is the one thing every pilot
+    // notices immediately.
+    g_ref.avionicsOn = findRef("sim/cockpit2/switches/avionics_power_on");
+    g_ref.com1Power  = findRef("sim/cockpit2/radios/actuators/com1_power");
+    g_ref.com2Power  = findRef("sim/cockpit2/radios/actuators/com2_power");
+    g_ref.busVolts   = findRef("sim/cockpit2/electrical/bus_volts");
+
     g_ref.ltNav     = findRef("sim/cockpit2/switches/navigation_lights_on");
     g_ref.ltBeacon  = findRef("sim/cockpit2/switches/beacon_on");
     g_ref.ltStrobe  = findRef("sim/cockpit2/switches/strobe_lights_on");
@@ -177,6 +186,33 @@ void findRefs() {
 float  fd(XPLMDataRef r) { return r ? XPLMGetDataf(r) : 0.f; }
 double dd(XPLMDataRef r) { return r ? XPLMGetDatad(r) : 0.0; }
 int    id(XPLMDataRef r) { return r ? XPLMGetDatai(r) : 0; }
+
+// Highest voltage on any electrical bus. An aircraft sitting cold and dark
+// reads zero everywhere; one with the master on reads its bus voltage.
+float busVolts() {
+    if (!g_ref.busVolts) return 0.f;
+    float v[8] = {0.f};
+    const int n = XPLMGetDatavf(g_ref.busVolts, v, 0, 8);
+    float best = 0.f;
+    for (int i = 0; i < n && i < 8; ++i) if (v[i] > best) best = v[i];
+    return best;
+}
+
+// Can this COM actually transmit and receive? A radio needs the avionics
+// bus, its own power switch, and volts behind them -- the same three things
+// a pilot checks when the radio is dead. An aircraft that models none of
+// this (no datarefs at all) is treated as powered, so an odd add-on does
+// not go silent.
+bool comPowered(int which) {
+    if (!g_ref.avionicsOn && !g_ref.com1Power && !g_ref.busVolts) return true;
+    if (g_ref.avionicsOn && !id(g_ref.avionicsOn)) return false;
+    if (g_ref.busVolts && busVolts() < 8.f) return false;
+    XPLMDataRef sw = (which == 2) ? g_ref.com2Power : g_ref.com1Power;
+    if (sw && !id(sw)) return false;
+    return true;
+}
+
+bool anyComPowered() { return comPowered(1) || comPowered(2); }
 
 // A byte-array dataref as a trimmed string.
 std::string sd(XPLMDataRef r, int maxLen) {
@@ -257,6 +293,8 @@ int g_rejected = 0;   // traffic entries dropped as implausible
 // Defined with the hosting code further down; the main window needs it.
 std::string shareAddress();
 void reconnect();
+void setPtt(bool down);
+float g_lastWeatherSend = -1000.f;   // see sendWeather()
 void handleWeather(const uint8_t* payload, int len);
 double distanceNm(double lat1, double lon1, double lat2, double lon2);
 
@@ -355,8 +393,10 @@ void sendPosition() {
     p.gsMs        = fd(g_ref.gs);
     p.gearRatio   = firstOfArray(g_ref.gear);
     p.flapRatio   = fd(g_ref.flap);
-    p.com1Khz     = (uint32_t)id(g_ref.com1);
-    p.com2Khz     = (uint32_t)id(g_ref.com2);
+    // A dead radio is on no frequency at all, so the server does not route
+    // anyone's voice to us and other pilots do not see us listening.
+    p.com1Khz     = comPowered(1) ? (uint32_t)id(g_ref.com1) : 0u;
+    p.com2Khz     = comPowered(2) ? (uint32_t)id(g_ref.com2) : 0u;
     p.onGround    = id(g_ref.onGround) ? 1 : 0;
 
     uint8_t lights = 0;
@@ -371,12 +411,16 @@ void sendPosition() {
     const int sel = id(g_ref.audioComSel);
     uint8_t tx = xr::TX_NONE;
     if (g_pttDown) tx = (sel == 7) ? xr::TX_COM2 : xr::TX_COM1;
+    if (tx == xr::TX_COM1 && !comPowered(1)) tx = xr::TX_NONE;
+    if (tx == xr::TX_COM2 && !comPowered(2)) tx = xr::TX_NONE;
     p.txRadio = tx;
 
     uint8_t rx = 0;
     if (id(g_ref.rxCom1)) rx |= xr::RX_COM1;
     if (id(g_ref.rxCom2)) rx |= xr::RX_COM2;
     if (rx == 0) rx = xr::RX_COM1;        // some aircraft do not wire the audio panel
+    if (!comPowered(1)) rx &= (uint8_t)~xr::RX_COM1;
+    if (!comPowered(2)) rx &= (uint8_t)~xr::RX_COM2;
     p.rxMask = rx;
 
     p.timeMs    = nowMs();
@@ -466,6 +510,11 @@ void handleTraffic(const uint8_t* payload, int len) {
         const std::string cs = sanitizeText(e.callsign, sizeof(e.callsign));
         const std::string ic = sanitizeText(e.acIcao, sizeof(e.acIcao));
         const std::string lv = sanitizeText(e.livery, sizeof(e.livery));
+
+        // A pilot who just joined should not spend up to ten seconds in
+        // their own weather before the host's arrives.
+        if (g_remote.find(e.sessionId) == g_remote.end())
+            g_lastWeatherSend = -1000.f;
 
         Remote& r   = g_remote[e.sessionId];
         r.sid       = e.sessionId;
@@ -708,8 +757,8 @@ void pumpNetwork() {
 }
 
 // The sky we are hosting, for everyone who is following. Sent on a slow
-// clock: weather changes over minutes, and the packet is 452 bytes.
-float g_lastWeatherSend = -1000.f;
+// clock: weather changes over minutes, and the packet is 452 bytes -- but
+// straight away when someone joins, see handleTraffic.
 static const float kWeatherIntervalS = 10.f;
 
 void sendWeather() {
@@ -774,8 +823,15 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
     // The audio panel's volume knobs, so turning a radio down in the cockpit
     // turns it down in the headset. A missing dataref reads 0, which would
     // mute everything, so an absent knob counts as fully up.
-    xr::voice::setRadioVolumes((uint32_t)id(g_ref.com1), g_ref.volCom1 ? fd(g_ref.volCom1) : 1.f,
-                               (uint32_t)id(g_ref.com2), g_ref.volCom2 ? fd(g_ref.volCom2) : 1.f);
+    // A radio with no power is silent in both directions: zero volume here
+    // stops anything already in the mixer, and the position packet has
+    // already told the server we are not listening.
+    xr::voice::setRadioVolumes(
+        (uint32_t)id(g_ref.com1), comPowered(1) ? (g_ref.volCom1 ? fd(g_ref.volCom1) : 1.f) : 0.f,
+        (uint32_t)id(g_ref.com2), comPowered(2) ? (g_ref.volCom2 ? fd(g_ref.volCom2) : 1.f) : 0.f);
+
+    // Switching the avionics off mid-transmission has to unkey us.
+    if (g_pttDown && !anyComPowered()) setPtt(false);
 
     if (!g_connected) {
         // Retry until acked -- slowly once the server has said no, since the
@@ -829,6 +885,9 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
 // PTT command
 // ---------------------------------------------------------------------------
 void setPtt(bool down) {
+    // Keying a radio that has no power should do nothing at all -- no
+    // sidetone, no carrier for anyone else, no [TX] on our aircraft.
+    if (down && !anyComPowered()) return;
     if (down == g_pttDown) return;
     g_pttDown = down;
     xr::voice::setTransmitting(g_pttDown);
@@ -868,6 +927,32 @@ double distanceNm(double lat1, double lon1, double lat2, double lon2) {
     return 2 * R * asin(std::min(1.0, sqrt(a)));
 }
 
+// X-Plane lets the pilot drag this window down to 320 px wide. A line that
+// does not fit has to be cut here: XPLMDrawString happily paints past the
+// window's edge and over the cockpit, which looks like a broken plugin.
+void drawFit(float* col, int x, int y, int right, const std::string& text,
+             XPLMFontID font) {
+    const int avail = right - x - 8;
+    if (avail <= 0) return;
+    if (XPLMMeasureString(font, text.c_str(), (int)text.size()) <= (float)avail) {
+        XPLMDrawString(col, x, y, (char*)text.c_str(), nullptr, font);
+        return;
+    }
+    // Trim from a proportional first guess rather than one character at a
+    // time: a traffic list of twenty aircraft redraws every frame.
+    std::string t = text;
+    const float per = XPLMMeasureString(font, t.c_str(), (int)t.size()) / (float)t.size();
+    size_t keep = (size_t)((float)avail / (per > 0.f ? per : 7.f));
+    if (keep > t.size()) keep = t.size();
+    t.resize(keep);
+    while (!t.empty() &&
+           XPLMMeasureString(font, (t + "..").c_str(), (int)t.size() + 2) > (float)avail) {
+        t.pop_back();
+    }
+    t += "..";
+    XPLMDrawString(col, x, y, (char*)t.c_str(), nullptr, font);
+}
+
 void drawWindow(XPLMWindowID win, void*) {
     int l, t, r, b;
     XPLMGetWindowGeometry(win, &l, &t, &r, &b);
@@ -881,15 +966,14 @@ void drawWindow(XPLMWindowID win, void*) {
 
     y -= xr::brand::draw(x, y, true);              // the mark is the first row
 
-    XPLMDrawString(g_connected ? green : amber, x, y, (char*)g_status.c_str(),
-                   nullptr, xplmFont_Proportional);
+    drawFit(g_connected ? green : amber, x, y, r, g_status, xplmFont_Proportional);
     y -= 16;
     char who[200];
-    snprintf(who, sizeof(who), "%s as %s (%s%s%s)   Plugins > XRadio > Settings to change",
+    snprintf(who, sizeof(who), "%s as %s (%s%s%s)  ·  Plugins > XRadio > Settings",
              g_sock.endpoint().empty() ? "no server" : g_sock.endpoint().c_str(),
              g_cfg.callsign.c_str(), effectiveIcao().c_str(),
              effectiveLivery().empty() ? "" : " ", effectiveLivery().c_str());
-    XPLMDrawString(white, x, y, who, nullptr, xplmFont_Basic);
+    drawFit(white, x, y, r, who, xplmFont_Basic);
     y -= 16;
 
     if (xr::relay::running()) {
@@ -898,16 +982,18 @@ void drawWindow(XPLMWindowID win, void*) {
         snprintf(hostLine, sizeof(hostLine),
                  "Hosting  ·  %d connected  ·  friends type %s",
                  st.clients, shareAddress().c_str());
-        XPLMDrawString(green, x, y, hostLine, nullptr, xplmFont_Basic);
+        drawFit(green, x, y, r, hostLine, xplmFont_Basic);
         y -= 16;
     }
     y -= 2;
 
-    char hdr[128];
-    snprintf(hdr, sizeof(hdr), "COM1 %.3f   COM2 %.3f   %s",
-             id(g_ref.com1) / 1000.0, id(g_ref.com2) / 1000.0,
+    char hdr[160];
+    const bool p1 = comPowered(1), p2 = comPowered(2);
+    snprintf(hdr, sizeof(hdr), "COM1 %.3f%s   COM2 %.3f%s   %s",
+             id(g_ref.com1) / 1000.0, p1 ? "" : " (no power)",
+             id(g_ref.com2) / 1000.0, p2 ? "" : " (no power)",
              g_pttDown ? "** TX **" : "");
-    XPLMDrawString(g_pttDown ? green : white, x, y, hdr, nullptr, xplmFont_Proportional);
+    drawFit(g_pttDown ? green : white, x, y, r, hdr, xplmFont_Proportional);
     y -= 16;
 
     // Voice: device status, a mic meter while keyed, and who we are hearing.
@@ -933,8 +1019,8 @@ void drawWindow(XPLMWindowID win, void*) {
             }
         }
         const bool ok = xr::voice::available() && xr::voice::haveMicrophone();
-        XPLMDrawString(!rx.empty() ? green : (ok ? white : amber), x, y,
-                       (char*)line.c_str(), nullptr, xplmFont_Basic);
+        drawFit(!rx.empty() ? green : (ok ? white : amber), x, y, r, line,
+                xplmFont_Basic);
     }
     y -= 22;
 
@@ -949,7 +1035,7 @@ void drawWindow(XPLMWindowID win, void*) {
         snprintf(title, sizeof(title), "Traffic (%d)  ·  no 3D models%s",
                  (int)g_remote.size(), g_rejected ? "  · bad data rejected" : "");
     }
-    XPLMDrawString(white, x, y, title, nullptr, xplmFont_Proportional);
+    drawFit(white, x, y, r, title, xplmFont_Proportional);
     y -= 16;
 
     const double myLat = dd(g_ref.lat), myLon = dd(g_ref.lon);
@@ -961,18 +1047,18 @@ void drawWindow(XPLMWindowID win, void*) {
                  rm.callsign.c_str(), rm.acIcao.c_str(), rm.altMslM * 3.28084f,
                  distanceNm(myLat, myLon, rm.lat, rm.lon), rm.gsMs * 1.94384f,
                  rm.txActive ? "<<TX" : "");
-        XPLMDrawString(rm.txActive ? green : white, x, y, line, nullptr, xplmFont_Basic);
+        drawFit(rm.txActive ? green : white, x, y, r, line, xplmFont_Basic);
         y -= 14;
     }
 
     y -= 8;
-    XPLMDrawString(white, x, y, (char*)"Radio", nullptr, xplmFont_Proportional);
+    drawFit(white, x, y, r, "Radio", xplmFont_Proportional);
     y -= 16;
     // Newest messages win the space; the input row at the bottom is reserved.
     const int inputY = b + 12;
     for (auto& msg : g_chatLog) {
         if (y < inputY + 22) break;
-        XPLMDrawString(white, x, y, (char*)msg.c_str(), nullptr, xplmFont_Basic);
+        drawFit(white, x, y, r, msg, xplmFont_Basic);
         y -= 14;
     }
 
@@ -987,8 +1073,8 @@ void drawWindow(XPLMWindowID win, void*) {
     } else {
         snprintf(prompt, sizeof(prompt), "Say:   (click here to type, Enter to send)");
     }
-    XPLMDrawString(g_chatFocus ? green : (g_chatInput.empty() ? amber : white), x, inputY,
-                   prompt, nullptr, xplmFont_Basic);
+    drawFit(g_chatFocus ? green : (g_chatInput.empty() ? amber : white), x, inputY, r,
+            prompt, xplmFont_Basic);
 }
 
 // Clicking the "Say:" row takes the keyboard; clicking anywhere else in the
@@ -1086,7 +1172,7 @@ void safeWindowRect(int wantW, int wantH, int offsetX,
 
 void createWindow() {
     int wl, wt, wr, wb;
-    safeWindowRect(460, 400, 0, &wl, &wt, &wr, &wb);
+    safeWindowRect(520, 400, 0, &wl, &wt, &wr, &wb);
 
     XPLMCreateWindow_t p{};
     p.structSize            = sizeof(p);
