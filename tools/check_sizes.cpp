@@ -13,5 +13,6 @@ int main() {
     printf("TRAFFIC_ENTRY %zu\n", sizeof(xr::TrafficEntry));
     printf("TEXT_HDR %zu\n",      sizeof(xr::TextHeader));
     printf("VOICE_HDR %zu\n",     sizeof(xr::VoiceHeader));
+    printf("WEATHER %zu\n",       sizeof(xr::WeatherPayload));
     return 0;
 }

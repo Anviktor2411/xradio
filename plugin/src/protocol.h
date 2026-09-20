@@ -24,7 +24,11 @@ enum PacketType : uint8_t {
     PT_PONG      = 8,  // server -> client
     PT_LOGOUT    = 9,  // client -> server
     PT_LOGIN_REJECT = 10,  // server -> client: why the login was refused
+    PT_WEATHER   = 11,  // weather source -> server -> everyone else
 };
+
+// LoginPayload.flags
+static const uint16_t LF_WEATHER_SOURCE = 1 << 0;  // "my weather and time are the flight's"
 
 // LoginRejectPayload.reason
 enum RejectReason : uint16_t {
@@ -60,7 +64,7 @@ struct LoginPayload {        // 76 bytes
     char     callsign[16];   // null-padded, e.g. "ESNA12"
     char     acIcao[8];      // ICAO type code, e.g. "C172"
     uint16_t protoVer;
-    uint16_t reserved;
+    uint16_t flags;          // LF_* bits; was reserved, so old builds send 0
     // v3
     char     livery[16];     // the aircraft's livery folder name, for CSL matching
     char     password[32];   // the flight password; empty if the server has none
@@ -134,6 +138,37 @@ struct TextHeader {          // 26 bytes, followed by `textLen` UTF-8 bytes
     uint32_t fromSession;
     char     from[16];
     uint16_t textLen;
+};
+
+// The flight's shared sky: what the host's sim reports, applied by everyone
+// who is following. The layer counts are X-Plane 12's own -- three cloud
+// layers and thirteen altitude levels -- so this is the region weather whole,
+// not an approximation of it.
+static const int kCloudLayers = 3;
+static const int kAirLayers   = 13;
+
+struct WeatherPayload {      // 452 bytes
+    uint32_t timeMs;         // sender's clock, so a late packet can be ignored
+    float    zuluTimeSec;    // sim/time/zulu_time_sec
+    int32_t  dateDays;       // sim/time/local_date_days
+    float    visibilitySm;
+    float    seaLevelPressurePa;
+    float    seaLevelTempC;
+    float    rainPercent;
+    float    snowCover;
+    float    thermalRateMs;
+    int32_t  changeMode;     // 0..7, how the weather is trending
+    float    cloudType[kCloudLayers];
+    float    cloudCoverage[kCloudLayers];
+    float    cloudBaseM[kCloudLayers];
+    float    cloudTopsM[kCloudLayers];
+    float    windAltM[kAirLayers];
+    float    windSpeedMs[kAirLayers];
+    float    windDirDeg[kAirLayers];
+    float    turbulence[kAirLayers];
+    float    tempAltM[kAirLayers];
+    float    tempAloftC[kAirLayers];
+    float    dewpointC[kAirLayers];
 };
 
 struct VoiceHeader {         // 12 bytes, followed by `opusLen` bytes of Opus

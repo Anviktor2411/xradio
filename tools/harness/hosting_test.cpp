@@ -86,13 +86,15 @@ public:
     }
     ~Peer() { if (fd_ >= 0) CLOSESOCK(fd_); }
 
-    bool login(const char* password = "", const char* livery = "Ryanair") {
+    bool login(const char* password = "", const char* livery = "Ryanair",
+               bool weatherSource = false) {
         xr::LoginPayload lp{};
         snprintf(lp.callsign, sizeof(lp.callsign), "%s", callsign_.c_str());
         snprintf(lp.acIcao, sizeof(lp.acIcao), "%s", "B738");
         snprintf(lp.livery, sizeof(lp.livery), "%s", livery);
         snprintf(lp.password, sizeof(lp.password), "%s", password);
         lp.protoVer = xr::kProtoVersion;
+        lp.flags = weatherSource ? xr::LF_WEATHER_SOURCE : 0;
         rejected_ = 0;
         send(xr::PT_LOGIN, 0, &lp, sizeof(lp));
 
@@ -152,6 +154,7 @@ public:
         std::vector<std::string> sawCallsigns;
         std::vector<std::string> sawTypes;      // "B738/Ryanair" per entry
         std::vector<std::string> texts;
+        std::vector<xr::WeatherPayload> weather;
     };
     Bag drain(int ms) {
         Bag bag;
@@ -181,6 +184,12 @@ public:
                     memcpy(lv, e.livery, 16);
                     bag.sawTypes.push_back(std::string(ty) + "/" + lv);
                 }
+            } else if (h.type == xr::PT_WEATHER) {
+                if (n >= (int)(sizeof(h) + sizeof(xr::WeatherPayload))) {
+                    xr::WeatherPayload w{};
+                    memcpy(&w, buf + sizeof(h), sizeof(w));
+                    bag.weather.push_back(w);
+                }
             } else if (h.type == xr::PT_TEXT) {
                 xr::TextHeader th{};
                 memcpy(&th, buf + sizeof(h), sizeof(th));
@@ -192,6 +201,10 @@ public:
             }
         }
         return bag;
+    }
+
+    void weather(const xr::WeatherPayload& w) {
+        send(xr::PT_WEATHER, sid_, &w, (int)sizeof(w));
     }
 
     uint32_t sid() const { return sid_; }
@@ -406,6 +419,167 @@ int main(int argc, char** argv) {
         check("it does not claim the router opened anything",
               !shows(v, "Router opened"));
         if (failures) dump(v);
+    }
+
+    printf("\nthe host's sky reaches everyone else\n");
+    {
+        // The whole point: one pilot breaking out of cloud at 600 ft while
+        // another is in sunshine is worse than no weather sharing at all.
+        // Set a distinctive sky on the host's sim and see it arrive intact.
+        harness::set("sim/time/zulu_time_sec", 43200.f);        // 12:00Z
+        harness::set("sim/time/local_date_days", 180);
+        harness::set("sim/weather/region/sealevel_pressure_pas", 99400.f);
+        harness::set("sim/weather/region/sealevel_temperature_c", 7.f);
+        harness::set("sim/weather/region/visibility_reported_sm", 4.5f);
+        harness::set("sim/weather/region/rain_percent", 0.6f);
+        harness::setArray("sim/weather/region/cloud_base_msl_m", {180.f, 2400.f, 0.f});
+        harness::setArray("sim/weather/region/cloud_coverage_percent", {0.9f, 0.4f, 0.f});
+        harness::setArray("sim/weather/region/wind_speed_msc",
+                          {8.f, 12.f, 18.f, 25.f, 31.f, 38.f, 44.f, 50.f, 55.f, 58.f, 60.f, 52.f, 40.f});
+        harness::setArray("sim/weather/region/wind_direction_degt",
+                          {210.f, 215.f, 220.f, 228.f, 235.f, 240.f, 245.f, 250.f, 255.f, 258.f, 260.f, 262.f, 265.f});
+
+        Peer sky("SKY001", 57.856, 27.026);
+        check("a pilot joins the hosted flight", sky.login());
+        // The host sends weather on a 10 s clock; it also sends one on the
+        // first tick after login, so a short wait is enough.
+        Peer::Bag bag;
+        for (int i = 0; i < 24 && bag.weather.empty(); ++i) {
+            fly(0.4);
+            auto got = sky.drain(200);
+            if (!got.weather.empty()) bag = got;
+        }
+        check("the host's weather arrives", !bag.weather.empty());
+        if (!bag.weather.empty()) {
+            const xr::WeatherPayload& w = bag.weather.front();
+            check("at the right time of day", std::fabs(w.zuluTimeSec - 43200.f) < 1.f,
+                  std::to_string(w.zuluTimeSec));
+            check("on the right date", w.dateDays == 180, std::to_string(w.dateDays));
+            check("with the host's pressure",
+                  std::fabs(w.seaLevelPressurePa - 99400.f) < 1.f,
+                  std::to_string(w.seaLevelPressurePa));
+            check("and visibility", std::fabs(w.visibilitySm - 4.5f) < 0.01f);
+            check("the overcast layer's base comes through",
+                  std::fabs(w.cloudBaseM[0] - 180.f) < 0.5f &&
+                  std::fabs(w.cloudCoverage[0] - 0.9f) < 0.01f);
+            check("the second cloud layer too",
+                  std::fabs(w.cloudBaseM[1] - 2400.f) < 0.5f);
+            check("all thirteen wind layers, not just the surface",
+                  std::fabs(w.windSpeedMs[0] - 8.f) < 0.01f &&
+                  std::fabs(w.windSpeedMs[6] - 44.f) < 0.01f &&
+                  std::fabs(w.windSpeedMs[12] - 40.f) < 0.01f,
+                  std::to_string(w.windSpeedMs[12]));
+            check("winds aloft keep their direction",
+                  std::fabs(w.windDirDeg[12] - 265.f) < 0.01f);
+        }
+    }
+
+    printf("\nand a sky shared by someone else is flown in\n");
+    {
+        // The other direction, as a pilot who is not the authority: untick
+        // "share", so the claim passes to whoever does want it, and the
+        // weather they send has to land in this sim's own datarefs.
+        harness::menu(1);
+        drawSettings();
+        int tx = 0, ty = 0, top = 0, left = 0;
+        harness::windowTop(kWin, &top, &left);
+        harness::drawnAt("Hosting", &tx, &ty);
+        harness::click(kWin, tx + 10, ty);
+        drawSettings();
+        int lx = 0, ly = 0;
+        check("there is a share toggle", harness::drawnAt("Share my weather", &lx, &ly));
+        harness::click(kWin, left + xr::ui::Ctx::kValueX + 10, ly);
+        drawSettings();
+        int bx = 0, by = 0;
+        harness::drawnAt("Save & apply", &bx, &by);
+        harness::click(kWin, bx + 20, by);
+        drawSettings();
+        fly(1.5);                       // reconnects without the claim
+        {
+            xr::Settings saved;
+            xr::loadSettings(saved, kCfgPath);
+            check("sharing is off in the saved settings", !saved.shareWeather);
+            check("following is still on", saved.followWeather);
+        }
+
+        harness::set("sim/weather/region/sealevel_pressure_pas", 101325.f);
+        harness::set("sim/weather/region/visibility_reported_sm", 10.f);
+        harness::set("sim/time/zulu_time_sec", 3600.f);           // 01:00Z
+
+        xr::WeatherPayload w{};
+        w.zuluTimeSec = 75600.f;                                  // 21:00Z
+        w.dateDays = 200;
+        w.seaLevelPressurePa = 98700.f;
+        w.visibilitySm = 1.25f;
+        w.seaLevelTempC = -3.f;
+        w.cloudBaseM[0] = 120.f;
+        w.cloudCoverage[0] = 1.f;
+        for (int i = 0; i < xr::kAirLayers; ++i) {
+            w.windSpeedMs[i] = 5.f + (float)i;
+            w.windDirDeg[i]  = 90.f + (float)i;
+            w.turbulence[i]  = 0.2f;
+        }
+
+        Peer boss("SKY002", 57.857, 27.027);
+        check("the pilot sharing their sky joins", boss.login("", "Ryanair", true));
+        boss.weather(w);
+        fly(1.0);
+
+        check("the clock moved to their time",
+              std::fabs(harness::get("sim/time/zulu_time_sec") - 75600.0) < 1.0,
+              std::to_string(harness::get("sim/time/zulu_time_sec")));
+        check("the pressure followed",
+              std::fabs(harness::get("sim/weather/region/sealevel_pressure_pas") - 98700.0) < 1.0,
+              std::to_string(harness::get("sim/weather/region/sealevel_pressure_pas")));
+        check("so did the visibility",
+              std::fabs(harness::get("sim/weather/region/visibility_reported_sm") - 1.25) < 0.01);
+        const auto& winds = harness::getArray("sim/weather/region/wind_speed_msc");
+        check("every wind layer was written",
+              winds.size() == (size_t)xr::kAirLayers && std::fabs(winds[12] - 17.f) < 0.01f,
+              winds.empty() ? "none" : std::to_string(winds.size()) + " layers");
+        check("X-Plane was told to apply it now, not in a minute",
+              harness::get("sim/weather/region/update_immediately") == 1.0);
+
+        // Small differences are left alone. Writing zulu time on every
+        // packet would fight the sim's own clock, which a pilot sees as the
+        // sun twitching; only a real drift is worth a correction.
+        harness::set("sim/time/zulu_time_sec", 75600.f);
+        w.zuluTimeSec = 75605.f;                 // five seconds out
+        boss.weather(w);
+        fly(0.8);
+        check("a five-second difference is not worth snapping the clock",
+              std::fabs(harness::get("sim/time/zulu_time_sec") - 75600.0) < 0.5,
+              std::to_string(harness::get("sim/time/zulu_time_sec")));
+
+        w.zuluTimeSec = 79200.f;                 // an hour out
+        boss.weather(w);
+        fly(0.8);
+        check("an hour out is",
+              std::fabs(harness::get("sim/time/zulu_time_sec") - 79200.0) < 1.0,
+              std::to_string(harness::get("sim/time/zulu_time_sec")));
+
+        // A pilot who wants their own weather keeps it.
+        harness::menu(1);
+        drawSettings();
+        harness::drawnAt("Traffic", &tx, &ty);
+        harness::click(kWin, tx + 10, ty);
+        drawSettings();
+        check("there is a follow toggle", harness::drawnAt("Follow the host", &lx, &ly));
+        harness::click(kWin, left + xr::ui::Ctx::kValueX + 10, ly);
+        drawSettings();
+        harness::drawnAt("Save & apply", &bx, &by);
+        harness::click(kWin, bx + 20, by);
+        drawSettings();
+        fly(1.5);
+
+        harness::set("sim/weather/region/sealevel_pressure_pas", 101325.f);
+        w.seaLevelPressurePa = 95000.f;
+        boss.login("", "Ryanair", true);
+        boss.weather(w);
+        fly(1.0);
+        check("with following off, our own weather is left alone",
+              std::fabs(harness::get("sim/weather/region/sealevel_pressure_pas") - 101325.0) < 1.0,
+              std::to_string(harness::get("sim/weather/region/sealevel_pressure_pas")));
     }
 
     printf("\nchanging the callsign leaves no ghost behind\n");

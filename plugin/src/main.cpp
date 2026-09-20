@@ -17,6 +17,7 @@
 #include "smoothing.h"
 #include "ui.h"
 #include "voice.h"
+#include "weather.h"
 #include "xpmp_bridge.h"
 
 #include "XPLMDataAccess.h"
@@ -256,6 +257,7 @@ int g_rejected = 0;   // traffic entries dropped as implausible
 // Defined with the hosting code further down; the main window needs it.
 std::string shareAddress();
 void reconnect();
+void handleWeather(const uint8_t* payload, int len);
 double distanceNm(double lat1, double lon1, double lat2, double lon2);
 
 // How well another pilot's radio reaches us, from distance against the VHF
@@ -332,6 +334,9 @@ void sendLogin() {
     strncpy(p.livery,   g_loginLivery.c_str(),  sizeof(p.livery)   - 1);
     strncpy(p.password, g_cfg.password.c_str(), sizeof(p.password) - 1);
     p.protoVer = xr::kProtoVersion;
+    // Hosting is what makes a pilot the authority on the sky: their machine
+    // is the one everyone else joined. The server takes the first claim.
+    p.flags = (xr::relay::running() && g_cfg.shareWeather) ? xr::LF_WEATHER_SOURCE : 0;
     memcpy(buf + off, &p, sizeof(p));
     g_sock.send(buf, off + (int)sizeof(p));
     g_lastLogin = g_elapsed;
@@ -695,10 +700,34 @@ void pumpNetwork() {
             }
             case xr::PT_TRAFFIC: handleTraffic(payload, h.payloadLen); break;
             case xr::PT_TEXT:    handleText(payload, h.payloadLen);    break;
+            case xr::PT_WEATHER: handleWeather(payload, h.payloadLen); break;
             case xr::PT_PONG:    break;
             default:             break;
         }
     }
+}
+
+// The sky we are hosting, for everyone who is following. Sent on a slow
+// clock: weather changes over minutes, and the packet is 452 bytes.
+float g_lastWeatherSend = -1000.f;
+static const float kWeatherIntervalS = 10.f;
+
+void sendWeather() {
+    xr::WeatherPayload w{};
+    if (!xr::weather::read(w)) return;
+    w.timeMs = (uint32_t)(g_elapsed * 1000.f);
+    uint8_t buf[sizeof(xr::Header) + sizeof(w)];
+    int off = writeHeader(buf, xr::PT_WEATHER, (uint16_t)sizeof(w));
+    memcpy(buf + off, &w, sizeof(w));
+    g_sock.send(buf, off + (int)sizeof(w));
+}
+
+void handleWeather(const uint8_t* payload, int len) {
+    if (len != (int)sizeof(xr::WeatherPayload)) return;
+    if (!g_cfg.followWeather) return;
+    xr::WeatherPayload w{};
+    memcpy(&w, payload, sizeof(w));
+    xr::weather::apply(w);
 }
 
 // ---------------------------------------------------------------------------
@@ -770,6 +799,12 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
             reconnect();
             return -1.0f;
         }
+    }
+
+    if (g_connected && xr::relay::running() && g_cfg.shareWeather &&
+        g_elapsed - g_lastWeatherSend >= kWeatherIntervalS) {
+        g_lastWeatherSend = g_elapsed;
+        sendWeather();
     }
 
     // the server drops us after 15 s of silence, so position doubles as keepalive
@@ -1252,7 +1287,12 @@ void applySettings() {
                             (g_edit.acIcao != g_cfg.acIcao) ||
                             (g_edit.password != g_cfg.password) ||
                             (g_edit.hostEnabled != g_cfg.hostEnabled) ||
-                            (g_edit.hostPort != g_cfg.hostPort);
+                            (g_edit.hostPort != g_cfg.hostPort) ||
+                            // Who owns the sky is claimed at login, so
+                            // changing our mind means logging in again --
+                            // otherwise the setting appears to do nothing
+                            // until the next flight.
+                            (g_edit.shareWeather != g_cfg.shareWeather);
     const bool hostChanged = (g_edit.hostEnabled != g_cfg.hostEnabled) ||
                              (g_edit.hostPort != g_cfg.hostPort) ||
                              (g_edit.password != g_cfg.password) ||
@@ -1576,6 +1616,7 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
 
     loadConfig();
     findRefs();
+    xr::weather::init();
     createWindow();
     createSettingsWindow();
 

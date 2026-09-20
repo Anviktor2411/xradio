@@ -14,6 +14,8 @@ void   set(const std::string& dataref, double value);
 double get(const std::string& dataref);
 void   setString(const std::string& dataref, const std::string& value);   // byte-array refs
 std::string getString(const std::string& dataref);
+void   setArray(const std::string& dataref, const std::vector<float>& values);  // float[n] refs
+const std::vector<float>& getArray(const std::string& dataref);
 
 void tick(float dt);                      // run one flight-loop callback
 std::vector<std::string> draw();          // run the window draw, capture its text

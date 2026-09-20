@@ -29,7 +29,8 @@ sys.path.insert(0, str(ROOT / "server"))
 import protocol as P          # noqa: E402
 
 TYPES = [P.PT_LOGIN, P.PT_LOGIN_ACK, P.PT_POSITION, P.PT_TRAFFIC, P.PT_TEXT,
-         P.PT_VOICE, P.PT_PING, P.PT_PONG, P.PT_LOGOUT, 0, 10, 99, 255]
+         P.PT_VOICE, P.PT_PING, P.PT_PONG, P.PT_LOGOUT, P.PT_WEATHER,
+         0, 10, 99, 255]
 
 WILD_FLOATS = [float("nan"), float("inf"), float("-inf"), 0.0, -0.0,
                1e308, -1e308, 1e-308, 3.4e38, -3.4e38]

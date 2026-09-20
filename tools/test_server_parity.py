@@ -117,7 +117,8 @@ class Client:
 
     def drain(self, seconds):
         """Collect everything that arrives, grouped by packet type."""
-        out = {P.PT_TRAFFIC: [], P.PT_TEXT: [], P.PT_VOICE: [], P.PT_PONG: []}
+        out = {P.PT_TRAFFIC: [], P.PT_TEXT: [], P.PT_VOICE: [], P.PT_PONG: [],
+               P.PT_WEATHER: []}
         end = time.time() + seconds
         while time.time() < end:
             self.sock.settimeout(max(0.01, end - time.time()))
@@ -141,6 +142,27 @@ def norm(callsign):
     many clients logged in earlier. Fold it away so the comparison is about
     behaviour, not ordering."""
     return "UNK*" if re.fullmatch(r"UNK\d+", callsign) else callsign
+
+
+def wait_traffic(c, settle=0.3, cap=3.0, want=None):
+    """Traffic packets, waited for rather than sampled.
+
+    The servers broadcast on their own clock (10 Hz), so a fixed window can
+    miss a cycle, or catch only one sent before the aircraft's first position
+    was processed -- and then the two transcripts differ for no reason but
+    timing, which is exactly what this test must not report as a difference.
+    `want` is a callsign prefix that has to appear before we stop waiting;
+    without it, the first packet of any kind is enough. Either way the window
+    then stays open for `settle` to catch the rest of the cycle, and a wait
+    that times out returns what the fixed window would have: nothing."""
+    packets = []
+    end = time.time() + cap
+    while time.time() < end:
+        packets += c.drain(0.25)[P.PT_TRAFFIC]
+        if traffic_set(packets, (want,)) if want else packets:
+            break
+    packets += c.drain(settle)[P.PT_TRAFFIC]
+    return packets
 
 
 def traffic_set(packets, keep=None):
@@ -229,7 +251,7 @@ def scenario_login_and_traffic(port):
         a.position(); b.position(); far.position()
         time.sleep(0.12)
     mine = ("ESNA12", "ESNB34", "ESFAR1")
-    out["a_sees"] = traffic_set(a.drain(0.4)[P.PT_TRAFFIC], mine)
+    out["a_sees"] = traffic_set(wait_traffic(a, want="ESNB34"), mine)
     out["far_sees"] = traffic_set(far.drain(0.4)[P.PT_TRAFFIC], mine)
     for c in (a, b, far):
         c.close()
@@ -251,9 +273,9 @@ def scenario_bad_login(port):
         time.sleep(0.12)
     mine = ("BADCS", "UNK*", "WATCH1")
     out["callsigns_seen"] = [t[0] for t in
-                             traffic_set(peer.drain(0.4)[P.PT_TRAFFIC], mine)]
+                             traffic_set(wait_traffic(peer, want="WATCH1"), mine)]
     out["ac_types_seen"] = sorted({t[1] for t in
-                                   traffic_set(peer.drain(0.3)[P.PT_TRAFFIC], mine)})
+                                   traffic_set(wait_traffic(peer, want="WATCH1"), mine)})
     for c in (v1, ctl, empty, peer):
         c.close()
     return out
@@ -295,7 +317,7 @@ def scenario_position_validation(port):
     for _ in range(3):
         b.position()
         time.sleep(0.12)
-    out = {"b_sees": traffic_set(b.drain(0.4)[P.PT_TRAFFIC], ("ESVAL1",))}
+    out = {"b_sees": traffic_set(wait_traffic(b, want="ESVAL1"), ("ESVAL1",))}
     a.close(); b.close()
     return out
 
@@ -345,7 +367,7 @@ def scenario_voice_routing(port):
         a.voice(seq=100 + i, freq=FREQ)
         b.position(tx=P.TX_NONE)
         time.sleep(0.05)
-    out["tx_flags"] = tx_flags(b.drain(0.3)[P.PT_TRAFFIC], ("ESVC",))
+    out["tx_flags"] = tx_flags(wait_traffic(b, want="ESVC"), ("ESVC",))
     for c in (a, b, off):
         c.close()
     return out
@@ -379,13 +401,13 @@ def scenario_logout(port):
     a.login(); b.login()
     a.position(); b.position()
     time.sleep(0.25)
-    before = traffic_set(b.drain(0.3)[P.PT_TRAFFIC], ("ESOUT",))
+    before = traffic_set(wait_traffic(b, want="ESOUT1"), ("ESOUT",))
     a.send(P.PT_LOGOUT)
     time.sleep(0.25)
     for _ in range(2):
         b.position()
         time.sleep(0.12)
-    after = traffic_set(b.drain(0.3)[P.PT_TRAFFIC], ("ESOUT",))
+    after = traffic_set(wait_traffic(b), ("ESOUT",))
     a.close(); b.close()
     return {"before": [t[0] for t in before], "after": [t[0] for t in after]}
 
@@ -415,7 +437,7 @@ def scenario_garbage(port):
     for _ in range(3):
         a.position(); b.position()
         time.sleep(0.12)
-    out = {"still_working": traffic_set(b.drain(0.4)[P.PT_TRAFFIC], ("ESGAR",))}
+    out = {"still_working": traffic_set(wait_traffic(b, want="ESGAR"), ("ESGAR",))}
     a.close(); b.close()
     return out
 
@@ -446,7 +468,7 @@ def scenario_password(port):
     for _ in range(3):
         a.position(); b.position(); time.sleep(0.12)
     liveries = set()
-    for payload in b.drain(0.4)[P.PT_TRAFFIC]:
+    for payload in wait_traffic(b, want="ESLIVA"):
         count, _ = P.TRAFFIC_HDR.unpack_from(payload, 0)
         off = P.TRAFFIC_HDR.size
         for _ in range(count):
@@ -456,6 +478,44 @@ def scenario_password(port):
     out["livery_seen"] = sorted(liveries)
     for c in (nopw, wrong, right, old, a, b):
         c.close()
+    return out
+
+
+def scenario_weather(port):
+    """One sim decides the sky. Both servers must relay it only from the
+    pilot who claimed it, or a stranger could move everyone's weather."""
+    out = {}
+    src = Client(port, "ESWXA1", 57.85, 27.02)
+    other = Client(port, "ESWXB1", 57.855, 27.025)
+
+    # the source says so in its login
+    src.send(P.PT_LOGIN, P.LOGIN.pack(P.pad("ESWXA1", 16), P.pad("C172", 8),
+             P.PROTO_VERSION, P.LF_WEATHER_SOURCE, P.pad("", 16), P.pad("", 32)), sid=0)
+    ack = src.recv(P.PT_LOGIN_ACK)
+    src.sid = P.LOGIN_ACK.unpack_from(ack, 0)[0] if ack else 0
+    out["source_got_in"] = src.sid != 0
+    other.login()
+
+    sky = [0, 43200.0, 180, 4.5, 99400.0, 7.0, 0.6, 0.0, 0.0, 3] + [0.0] * (4 * 3) + \
+          [0.0] * (7 * P.AIR_LAYERS)
+    sky[10] = 120.0                      # first cloud type, as a marker
+    src.send(P.PT_WEATHER, P.WEATHER.pack(*sky))
+    time.sleep(0.2)
+    got = other.drain(0.4)[P.PT_WEATHER]
+    out["relayed"] = len(got) > 0
+    out["intact"] = [round(v, 3) for v in P.WEATHER.unpack(got[0])[1:6]] if got else []
+
+    # a pilot who never claimed it cannot move the sky
+    other.send(P.PT_WEATHER, P.WEATHER.pack(*sky))
+    time.sleep(0.2)
+    out["stranger_relayed"] = len(src.drain(0.4)[P.PT_WEATHER]) > 0
+
+    # and a truncated one is not passed on either
+    src.send(P.PT_WEATHER, b"\x01\x02\x03")
+    time.sleep(0.2)
+    out["runt_relayed"] = len(other.drain(0.3)[P.PT_WEATHER]) > 0
+
+    src.close(); other.close()
     return out
 
 
@@ -469,6 +529,7 @@ SCENARIOS = [
     ("logout", scenario_logout),
     ("garbage packets", scenario_garbage),
     ("flight password", scenario_password),
+    ("shared weather", scenario_weather),
 ]
 # scenarios whose server runs with a flight password
 PASSWORDED = {"flight password": "sky"}
@@ -569,6 +630,13 @@ def main():
     check("its ICAO type comes through",
           any(t[0] == "ESNB34" and t[1] == "A20N" for t in r["a_sees"]))
     check("an aircraft 130 nm away is not", not any(t[0] == "ESFAR1" for t in r["a_sees"]))
+
+    r = cpp["shared weather"]
+    check("the weather source's sky is relayed", r["relayed"])
+    check("it arrives unchanged", r["intact"] == [43200.0, 180.0, 4.5, 99400.0, 7.0],
+          str(r["intact"]))
+    check("a pilot who did not claim it cannot set the weather", not r["stranger_relayed"])
+    check("a truncated weather packet is dropped", not r["runt_relayed"])
 
     r = cpp["login validation"]
     check("an old protocol version is refused", r["old_protocol_gets_no_ack"])

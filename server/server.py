@@ -42,6 +42,7 @@ class Session:
     ac_icao: str
     last_seen: float
     livery: str = ""
+    weather_source: bool = False   # claimed the flight's weather and time
     lat: float = 0.0
     lon: float = 0.0
     alt_m: float = 0.0
@@ -123,6 +124,10 @@ class XRadioServer(asyncio.DatagramProtocol):
         self.by_sid: dict[int, Session] = {}
         self._next_sid = 1
         self._t0 = time.monotonic()
+        # Whose sky everyone else flies in. The first pilot to claim it keeps
+        # it until they leave; a second claimant would mean the weather
+        # flickered between two sims.
+        self._weather_sid = 0
 
     # -- asyncio plumbing ---------------------------------------------------
     def connection_made(self, transport):
@@ -178,13 +183,15 @@ class XRadioServer(asyncio.DatagramProtocol):
             self._on_voice(s, payload)
         elif ptype == P.PT_PING:
             self._send(addr, P.PT_PONG, s.sid)
+        elif ptype == P.PT_WEATHER:
+            self._on_weather(s, payload)
         elif ptype == P.PT_LOGOUT:
             self._drop(s, "logout")
 
     def _on_login(self, payload, addr):
         if len(payload) < P.LOGIN.size:
             return
-        (callsign_raw, icao_raw, proto_ver, _res,
+        (callsign_raw, icao_raw, proto_ver, flags,
          livery_raw, password_raw) = P.LOGIN.unpack_from(payload, 0)
         if proto_ver != P.PROTO_VERSION:
             LOG.warning("rejecting %s: protocol v%s", addr, proto_ver)
@@ -212,9 +219,13 @@ class XRadioServer(asyncio.DatagramProtocol):
             ac_icao=ac_icao or "ZZZZ",
             last_seen=time.monotonic(),
             livery=livery,
+            weather_source=bool(flags & P.LF_WEATHER_SOURCE),
         )
         self.sessions[addr] = s
         self.by_sid[sid] = s
+        if s.weather_source and self._weather_sid == 0:
+            self._weather_sid = sid
+            LOG.info("weather and time now come from %s", s.callsign)
         LOG.info("login: %s (%s) sid=%d from %s", s.callsign, s.ac_icao, sid, addr)
         self._send(addr, P.PT_LOGIN_ACK, sid, P.LOGIN_ACK.pack(sid, self._now_ms()))
 
@@ -331,9 +342,26 @@ class XRadioServer(asyncio.DatagramProtocol):
         for s in [s for s in self.sessions.values() if now - s.last_seen > SESSION_TIMEOUT_S]:
             self._drop(s, "timeout")
 
+    def _on_weather(self, s: Session, payload):
+        """One sim decides the sky; the rest are told about it.
+
+        Relayed untouched and only from the session that claimed it at login,
+        so a joining pilot cannot quietly move everyone else's weather."""
+        if len(payload) != P.WEATHER.size:
+            return
+        if self._weather_sid == 0 and s.weather_source:
+            self._weather_sid = s.sid          # claimed late (the host rejoined)
+        if s.sid != self._weather_sid:
+            return
+        for other in list(self.sessions.values()):
+            if other.sid != s.sid:
+                self._send(other.addr, P.PT_WEATHER, other.sid, payload)
+
     def _drop(self, s: Session, why: str):
         self.sessions.pop(s.addr, None)
         self.by_sid.pop(s.sid, None)
+        if self._weather_sid == s.sid:
+            self._weather_sid = 0      # the next claimant may have it
         LOG.info("drop %s (sid=%d): %s", s.callsign, s.sid, why)
 
     def _broadcast_traffic(self):

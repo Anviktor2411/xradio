@@ -41,6 +41,10 @@ struct Settings {
     bool        hostEnabled = false;
     std::string hostPort    = "49100";
     bool        hostUpnp    = true;        // ask the router to open the port
+    // The host's sim decides the sky for everyone who wants it. Both halves
+    // are opt-out: a pilot who has set up their own weather can keep it.
+    bool        shareWeather  = true;      // host: my weather and time are the flight's
+    bool        followWeather = true;      // everyone else: take them from the host
 
     // --- traffic ---
     bool        showTraffic = true;
@@ -121,6 +125,9 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"hosting",     "Host a flight here", Kind::Bool, 3, &s.hostEnabled},
         {"hostport",    "Port to host on",    Kind::Text, 3, &s.hostPort, 0,0,"",0, 5, true},
         {"hostupnp",    "Ask the router to open it", Kind::Bool, 3, &s.hostUpnp},
+        {"shareweather", "Share my weather and time", Kind::Bool, 3, &s.shareWeather},
+        {"followweather", "Follow the host's weather and time", Kind::Bool, 2,
+                         &s.followWeather},
     };
 }
 

@@ -319,12 +319,38 @@ Each package root needs an `xsb_aircraft.txt`. A free, open set is
 common types. When no model matches, XPMP2 falls back to the `actype` from
 `xradio.cfg`.
 
+## One sky for the whole flight
+
+Two pilots flying together in different weather is worse than it sounds: one
+breaks out of cloud at 600 ft while the other is in sunshine, the winds
+disagree so the aircraft holding station drifts away, and the same approach
+happens in daylight for one and at night for the other.
+
+So the host's sim decides the sky. Their weather and clock are sent to
+everyone else every ten seconds -- X-Plane 12's region weather whole, not a
+summary of it: sea-level pressure and temperature, visibility, rain, the
+three cloud layers, and all thirteen altitude levels of wind, temperature,
+dewpoint and turbulence, plus zulu time and the date.
+
+Both halves are opt-out. The host can untick **Settings > Hosting > Share my
+weather and time**, and anyone who has set up their own conditions can untick
+**Settings > Traffic > Follow the host's weather and time** and keep them.
+
+The clock is only moved when it has really drifted (more than 30 s); nudging
+it on every packet fights the sim's own clock and shows up as a twitching
+sun. The server relays weather only from the pilot who claimed it when they
+logged in, so a joining pilot cannot quietly move everyone else's weather,
+and the whole feature is off on X-Plane 11, whose region datarefs do not
+exist.
+
 ## Protocol versions
 
 The header carries a version and the server rejects anything that does not
 match, so **all pilots and the server must run the same build**. v2 added the
 position timestamp, ground track and vertical speed that the smoothing needs;
-a v1 client gets no error beyond being ignored.
+a v1 client gets no error beyond being ignored. Shared weather arrived
+without a version bump: it is a new packet type, which older builds ignore,
+so a flight with mixed builds simply does not share a sky.
 
 ## Configuration
 

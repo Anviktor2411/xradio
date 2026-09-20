@@ -27,6 +27,7 @@ struct Session {
     std::string callsign;
     std::string acIcao;
     std::string livery;
+    bool        weatherSource = false;   // claimed the flight's weather and time
     double      lastSeen = 0;
 
     double  lat = 0, lon = 0;
@@ -143,6 +144,7 @@ private:
     void onLogin(const Peer& from, const uint8_t* p, int len, double now);
     void onPosition(Session& s, const uint8_t* p, int len);
     void onText(Session& s, const uint8_t* p, int len);
+    void onWeather(Session& s, const uint8_t* p, int len);
     void onVoice(Session& s, const uint8_t* p, int len, double now);
 
     std::vector<Session*> listeners(const Session& sender, uint32_t freqKhz);
@@ -156,6 +158,10 @@ private:
     std::string password_;              // empty: open to all
     std::map<Peer, Session> sessions_;
     uint32_t nextSid_ = 1;
+    // Whose sky everyone else flies in. The first pilot to claim it keeps it
+    // until they leave; two sources would mean the weather flickering between
+    // two sims.
+    uint32_t weatherSid_ = 0;
     double   lastTraffic_ = 0;
     uint64_t sent_ = 0;
     double   t0_ = 0;
@@ -218,6 +224,7 @@ void Core::onPacket(const Peer& from, const uint8_t* data, int len, double now) 
         case PT_TEXT:     onText(s, payload, avail); break;
         case PT_VOICE:    onVoice(s, payload, avail, now); break;
         case PT_PING:     send(from, PT_PONG, s.sid); break;
+        case PT_WEATHER:  onWeather(s, payload, avail); break;
         case PT_LOGOUT:   drop(from); break;
         default: break;
     }
@@ -256,9 +263,11 @@ void Core::onLogin(const Peer& from, const uint8_t* p, int len, double now) {
     s.callsign = callsign.empty() ? ("UNK" + std::to_string(s.sid)) : callsign;
     s.acIcao   = acIcao.empty() ? "ZZZZ" : acIcao;
     s.livery   = livery;
+    s.weatherSource = (lp.flags & LF_WEATHER_SOURCE) != 0;
     s.lastSeen = now;
     const uint32_t sid = s.sid;
     sessions_[from] = s;
+    if (s.weatherSource && weatherSid_ == 0) weatherSid_ = sid;
 
     LoginAckPayload ack{};
     ack.sessionId    = sid;
@@ -387,11 +396,31 @@ std::vector<Session*> Core::listeners(const Session& sender, uint32_t freqKhz) {
     return out;
 }
 
-void Core::drop(const Peer& peer) { sessions_.erase(peer); }
+// One sim decides the sky; the rest are told about it. Relayed untouched and
+// only from the session that claimed it at login, so a joining pilot cannot
+// quietly move everyone else's weather.
+void Core::onWeather(Session& s, const uint8_t* p, int len) {
+    if (len != (int)sizeof(WeatherPayload)) return;
+    if (weatherSid_ == 0 && s.weatherSource) weatherSid_ = s.sid;  // host rejoined
+    if (s.sid != weatherSid_) return;
+    for (auto& kv : sessions_) {
+        if (kv.second.sid == s.sid) continue;
+        send(kv.first, PT_WEATHER, kv.second.sid, p, len);
+    }
+}
+
+void Core::drop(const Peer& peer) {
+    auto it = sessions_.find(peer);
+    if (it != sessions_.end() && it->second.sid == weatherSid_) weatherSid_ = 0;
+    sessions_.erase(peer);
+}
 
 void Core::reap(double now) {
     for (auto it = sessions_.begin(); it != sessions_.end();) {
-        if (now - it->second.lastSeen > kSessionTimeoutS) it = sessions_.erase(it);
+        if (now - it->second.lastSeen > kSessionTimeoutS) {
+            if (it->second.sid == weatherSid_) weatherSid_ = 0;
+            it = sessions_.erase(it);
+        }
         else ++it;
     }
 }

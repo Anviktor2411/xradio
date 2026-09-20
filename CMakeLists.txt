@@ -70,6 +70,7 @@ set(XR_PLUGIN_SOURCES
     plugin/src/ui.cpp
     plugin/src/upnp.cpp
     plugin/src/voice.cpp
+    plugin/src/weather.cpp
     plugin/src/xpmp_bridge.cpp
 )
 

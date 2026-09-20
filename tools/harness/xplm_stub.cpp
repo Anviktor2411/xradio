@@ -26,6 +26,7 @@ namespace harness {
 
 std::map<std::string, double> g_values;
 std::map<std::string, std::string> g_strings;
+std::map<std::string, std::vector<float>> g_arrays;
 std::vector<std::string>      g_drawn;
 std::vector<Drawn>            g_drawnAt;   // same lines, with where they landed
 std::vector<std::string>      g_log;
@@ -62,6 +63,14 @@ std::string getString(const std::string& name) {
 double get(const std::string& name) {
     auto it = g_values.find(name);
     return it == g_values.end() ? 0.0 : it->second;
+}
+
+void setArray(const std::string& name, const std::vector<float>& v) { g_arrays[name] = v; }
+
+const std::vector<float>& getArray(const std::string& name) {
+    static const std::vector<float> empty;
+    auto it = g_arrays.find(name);
+    return it == g_arrays.end() ? empty : it->second;
 }
 
 void tick(float dt) { if (g_loopFunc) g_loopFunc(dt, dt, 0, nullptr); }
@@ -216,11 +225,32 @@ int XPLMGetDatab(XPLMDataRef r, void* out, int, int inMax) {
     return n;
 }
 
-int XPLMGetDatavf(XPLMDataRef r, float* out, int, int inMax) {
+// Array datarefs (the thirteen wind layers, the three cloud layers). Stored
+// per name by the harness; a ref that was only ever set as a scalar reads
+// back as its single value, which is what X-Plane does for a one-element
+// array too.
+int XPLMGetDatavf(XPLMDataRef r, float* out, int inOffset, int inMax) {
     if (inMax < 1 || !out) return 0;
-    out[0] = (float)harness::get(refName(r));
-    return 1;
+    const std::vector<float>& v = harness::getArray(refName(r));
+    if (v.empty()) {
+        out[0] = (float)harness::get(refName(r));
+        return 1;
+    }
+    int n = 0;
+    for (int i = inOffset; i < (int)v.size() && n < inMax; ++i, ++n) out[n] = v[(size_t)i];
+    return n;
 }
+
+void XPLMSetDatavf(XPLMDataRef r, float* in, int inOffset, int inCount) {
+    if (!in || inCount < 1) return;
+    std::vector<float> v = harness::getArray(refName(r));
+    if ((int)v.size() < inOffset + inCount) v.resize((size_t)(inOffset + inCount), 0.f);
+    for (int i = 0; i < inCount; ++i) v[(size_t)(inOffset + i)] = in[i];
+    harness::setArray(refName(r), v);
+}
+
+void XPLMSetDataf(XPLMDataRef r, float v) { harness::set(refName(r), v); }
+void XPLMSetDatai(XPLMDataRef r, int v)   { harness::set(refName(r), v); }
 
 XPLMFlightLoopID XPLMCreateFlightLoop(XPLMCreateFlightLoop_t* p) {
     harness::g_loopFunc = p->callbackFunc;
