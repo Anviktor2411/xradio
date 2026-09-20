@@ -13,7 +13,10 @@ namespace ui {
 namespace {
 
 float kWhite[] = {1.f, 1.f, 1.f};
-float kGrey[]  = {0.68f, 0.68f, 0.68f};
+// The window sits on whatever the cockpit is showing, often something dark
+// and busy. Secondary text still has to be read, not guessed at, so "grey"
+// here is only a step down from white rather than half of it.
+float kGrey[]  = {0.82f, 0.85f, 0.90f};
 float kGreen[] = {0.40f, 1.f, 0.40f};
 float kAmber[] = {1.f, 0.80f, 0.30f};
 

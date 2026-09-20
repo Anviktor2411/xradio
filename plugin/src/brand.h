@@ -32,7 +32,7 @@ inline int charWidth() {
 inline int draw(int x, int y, bool withTagline = false) {
     float amber[] = {1.f, 0.72f, 0.13f};
     float white[] = {0.95f, 0.97f, 1.f};
-    float dim[]   = {0.55f, 0.62f, 0.72f};
+    float dim[]   = {0.78f, 0.82f, 0.88f};
 
     const int cw = charWidth();
 
