@@ -53,7 +53,8 @@ jobs:
           import sys; sys.path.insert(0, 'server')
           import protocol as P
           for n in ("HEADER", "LOGIN", "LOGIN_ACK", "LOGIN_REJECT", "POSITION",
-                    "TRAFFIC_HDR", "TRAFFIC_ENTRY", "TEXT_HDR", "VOICE_HDR"):
+                    "TRAFFIC_HDR", "TRAFFIC_ENTRY", "TEXT_HDR", "VOICE_HDR",
+                    "WEATHER"):
               print(n, getattr(P, n).size)
           PY
           diff /tmp/cpp_sizes.txt /tmp/py_sizes.txt
