@@ -347,8 +347,16 @@ def main():
     say(f"  1. Upload the source to GitHub (the zip above), or commit it.")
     say(f"  2. Wait for the build to go green, then download the")
     say(f"     XRadio-all-platforms artifact from that run.")
-    say(f"  3. Draft a release tagged v{new}, paste the notes, attach that")
-    say(f"     artifact -- the source zip is not what pilots install.")
+    say(f"  3. Draft a release, paste the notes, attach that artifact --")
+    say(f"     the source zip is not what pilots install.")
+    say()
+    # On its own line, because this is the one string that is typed by hand
+    # into GitHub and a dot in the wrong place is not obvious. "v05.4" reads
+    # as version 5.4, beats every real version, and tells every pilot already
+    # running the release that an update is waiting for them.
+    say("     The tag must be exactly, character for character:")
+    say()
+    say(f"         v{new}")
     say()
     return 0
 

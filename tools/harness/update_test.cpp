@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <thread>
 
@@ -23,6 +24,19 @@ static void check(const std::string& name, bool ok, const std::string& detail = 
 
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "offline";
+
+    // "offline" means the update site cannot be reached. Left to itself this
+    // test asked the real GitHub and then asserted that the answer was
+    // useless -- so it passed only while the runner happened to be blocked or
+    // rate-limited, and failed the day it got through. Point it at a port
+    // with nothing behind it and the case is the one it claims to be.
+    if (mode == "offline" && !getenv("XRADIO_UPDATE_URL")) {
+#ifdef _WIN32
+        _putenv_s("XRADIO_UPDATE_URL", "http://127.0.0.1:5398/nothing-here");
+#else
+        setenv("XRADIO_UPDATE_URL", "http://127.0.0.1:5398/nothing-here", 1);
+#endif
+    }
 
     printf("\ncomparing versions\n");
     {
@@ -38,6 +52,14 @@ int main(int argc, char** argv) {
         check("nonsense is never newer",
               !isNewer("0.5.2", "banana") && !isNewer("0.5.2", "") &&
               !isNewer("", "0.6.0") && !isNewer("0.5.2", "0.6.0-beta"));
+        // A tag with a dot missing parses as a much larger version and beats
+        // everything. This is not a bug in the comparison -- 05.4 really does
+        // read as 5.4 -- it is why a release tag has to be exactly vX.Y.Z,
+        // and it once told every pilot on 0.5.4 that "v05.4" was newer.
+        check("a tag with a missing dot reads as a far higher version",
+              isNewer("0.5.4", "05.4"));
+        check("which the well-formed tag does not",
+              !isNewer("0.5.4", "0.5.4"));
         check("absurd input is refused rather than parsed",
               !isNewer("0.5.2", "99999999.0.0"));
     }
