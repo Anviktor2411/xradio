@@ -83,6 +83,37 @@ def have(cmd):
     return shutil.which(cmd) is not None
 
 
+# The Python running this script, not whatever "python3" means on PATH. On
+# Windows there is usually no python3.exe at all -- it is python.exe, or an
+# App Execution Alias that opens the Microsoft Store -- and the server tests
+# were being skipped for that reason alone.
+PY = sys.executable or "python3"
+
+
+def working_bash():
+    """A bash that can actually run a script, or None.
+
+    On Windows, `bash` on PATH is normally C:\Windows\System32\bash.exe --
+    the launcher for WSL. With no distribution installed it exists, answers
+    every call with an error about installing one, and exits non-zero, so
+    shutil.which() says bash is here and every shell check then "fails" for a
+    reason that has nothing to do with this repository. Ask it to say
+    something and believe only the answer.
+    """
+    exe = shutil.which("bash")
+    if not exe:
+        return None
+    try:
+        p = subprocess.run([exe, "-c", "echo xradio-shell-ok"],
+                           capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    # Decoded loosely: the WSL stub answers in UTF-16 and would otherwise
+    # come back as mojibake rather than as a mismatch.
+    out = p.stdout.decode("utf-8", "ignore") + p.stdout.decode("utf-16", "ignore")
+    return exe if p.returncode == 0 and "xradio-shell-ok" in out else None
+
+
 def run(name, argv, env=None):
     """One check. Returns True if it passed, and prints its tail if it did not."""
     say(f"  {name} ...")
@@ -107,23 +138,39 @@ def run(name, argv, env=None):
     return False
 
 
-def checks():
-    """Everything this machine is equipped to run, in the order CI runs it."""
+def checks(skipped):
+    """Everything this machine is equipped to run, in the order CI runs it.
+
+    A check this machine cannot run is skipped and named, not failed: the
+    whole suite runs in CI on every push, and a Windows desktop with no shell
+    and no compiler is a perfectly ordinary place to cut a release from. What
+    must not happen is a release going out because a check quietly did not
+    run, so everything skipped is listed again at the end.
+    """
     ok = True
-    if have("bash"):
-        ok &= run("portability", ["bash", "tools/check_portability.sh"])
+    bash = working_bash()
+    if bash:
+        ok &= run("portability", [bash, "tools/check_portability.sh"])
         if have("x86_64-w64-mingw32-g++"):
             ok &= run("the plugin compiles for Windows",
-                      ["bash", "tools/check_windows_build.sh"])
+                      [bash, "tools/check_windows_build.sh"])
         else:
             say("  the plugin compiles for Windows ... skipped (no mingw-w64 here)")
+            skipped.append("the Windows cross-compile (no mingw-w64)")
         ok &= run("the CSL bridge compiles against real XPMP2",
-                  ["bash", "tools/check_xpmp2_build.sh"])
-    if have("python3"):
-        ok &= run("server protocol and routing", ["python3", "tools/test_server.py"])
+                  [bash, "tools/check_xpmp2_build.sh"])
+    else:
+        why = ("the bash here is the WSL launcher and WSL has no distribution"
+               if shutil.which("bash") else "no bash here")
+        say(f"  the shell checks ... skipped ({why})")
+        skipped.append(f"portability, the Windows cross-compile and the XPMP2 "
+                       f"compile ({why})")
+
+    ok &= run("server protocol and routing", [PY, "tools/test_server.py"])
 
     if not (have("cmake") and (have("g++") or have("clang++"))):
         say("  the C++ tests ... skipped (no cmake/compiler here)")
+        skipped.append("every C++ test (no cmake or compiler)")
         return ok
 
     build = ROOT / "build-tests"
@@ -141,13 +188,13 @@ def checks():
         ("window placement", "placement_test", []),
         ("settings window", "settings_test", []),
         ("hosting end to end", "hosting_test", ["49810"]),
+        ("the clipboard", "clipboard_test", []),
     ]:
         ok &= run(name, [str(build / exe)] + args)
 
-    if have("python3"):
-        ok &= run("the two servers agree",
-                  ["python3", "tools/test_server_parity.py",
-                   "--cpp", str(build / "xradio_server")])
+    ok &= run("the two servers agree",
+              [PY, "tools/test_server_parity.py",
+               "--cpp", str(build / "xradio_server")])
     return ok
 
 
@@ -242,14 +289,24 @@ def main():
             say("nothing done.")
             return 1
 
+    skipped = []
     if not args.no_tests:
         say("Checking the build is sound (this takes a few minutes):")
-        if not checks():
+        if not checks(skipped):
             say()
             say("Something failed, so the version was NOT changed and no zip was")
             say("written. Fix it and run this again.")
             return 1
         say()
+        if skipped:
+            # Never silently: a release that went out because a check did not
+            # run looks exactly like one where it passed.
+            say("This machine could not run everything:")
+            for line in skipped:
+                say(f"  - {line}")
+            say("  The build on GitHub runs all of it -- wait for it to go green")
+            say("  before attaching the artifact to a release.")
+            say()
 
     set_version(new, args.dry_run)
     verb = "would be set" if args.dry_run else "set"
