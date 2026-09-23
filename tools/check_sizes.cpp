@@ -19,5 +19,6 @@ int main() {
     // traffic that thins out for clients of one of them.
     printf("MAX_PACKET %d\n",      xr::kMaxPacket);
     printf("MAX_TRAFFIC_ENTRIES %d\n", xr::kMaxTrafficEntries);
+    printf("GUARD_KHZ %u\n",      (unsigned)xr::kGuardKhz);
     return 0;
 }

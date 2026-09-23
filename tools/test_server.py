@@ -68,7 +68,7 @@ class Client:
         b = msg.encode()
         self.sock.sendto(P.pack(P.PT_TEXT, self.sid if sid is None else sid,
                                 P.TEXT_HDR.pack(freq, self.sid, P.pad(self.callsign, 16),
-                                                len(b)) + b), self.dest)
+                                                len(b), P.pad("", 16)) + b), self.dest)
 
     def recv(self, want_type, timeout=0.6):
         """Read packets until one of want_type arrives, or give up."""
@@ -136,7 +136,7 @@ def run():
     print("\nwire format")
     check("C++/Python struct sizes agree", all([
         P.HEADER.size == 12, P.LOGIN.size == 76, P.POSITION.size == 72,
-        P.TRAFFIC_ENTRY.size == 108, P.TEXT_HDR.size == 26, P.VOICE_HDR.size == 12,
+        P.TRAFFIC_ENTRY.size == 108, P.TEXT_HDR.size == 42, P.VOICE_HDR.size == 12,
     ]))
     check("bad magic is rejected",
           P.unpack_header(struct.pack("<IBBHI", 0xDEADBEEF, 1, 1, 0, 0)) is None)
@@ -242,7 +242,7 @@ def run():
     if payload is None:
         check("oversized text still delivered, truncated", False, "nothing arrived")
     else:
-        _f, _s, _frm, tlen = P.TEXT_HDR.unpack_from(payload, 0)
+        _f, _s, _frm, tlen, _to = P.TEXT_HDR.unpack_from(payload, 0)
         check("oversized text is capped", tlen <= S.MAX_TEXT_BYTES, f"len={tlen}")
 
     print("\nhostile client input")

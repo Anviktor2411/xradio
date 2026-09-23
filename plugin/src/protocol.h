@@ -11,7 +11,7 @@ namespace xr {
 
 // "XRC1" as little-endian bytes.
 static const uint32_t kMagic       = 0x31435258u;
-static const uint16_t kProtoVersion = 4;   // v4: transponder (squawk, mode, ident)
+static const uint16_t kProtoVersion = 5;   // v5: the roster, and 121.500 as guard
 
 enum PacketType : uint8_t {
     PT_LOGIN     = 1,  // client -> server
@@ -26,6 +26,15 @@ enum PacketType : uint8_t {
     PT_LOGIN_REJECT = 10,  // server -> client: why the login was refused
     PT_WEATHER   = 11,  // weather source -> server -> everyone else
 };
+
+// The international emergency frequency, and in XRadio the one place everybody
+// can be reached. A transmission on it is relayed to every pilot within VHF
+// range whatever they have tuned, which is what guard is for: you do not know
+// what frequency the other aircraft is on, so you call them on the one
+// everybody is supposed to be listening to. Still a radio -- the horizon
+// applies exactly as it does on any other frequency.
+static const uint32_t kGuardKhz = 121500;
+inline bool isGuard(uint32_t freqKhz) { return freqKhz == kGuardKhz; }
 
 // LoginPayload.flags
 static const uint16_t LF_WEATHER_SOURCE = 1 << 0;  // "my weather and time are the flight's"
@@ -176,11 +185,19 @@ struct TrafficHeader {       // 4 bytes, followed by `count` TrafficEntry
     uint16_t reserved;
 };
 
-struct TextHeader {          // 26 bytes, followed by `textLen` UTF-8 bytes
+
+struct TextHeader {          // 42 bytes (v5), followed by `textLen` UTF-8 bytes
     uint32_t freqKhz;
     uint32_t fromSession;
     char     from[16];
     uint16_t textLen;
+    // v5. Empty for an ordinary radio call, which goes to whoever has that
+    // frequency tuned and is inside the horizon. With a callsign in it the
+    // message is not a transmission at all: it reaches that one pilot
+    // wherever they are and whatever they have tuned, and nobody else hears
+    // it. Both halves of the window label it as what it is, because a pilot
+    // who mistakes one for the other will say something on the wrong one.
+    char     to[16];
 };
 
 // The flight's shared sky: what the host's sim reports, applied by everyone

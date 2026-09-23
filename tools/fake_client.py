@@ -72,9 +72,10 @@ def run(args):
                 if names:
                     print(f"  traffic: {', '.join(names)}")
             elif ptype == P.PT_TEXT:
-                freq, _fs, frm, tlen = P.TEXT_HDR.unpack_from(payload, 0)
+                freq, _fs, frm, tlen, to = P.TEXT_HDR.unpack_from(payload, 0)
                 text = payload[P.TEXT_HDR.size:P.TEXT_HDR.size + tlen]
-                print(f"  [{freq / 1000:.3f}] {P.cstr(frm)}: "
+                where = "direct" if P.cstr(to) else f"{freq / 1000:.3f}"
+                print(f"  [{where}] {P.cstr(frm)}: "
                       f"{text.decode('utf-8', 'replace')}")
             elif ptype == P.PT_VOICE:
                 freq, from_sid, seq, olen = P.VOICE_HDR.unpack_from(payload, 0)
@@ -124,7 +125,7 @@ def run(args):
             if args.talk and time.time() >= next_text:
                 msg = f"{args.callsign} position report".encode()
                 sock.sendto(P.pack(P.PT_TEXT, sid, P.TEXT_HDR.pack(
-                    args.com1, sid, P.pad(args.callsign, 16), len(msg)) + msg), dest)
+                    args.com1, sid, P.pad(args.callsign, 16), len(msg), P.pad("", 16)) + msg), dest)
                 next_text = time.time() + 5.0
 
             time.sleep(tick)

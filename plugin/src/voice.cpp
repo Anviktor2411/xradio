@@ -1,5 +1,7 @@
 #include "voice.h"
 
+#include "protocol.h"   // kGuardKhz: guard is heard on no radio in particular
+
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -40,6 +42,7 @@ void setTransmitting(bool) {}
 bool transmitting() { return false; }
 void onIncomingFrame(uint32_t, uint16_t, const uint8_t*, int, uint32_t) {}
 void setRadioVolumes(uint32_t, float, uint32_t, float) {}
+void setGuardGain(float) {}
 float signalQualityOf(uint32_t) { return 1.f; }
 void pollOutgoing(std::vector<OutFrame>& out) { out.clear(); }
 void tick() {}
@@ -142,6 +145,7 @@ std::atomic<float> g_volume{1.f};
 // the audio panel: tuned frequencies and knob positions, main thread -> playback
 std::atomic<uint32_t> g_com1Khz{0}, g_com2Khz{0};
 std::atomic<float>    g_com1Vol{1.f}, g_com2Vol{1.f};
+std::atomic<float>    g_guardVol{1.f};
 
 // How far up the knob is for the radio this frequency is on. A frequency
 // neither radio has (or 0) plays at full: better heard than silently lost.
@@ -149,6 +153,8 @@ float radioGain(uint32_t freqKhz) {
     if (freqKhz == 0) return 1.f;
     if (freqKhz == g_com1Khz.load()) return g_com1Vol.load();
     if (freqKhz == g_com2Khz.load()) return g_com2Vol.load();
+    // Guard, on neither radio: heard anyway, but only by a radio with power.
+    if (isGuard(freqKhz)) return g_guardVol.load();
     return 1.f;
 }
 std::atomic<uint64_t> g_nEncoded{0}, g_nReceived{0}, g_nPlayed{0}, g_nConcealed{0};
@@ -726,6 +732,9 @@ void setRadioVolumes(uint32_t com1Khz, float com1Vol, uint32_t com2Khz, float co
     g_com2Khz.store(com2Khz);
     g_com1Vol.store(com1Vol < 0.f ? 0.f : (com1Vol > 1.f ? 1.f : com1Vol));
     g_com2Vol.store(com2Vol < 0.f ? 0.f : (com2Vol > 1.f ? 1.f : com2Vol));
+}
+void setGuardGain(float gain) {
+    g_guardVol.store(gain < 0.f ? 0.f : (gain > 1.f ? 1.f : gain));
 }
 float signalQualityOf(uint32_t sid) {
     std::lock_guard<std::mutex> lk(g_mx);

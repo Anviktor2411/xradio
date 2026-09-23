@@ -326,6 +326,39 @@ void Core::onText(Session& s, const uint8_t* p, int len) {
     textLen = std::min(textLen, avail);
     if (textLen <= 0) return;
 
+    // A message addressed to a callsign is not a transmission: it goes to
+    // that one pilot wherever they are, on no frequency at all, and nobody
+    // else sees it. A pilot who cannot be found is told so, rather than
+    // being left to wonder whether the message landed.
+    const std::string to = clean(th.to, sizeof(th.to), 15);
+    if (!to.empty()) {
+        Session* target = nullptr;
+        for (auto& kv : sessions_) {
+            if (kv.second.callsign == to) { target = &kv.second; break; }
+        }
+
+        uint8_t dm[kMaxPacket];
+        TextHeader dh{};
+        dh.freqKhz     = 0;                     // not on the radio
+        dh.fromSession = target ? s.sid : 0;
+        padInto(dh.from, sizeof(dh.from), target ? s.callsign : std::string("XRADIO"));
+        padInto(dh.to, sizeof(dh.to), to);
+
+        if (target) {
+            dh.textLen = (uint16_t)textLen;
+            memcpy(dm, &dh, sizeof(dh));
+            memcpy(dm + sizeof(dh), p + sizeof(TextHeader), (size_t)textLen);
+            send(target->peer, PT_TEXT, target->sid, dm, (int)sizeof(dh) + textLen);
+        } else {
+            const std::string why = "nobody called " + to + " is in this flight";
+            dh.textLen = (uint16_t)why.size();
+            memcpy(dm, &dh, sizeof(dh));
+            memcpy(dm + sizeof(dh), why.data(), why.size());
+            send(s.peer, PT_TEXT, s.sid, dm, (int)sizeof(dh) + (int)why.size());
+        }
+        return;
+    }
+
     // Text does not need the PTT held, so it goes out on whichever radio the
     // client names -- but only if that radio is really tuned there, so nobody
     // can transmit on a frequency they are not on.
@@ -393,9 +426,14 @@ void Core::onVoice(Session& s, const uint8_t* p, int len, double now) {
 
 std::vector<Session*> Core::listeners(const Session& sender, uint32_t freqKhz) {
     std::vector<Session*> out;
+    // Guard reaches everyone in range whether or not they have it tuned. It is
+    // the one frequency you can call somebody on without already knowing where
+    // they are listening, which is the whole reason it exists.
+    const bool guard = isGuard(freqKhz);
     for (auto& kv : sessions_) {
         Session& peer = kv.second;
-        if (peer.sid == sender.sid || !peer.listeningOn(freqKhz)) continue;
+        if (peer.sid == sender.sid) continue;
+        if (!guard && !peer.listeningOn(freqKhz)) continue;
         if (sender.hasPosition && peer.hasPosition && !inRadioRange(sender, peer)) {
             continue;
         }

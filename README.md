@@ -429,6 +429,42 @@ logged in, so a joining pilot cannot quietly move everyone else's weather,
 and the whole feature is off on X-Plane 11, whose region datarefs do not
 exist.
 
+## Finding each other on the radio
+
+Two pilots who join the same server and do not already know what frequency the
+other is tuned to cannot reach each other: text and voice go only to people on
+that frequency, which is the point of modelling a radio at all. XRadio does not
+solve that by showing you everyone's frequency — you cannot tell what another
+aircraft is monitoring in real life either — but by giving you the two things
+aviation already uses for it.
+
+**121.500 is guard.** Anything transmitted on it is heard by every pilot within
+VHF range whatever they have tuned, and the window labels it `GUARD 121.500` so
+nobody mistakes it for an ordinary call. Tune a radio to 121.500 and ask.
+
+```
+  [GUARD 121.500] ESNA12: anyone out there, come to 118.100
+```
+
+You still have to be tuned to 121.500 to *transmit* on it — the rule that you
+cannot talk on a frequency your radio is not on is not relaxed, only the
+listening half is. And it is still a radio: the VHF horizon applies exactly as
+it does anywhere else, so guard does not reach across the country.
+
+**`@CALLSIGN` is a message for one pilot.** Typed in the Say row, it reaches
+that pilot wherever they are and whatever they have tuned, and nobody else sees
+it. It is not a transmission and it is not on a frequency, so the window labels
+it as what it is:
+
+```
+  Say:  @ESNB34 come to 118.100
+  [direct to ESNB34] ESNA12: come to 118.100
+  [direct] ESNB34: on my way
+```
+
+A callsign nobody in the flight is using comes back with an answer rather than
+silence. An `@` anywhere but the start of the line is just an `@`.
+
 ## Protocol versions
 
 The header carries a version and the server rejects anything that does not
@@ -436,7 +472,10 @@ match, so **all pilots and the server must run the same build**. v2 added the
 position timestamp, ground track and vertical speed that the smoothing needs;
 a v1 client gets no error beyond being ignored. Shared weather arrived
 without a version bump: it is a new packet type, which older builds ignore,
-so a flight with mixed builds simply does not share a sky.
+so a flight with mixed builds simply does not share a sky. v4 put the
+transponder on the wire, v5 the addressee that makes `@CALLSIGN` possible --
+both are changes to existing packets, so both refuse an older build outright
+rather than letting it fly with half the behaviour.
 
 ## Configuration
 

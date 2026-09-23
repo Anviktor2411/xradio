@@ -90,10 +90,11 @@ class Client:
             self.com1, self.com2, 0, 0, tx, rx, time_ms, track, vs,
             squawk, xpdr, ident), sid=sid)
 
-    def text(self, body, freq=0, sid=None):
+    def text(self, body, freq=0, sid=None, to=""):
         raw = body.encode()
         self.send(P.PT_TEXT,
-                  P.TEXT_HDR.pack(freq, 0, P.pad(self.callsign, 16), len(raw)) + raw,
+                  P.TEXT_HDR.pack(freq, 0, P.pad(self.callsign, 16), len(raw),
+                                  P.pad(to, 16)) + raw,
                   sid=sid)
 
     def voice(self, seq=1, freq=0, opus=b"\x01\x02\x03\x04"):
@@ -222,7 +223,7 @@ def texts(packets):
     for payload in packets:
         if len(payload) < P.TEXT_HDR.size:
             continue
-        freq, _sid, frm, n = P.TEXT_HDR.unpack_from(payload, 0)
+        freq, _sid, frm, n, _to = P.TEXT_HDR.unpack_from(payload, 0)
         body = payload[P.TEXT_HDR.size:P.TEXT_HDR.size + n]
         out.append((freq, P.cstr(frm), body.decode("utf-8", "replace")))
     return sorted(out)
@@ -343,6 +344,84 @@ def scenario_text_routing(port):
         "out_of_range": texts(far.drain(0.2)[P.PT_TEXT]),
     }
     for c in (a, same, other, far):
+        c.close()
+    return out
+
+
+def scenario_guard(port):
+    """121.500 reaches everyone in range, whatever they have tuned.
+
+    It is the one frequency you can call somebody on without already knowing
+    where they are listening. Two things must stay true anyway: it is a radio,
+    so the horizon still applies, and you still cannot transmit on a frequency
+    your own radio is not tuned to.
+    """
+    out = {}
+    caller = Client(port, "ESGDA1", 57.85, 27.02, com1=P.GUARD_KHZ)
+    near = Client(port, "ESGDB1", 57.855, 27.025, com1=OTHER_FREQ)
+    near2 = Client(port, "ESGDC1", 57.856, 27.026, com1=118500)
+    far = Client(port, "ESGDD1", 60.50, 27.02, com1=OTHER_FREQ)
+    for c in (caller, near, near2, far):
+        c.login()
+        c.position()
+    time.sleep(0.2)
+
+    caller.text("anyone on guard, come to 118.100", freq=P.GUARD_KHZ)
+    time.sleep(0.3)
+    out["heard_by_other_freq"] = texts(near.drain(0.3)[P.PT_TEXT])
+    out["heard_by_another"] = texts(near2.drain(0.2)[P.PT_TEXT])
+    out["past_the_horizon"] = texts(far.drain(0.2)[P.PT_TEXT])
+
+    # Voice on guard, the same way.
+    for i in range(5):
+        caller.voice(seq=i, freq=P.GUARD_KHZ)
+        time.sleep(0.02)
+    time.sleep(0.25)
+    out["voice_heard"] = len(near.drain(0.3)[P.PT_VOICE])
+    out["voice_past_the_horizon"] = len(far.drain(0.2)[P.PT_VOICE])
+
+    # A pilot who has not tuned guard still cannot transmit on it.
+    near.text("not tuned there", freq=P.GUARD_KHZ)
+    time.sleep(0.25)
+    out["untuned_sender_relayed"] = texts(near2.drain(0.3)[P.PT_TEXT])
+
+    for c in (caller, near, near2, far):
+        c.close()
+    return out
+
+
+def scenario_direct_message(port):
+    """A message addressed to a callsign is not a transmission.
+
+    It reaches that one pilot wherever they are and whatever they have tuned,
+    it reaches nobody else, and a callsign that is not in the flight comes
+    back as an answer rather than silence.
+    """
+    out = {}
+    a = Client(port, "ESDMA1", 57.85, 27.02)
+    b = Client(port, "ESDMB1", 60.50, 27.02, com1=OTHER_FREQ)   # far away, other freq
+    nosy = Client(port, "ESDMC1", 57.851, 27.021)               # same freq, right there
+    for c in (a, b, nosy):
+        c.login()
+        c.position()
+    time.sleep(0.2)
+
+    a.text("come to 118.100", to="ESDMB1")
+    time.sleep(0.3)
+    out["reached_the_target"] = texts(b.drain(0.4)[P.PT_TEXT])
+    out["nobody_else_saw_it"] = texts(nosy.drain(0.2)[P.PT_TEXT])
+
+    # An unknown callsign is answered, not swallowed.
+    a.text("anyone there", to="NOSUCH")
+    time.sleep(0.3)
+    out["unknown_callsign_answer"] = texts(a.drain(0.4)[P.PT_TEXT])
+
+    # And the target's own reply goes back the same way.
+    b.text("on my way", to="ESDMA1")
+    time.sleep(0.3)
+    out["reply_came_back"] = texts(a.drain(0.4)[P.PT_TEXT])
+
+    for c in (a, b, nosy):
         c.close()
     return out
 
@@ -635,6 +714,8 @@ SCENARIOS = [
     ("shared weather", scenario_weather),
     ("transponder", scenario_transponder),
     ("a crowded sky", scenario_crowded_sky),
+    ("guard", scenario_guard),
+    ("direct messages", scenario_direct_message),
 ]
 # scenarios whose server runs with a flight password
 PASSWORDED = {"flight password": "sky"}
@@ -839,6 +920,41 @@ def main():
     check("and none of them is dropped on the way",
           r["distinct_seen"] == r["others"],
           f"{r['distinct_seen']} of {r['others']}")
+
+    r = cpp["guard"]
+    guard_call = [(P.GUARD_KHZ, "ESGDA1", "anyone on guard, come to 118.100")]
+    check("guard reaches a pilot on another frequency",
+          r["heard_by_other_freq"] == guard_call, str(r["heard_by_other_freq"]))
+    check("and everyone else in range too",
+          r["heard_by_another"] == guard_call, str(r["heard_by_another"]))
+    check("relayed on guard, not rewritten to the listener's frequency",
+          all(t[0] == P.GUARD_KHZ for t in r["heard_by_other_freq"]),
+          str(r["heard_by_other_freq"]))
+    check("but not past the VHF horizon -- it is still a radio",
+          r["past_the_horizon"] == [], str(r["past_the_horizon"]))
+    check("voice on guard is heard the same way", r["voice_heard"] == 5,
+          str(r["voice_heard"]))
+    check("and stops at the horizon the same way",
+          r["voice_past_the_horizon"] == 0, str(r["voice_past_the_horizon"]))
+    check("a pilot who has not tuned guard still cannot transmit on it",
+          r["untuned_sender_relayed"] == [], str(r["untuned_sender_relayed"]))
+
+    r = cpp["direct messages"]
+    check("a direct message reaches the pilot it names, however far away",
+          r["reached_the_target"] == [(0, "ESDMA1", "come to 118.100")],
+          str(r["reached_the_target"]))
+    check("and arrives on no frequency at all, because it is not a transmission",
+          all(t[0] == 0 for t in r["reached_the_target"]),
+          str(r["reached_the_target"]))
+    check("and nobody else sees it, not even someone on the same frequency",
+          r["nobody_else_saw_it"] == [], str(r["nobody_else_saw_it"]))
+    check("a callsign that is not in the flight is answered, not swallowed",
+          r["unknown_callsign_answer"] ==
+          [(0, "XRADIO", "nobody called NOSUCH is in this flight")],
+          str(r["unknown_callsign_answer"]))
+    check("and the reply comes back the same way",
+          r["reply_came_back"] == [(0, "ESDMB1", "on my way")],
+          str(r["reply_came_back"]))
 
     print()
     if failures:

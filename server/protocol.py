@@ -7,7 +7,7 @@ means no alignment padding, which matches #pragma pack(1) on the C++ side).
 import struct
 
 MAGIC = 0x31435258  # b"XRC1" little-endian
-PROTO_VERSION = 4   # v4: transponder (squawk, mode, ident)
+PROTO_VERSION = 5   # v5: the roster, and 121.500 as guard
 
 # packet types
 PT_LOGIN = 1
@@ -21,6 +21,16 @@ PT_PONG = 8
 PT_LOGOUT = 9
 PT_LOGIN_REJECT = 10
 PT_WEATHER = 11
+
+# The international emergency frequency, and in XRadio the one place everybody
+# can be reached: a transmission on it goes to every pilot within VHF range
+# whatever they have tuned. That is what guard is for -- you do not know what
+# frequency the other aircraft is on. The horizon still applies; it is a radio.
+GUARD_KHZ = 121500
+
+
+def is_guard(freq_khz: int) -> bool:
+    return freq_khz == GUARD_KHZ
 
 RJ_PASSWORD, RJ_VERSION = 1, 2
 
@@ -57,7 +67,7 @@ LOGIN_REJECT = struct.Struct("<HH")       # reason, reserved
 POSITION = struct.Struct("<2d7f2I4BI2fHBB")  # see PositionPayload
 TRAFFIC_HDR = struct.Struct("<HH")        # count, reserved
 TRAFFIC_ENTRY = struct.Struct("<I16s8s2d7f4BI2f16sHBB")  # ... + livery, squawk
-TEXT_HDR = struct.Struct("<II16sH")       # freqKhz, fromSession, from, textLen
+TEXT_HDR = struct.Struct("<II16sH16s")    # freqKhz, fromSession, from, textLen, to
 VOICE_HDR = struct.Struct("<IIHH")        # freqKhz, fromSession, seq, opusLen
 
 # The flight's shared sky: time, then X-Plane 12's region weather whole --
@@ -71,6 +81,7 @@ assert HEADER.size == 12
 assert LOGIN.size == 76
 assert POSITION.size == 72
 assert TRAFFIC_ENTRY.size == 108
+assert TEXT_HDR.size == 42
 assert WEATHER.size == 452
 
 

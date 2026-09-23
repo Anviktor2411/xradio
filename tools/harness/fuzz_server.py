@@ -70,18 +70,18 @@ def nasty_packets(sid, rnd):
         raw(P.PT_TRAFFIC, sid, P.TRAFFIC_HDR.pack(1, 0) + traffic_entry(t=0xFFFFFFFF))
 
     yield "text: textLen says 65535, few bytes present", \
-        raw(P.PT_TEXT, sid, P.TEXT_HDR.pack(122800, 1, P.pad("X", 16), 0xFFFF) + b"hi")
+        raw(P.PT_TEXT, sid, P.TEXT_HDR.pack(122800, 1, P.pad("X", 16), 0xFFFF, P.pad("", 16)) + b"hi")
     yield "text: textLen 0", \
-        raw(P.PT_TEXT, sid, P.TEXT_HDR.pack(122800, 1, P.pad("X", 16), 0))
+        raw(P.PT_TEXT, sid, P.TEXT_HDR.pack(122800, 1, P.pad("X", 16), 0, P.pad("", 16)))
     yield "text: header truncated mid-struct", \
-        raw(P.PT_TEXT, sid, P.TEXT_HDR.pack(122800, 1, P.pad("X", 16), 5)[:10])
+        raw(P.PT_TEXT, sid, P.TEXT_HDR.pack(122800, 1, P.pad("X", 16), 5, P.pad("", 16))[:10])
     yield "text: invalid UTF-8 body", \
-        raw(P.PT_TEXT, sid, P.TEXT_HDR.pack(122800, 1, P.pad("X", 16), 6) +
+        raw(P.PT_TEXT, sid, P.TEXT_HDR.pack(122800, 1, P.pad("X", 16), 6, P.pad("", 16)) +
             b"\xff\xfe\xfd\xfc\xfb\xfa")
     yield "text: 1200 bytes of body", \
-        raw(P.PT_TEXT, sid, P.TEXT_HDR.pack(122800, 1, P.pad("X", 16), 1200) + b"Z" * 1200)
+        raw(P.PT_TEXT, sid, P.TEXT_HDR.pack(122800, 1, P.pad("X", 16), 1200, P.pad("", 16)) + b"Z" * 1200)
     yield "text: embedded null bytes and format specifiers", \
-        raw(P.PT_TEXT, sid, P.TEXT_HDR.pack(122800, 1, P.pad("X", 16), 12) +
+        raw(P.PT_TEXT, sid, P.TEXT_HDR.pack(122800, 1, P.pad("X", 16), 12, P.pad("", 16)) +
             b"%s%n%x\x00\x00abc")
 
     yield "login_ack: payload too short", raw(P.PT_LOGIN_ACK, sid, b"\x01\x02")

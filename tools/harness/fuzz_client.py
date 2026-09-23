@@ -188,7 +188,7 @@ def main():
             pkt = P.pack(P.PT_POSITION, attacker.sid, body)
         elif pick == 4:                                  # text, lying length
             body = P.TEXT_HDR.pack(122800, attacker.sid, P.pad("EVILCL", 16),
-                                   rng.randint(0, 65535)) + os.urandom(rng.randint(0, 64))
+                                   rng.randint(0, 65535), P.pad("", 16)) + os.urandom(rng.randint(0, 64))
             pkt = P.pack(P.PT_TEXT, attacker.sid, body)
         elif pick == 5:                                  # voice, lying length
             body = P.VOICE_HDR.pack(122800, attacker.sid, rng.randint(0, 65535),
@@ -204,10 +204,10 @@ def main():
             pkt = mutate(rng, base)
         elif pick == 8:                                  # someone else's session
             pkt = P.pack(P.PT_TEXT, rng.randint(0, 2**32 - 1),
-                         P.TEXT_HDR.pack(122800, 0, P.pad("SPOOF", 16), 4) + b"heyo")
+                         P.TEXT_HDR.pack(122800, 0, P.pad("SPOOF", 16), 4, P.pad("", 16)) + b"heyo")
         else:                                            # oversized payload
             pkt = P.pack(P.PT_TEXT, attacker.sid,
-                         P.TEXT_HDR.pack(122800, 0, P.pad("BIG", 16), 60000) +
+                         P.TEXT_HDR.pack(122800, 0, P.pad("BIG", 16), 60000, P.pad("", 16)) +
                          os.urandom(1200))
 
         attacker.raw(pkt)

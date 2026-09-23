@@ -533,28 +533,73 @@ void sendPosition() {
     g_sock.send(buf, off + (int)sizeof(p));
 }
 
+// A frequency as it reads on the panel, except for guard -- which is the one
+// frequency worth naming, because everybody hears it whatever they are tuned
+// to and a pilot should know that before they say something on it.
+std::string freqLabel(uint32_t khz) {
+    if (xr::isGuard(khz)) return "GUARD 121.500";
+    char buf[24];
+    snprintf(buf, sizeof(buf), "%.3f", (double)(khz % 1000000u) / 1000.0);
+    return buf;
+}
+
+// "@ESNA12 come to 118.1" -- a message for one pilot rather than a frequency.
+// Split off the callsign and hand back the rest; an empty callsign means this
+// is an ordinary radio call. Deliberately only at the very start of the line,
+// so an "@" anywhere in a sentence is just an "@".
+std::string splitDirect(const std::string& in, std::string* body) {
+    *body = in;
+    if (in.size() < 2 || in[0] != '@') return "";
+    const size_t sp = in.find(' ');
+    if (sp == std::string::npos || sp == 1) return "";
+    std::string to = in.substr(1, sp - 1);
+    for (char& c : to) c = (char)toupper((unsigned char)c);
+    if (to.size() > 15) return "";
+    for (char c : to) {
+        if (!isalnum((unsigned char)c) && c != '-' && c != '_') return "";
+    }
+    size_t at = in.find_first_not_of(' ', sp);
+    if (at == std::string::npos) return "";      // a callsign and nothing to say
+    *body = in.substr(at);
+    return to;
+}
+
 void sendText(const std::string& text) {
     if (!g_connected || text.empty()) return;
+
+    std::string body;
+    const std::string to = splitDirect(text, &body);
+    if (body.empty()) return;
+
     uint8_t buf[xr::kMaxPacket];
-    uint16_t len = (uint16_t)std::min<size_t>(text.size(), 200);
+    uint16_t len = (uint16_t)std::min<size_t>(body.size(), 200);
     int off = writeHeader(buf, xr::PT_TEXT, (uint16_t)(sizeof(xr::TextHeader) + len));
 
     // Text does not use the PTT, so name the radio explicitly: whichever COM
     // the audio panel has selected for transmit. The server checks we really
-    // are tuned there before relaying.
+    // are tuned there before relaying. A message addressed to a callsign
+    // names no radio at all -- it is not a transmission.
     xr::TextHeader th{};
-    th.freqKhz     = (uint32_t)id(id(g_ref.audioComSel) == 7 ? g_ref.com2 : g_ref.com1);
+    th.freqKhz     = to.empty()
+                     ? (uint32_t)id(id(g_ref.audioComSel) == 7 ? g_ref.com2 : g_ref.com1)
+                     : 0u;
     th.fromSession = g_sessionId;
     strncpy(th.from, g_cfg.callsign.c_str(), sizeof(th.from) - 1);
     th.textLen     = len;
+    strncpy(th.to, to.c_str(), sizeof(th.to) - 1);
     memcpy(buf + off, &th, sizeof(th));
-    memcpy(buf + off + sizeof(th), text.data(), len);
+    memcpy(buf + off + sizeof(th), body.data(), len);
     g_sock.send(buf, off + (int)sizeof(th) + len);
 
     // The server does not echo to the sender, so show it ourselves.
-    char line[320];
-    snprintf(line, sizeof(line), "[%.3f] %s: %.*s", (double)(th.freqKhz % 1000000u) / 1000.0,
-             g_cfg.callsign.c_str(), (int)len, text.data());
+    char line[360];
+    if (to.empty()) {
+        snprintf(line, sizeof(line), "[%s] %s: %.*s", freqLabel(th.freqKhz).c_str(),
+                 g_cfg.callsign.c_str(), (int)len, body.data());
+    } else {
+        snprintf(line, sizeof(line), "[direct to %s] %s: %.*s", to.c_str(),
+                 g_cfg.callsign.c_str(), (int)len, body.data());
+    }
     addChat(line);
 }
 
@@ -694,9 +739,18 @@ void handleText(const uint8_t* payload, int len) {
     const std::string msg  = sanitizeText(
         reinterpret_cast<const char*>(payload + sizeof(th)), (size_t)textLen);
 
-    char line[320];
-    snprintf(line, sizeof(line), "[%.3f] %s: %s",
-             (double)(th.freqKhz % 1000000u) / 1000.0, from.c_str(), msg.c_str());
+    const std::string to = sanitizeText(th.to, sizeof(th.to));
+
+    // Three different things end up in this log and a pilot has to be able to
+    // tell them apart at a glance: an ordinary call on a frequency, a call on
+    // guard that everybody heard, and a message meant only for them.
+    char line[360];
+    if (!to.empty()) {
+        snprintf(line, sizeof(line), "[direct] %s: %s", from.c_str(), msg.c_str());
+    } else {
+        snprintf(line, sizeof(line), "[%s] %s: %s", freqLabel(th.freqKhz).c_str(),
+                 from.c_str(), msg.c_str());
+    }
     addChat(line);
 }
 
@@ -938,9 +992,14 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
     // A radio with no power is silent in both directions: zero volume here
     // stops anything already in the mixer, and the position packet has
     // already told the server we are not listening.
-    xr::voice::setRadioVolumes(
-        (uint32_t)id(g_ref.com1), comPowered(1) ? (g_ref.volCom1 ? fd(g_ref.volCom1) : 1.f) : 0.f,
-        (uint32_t)id(g_ref.com2), comPowered(2) ? (g_ref.volCom2 ? fd(g_ref.volCom2) : 1.f) : 0.f);
+    const float vol1 = comPowered(1) ? (g_ref.volCom1 ? fd(g_ref.volCom1) : 1.f) : 0.f;
+    const float vol2 = comPowered(2) ? (g_ref.volCom2 ? fd(g_ref.volCom2) : 1.f) : 0.f;
+    xr::voice::setRadioVolumes((uint32_t)id(g_ref.com1), vol1,
+                               (uint32_t)id(g_ref.com2), vol2);
+    // Guard reaches every aeroplane with a working radio, on whichever is
+    // turned up louder. With the avionics off it reaches this one too, and is
+    // heard exactly as much as anything else is: not at all.
+    xr::voice::setGuardGain(anyComPowered() ? std::max(vol1, vol2) : 0.f);
 
     // Switching the avionics off mid-transmission has to unkey us.
     if (g_pttDown && !anyComPowered()) setPtt(false);
@@ -1265,7 +1324,12 @@ void drawWindow(XPLMWindowID win, void*) {
     } else if (!g_chatInput.empty()) {
         snprintf(prompt, sizeof(prompt), "Say:   %s", g_chatInput.c_str());
     } else {
-        snprintf(prompt, sizeof(prompt), "Say:   (click here to type, Enter to send)");
+        // The hint is the only place @CALLSIGN is discoverable, and guard is
+        // worth naming next to it: between them they are the answer to "I do
+        // not know what frequency anyone is on".
+        snprintf(prompt, sizeof(prompt),
+                 "Say:   (click to type, Enter to send  ·  @CALLSIGN for one pilot"
+                 "  ·  121.500 is heard by all)");
     }
     drawFit(g_chatFocus ? green : (g_chatInput.empty() ? amber : white), x, inputY, r,
             prompt, xplmFont_Basic);

@@ -285,9 +285,29 @@ class XRadioServer(asyncio.DatagramProtocol):
     def _on_text(self, s: Session, payload):
         if len(payload) < P.TEXT_HDR.size:
             return
-        want_freq, _from_sid, _from, text_len = P.TEXT_HDR.unpack_from(payload, 0)
+        want_freq, _from_sid, _from, text_len, to_raw = P.TEXT_HDR.unpack_from(payload, 0)
         text = payload[P.TEXT_HDR.size:P.TEXT_HDR.size + min(text_len, MAX_TEXT_BYTES)]
         if not text:
+            return
+
+        # A message addressed to a callsign is not a transmission: it goes to
+        # that one pilot wherever they are, on no frequency at all, and nobody
+        # else sees it. A pilot who cannot be found is told so, rather than
+        # being left to wonder whether the message landed.
+        to = _clean(P.cstr(to_raw), 15)
+        if to:
+            target = next((x for x in self.sessions.values() if x.callsign == to), None)
+            if target is not None:
+                out = P.TEXT_HDR.pack(0, s.sid, P.pad(s.callsign, 16),
+                                      len(text), P.pad(to, 16)) + text
+                self._send(target.addr, P.PT_TEXT, target.sid, out)
+                LOG.info("direct %s -> %s: %s", s.callsign, to,
+                         text.decode("utf-8", "replace"))
+            else:
+                why = f"nobody called {to} is in this flight".encode()
+                out = P.TEXT_HDR.pack(0, 0, P.pad("XRADIO", 16),
+                                      len(why), P.pad(to, 16)) + why
+                self._send(s.addr, P.PT_TEXT, s.sid, out)
             return
 
         # Text does not need the PTT held down, so it is sent on whichever
@@ -300,7 +320,8 @@ class XRadioServer(asyncio.DatagramProtocol):
             freq = s.tx_freq() or s.com1
         if freq == 0:
             return
-        out_payload = P.TEXT_HDR.pack(freq, s.sid, P.pad(s.callsign, 16), len(text)) + text
+        out_payload = P.TEXT_HDR.pack(freq, s.sid, P.pad(s.callsign, 16),
+                                      len(text), P.pad("", 16)) + text
         for peer in self._listeners(s, freq):
             self._send(peer.addr, P.PT_TEXT, peer.sid, out_payload)
         LOG.info("text %s on %.3f: %s", s.callsign, freq / 1000.0,
@@ -334,9 +355,18 @@ class XRadioServer(asyncio.DatagramProtocol):
             self._send(peer.addr, P.PT_VOICE, peer.sid, out_payload)
 
     def _listeners(self, sender: Session, freq_khz: int):
-        """Everyone except the sender who has freq tuned and is in range."""
+        """Everyone except the sender who has freq tuned and is in range.
+
+        Guard is the exception: it reaches everyone in range whether or not
+        they have it tuned. It is the one frequency you can call somebody on
+        without already knowing where they are listening, which is the whole
+        reason it exists.
+        """
+        guard = P.is_guard(freq_khz)
         for peer in self.sessions.values():
-            if peer.sid == sender.sid or not peer.listening_on(freq_khz):
+            if peer.sid == sender.sid:
+                continue
+            if not guard and not peer.listening_on(freq_khz):
                 continue
             if sender.has_position and peer.has_position and not in_radio_range(sender, peer):
                 continue

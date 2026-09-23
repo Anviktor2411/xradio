@@ -147,18 +147,25 @@ public:
         squawk_ = squawk; xpdrMode_ = mode; ident_ = ident;
     }
 
-    void text(const char* body, uint32_t freq = 122800) {
+    void text(const char* body, uint32_t freq = 122800, const char* to = "") {
         uint8_t buf[xr::kMaxPacket];
         xr::TextHeader th{};
         th.freqKhz = freq;
         th.fromSession = sid_;
         snprintf(th.from, sizeof(th.from), "%s", callsign_.c_str());
+        snprintf(th.to, sizeof(th.to), "%s", to);
         const uint16_t n = (uint16_t)strlen(body);
         th.textLen = n;
         memcpy(buf, &th, sizeof(th));
         memcpy(buf + sizeof(th), body, n);
         send(xr::PT_TEXT, sid_, buf, (int)sizeof(th) + n);
     }
+
+    // The frequency and addressee of the last text this peer received, so a
+    // test can tell a guard call from an ordinary one and both from a message
+    // meant only for them.
+    struct LastText { uint32_t freq = 0; std::string to, from, body; };
+    LastText lastText;
 
     // Everything received in `ms`, split by packet type.
     struct Bag {
@@ -211,6 +218,13 @@ public:
                 const int len = (int)th.textLen;
                 if (off + (size_t)len <= (size_t)n && len > 0) {
                     bag.texts.push_back(std::string((const char*)buf + off, (size_t)len));
+                    char cs[17] = {0}, ts[17] = {0};
+                    memcpy(cs, th.from, 16);
+                    memcpy(ts, th.to, 16);
+                    lastText.freq = th.freqKhz;
+                    lastText.from = cs;
+                    lastText.to = ts;
+                    lastText.body = bag.texts.back();
                 }
             }
         }
@@ -574,6 +588,85 @@ int main(int argc, char** argv) {
         harness::click(1, sx + 40, sy + 200);
         harness::typeText(1, "zzz");
         check("clicking away stops capturing keys", !shows(harness::draw(), "zzz"));
+    }
+
+    printf("\nguard, and a message for one pilot\n");
+    {
+        // Two pilots on a server have no way to find each other if neither
+        // knows what frequency the other is on. Guard is the answer aviation
+        // already has: everybody hears 121.500 whatever they have tuned. And
+        // when you do know who you want, "@CALLSIGN ..." reaches them and
+        // nobody else.
+        Peer gd("GUARD1", 57.858, 27.028);
+        check("a pilot joins on another frequency", gd.login());
+        for (int i = 0; i < 6; ++i) { gd.position(118100); fly(0.1); }
+
+        // They call on guard; we are on 122.800 and hear it anyway. They do
+        // have to be tuned to guard to transmit on it -- that rule is not
+        // relaxed, only the listening side is.
+        for (int i = 0; i < 4; ++i) { gd.position(xr::kGuardKhz); fly(0.1); }
+        gd.text("anyone, come to 118.100", xr::kGuardKhz);
+        fly(0.8);
+        auto w = harness::draw();
+        check("a call on guard is heard on another frequency",
+              shows(w, "anyone, come to 118.100"));
+        check("and is labelled as guard, not as an ordinary call",
+              shows(w, "GUARD 121.500"));
+        if (!shows(w, "GUARD 121.500")) dump(w);
+
+        // A message addressed to us arrives however we are tuned, and says so.
+        gd.text("see you on 118.1", 0, "HOSTER");
+        fly(0.8);
+        w = harness::draw();
+        check("a message addressed to us arrives", shows(w, "see you on 118.1"));
+        check("and is labelled as direct, not as a frequency",
+              shows(w, "[direct] GUARD1: see you on 118.1"));
+        if (!shows(w, "[direct]")) dump(w);
+
+        // Sending one: "@CALLSIGN message" in the Say row.
+        int sx = 0, sy = 0;
+        check("the Say row is there", harness::drawnAt("Say:", &sx, &sy));
+        harness::click(1, sx + 40, sy);
+        harness::typeText(1, "@GUARD1 on my way");
+        harness::pressVk(1, 0x0D);
+        for (int i = 0; i < 6; ++i) { gd.position(118100); fly(0.1); }
+        auto bag = gd.drain(400);
+        bool got = false;
+        for (const auto& t : bag.texts) if (t == "on my way") got = true;
+        check("@CALLSIGN reaches that pilot", got,
+              bag.texts.empty() ? "nothing" : bag.texts.back());
+        check("with the callsign taken off the front, not sent as text",
+              gd.lastText.body == "on my way", gd.lastText.body);
+        check("addressed to them", gd.lastText.to == "GUARD1", gd.lastText.to);
+        check("and on no frequency, because it is not a transmission",
+              gd.lastText.freq == 0, std::to_string(gd.lastText.freq));
+        check("our own log shows where it went",
+              shows(harness::draw(), "[direct to GUARD1] HOSTER: on my way"));
+
+        // A callsign nobody is using comes back with an answer.
+        harness::click(1, sx + 40, sy);
+        harness::typeText(1, "@NOBODY hello");
+        harness::pressVk(1, 0x0D);
+        fly(1.0);
+        check("a callsign that is not in the flight is answered",
+              shows(harness::draw(), "nobody called NOBODY is in this flight"));
+        if (!shows(harness::draw(), "nobody called NOBODY"))
+            dump(harness::draw());
+
+        // An @ in the middle of a sentence is just an @.
+        harness::click(1, sx + 40, sy);
+        harness::typeText(1, "meet me @ the hold short");
+        harness::pressVk(1, 0x0D);
+        for (int i = 0; i < 6; ++i) { gd.position(118100); fly(0.1); }
+        bag = gd.drain(400);
+        bool onRadio = false;
+        for (const auto& t : bag.texts) if (t == "meet me @ the hold short") onRadio = true;
+        check("an @ that is not at the start is ordinary text", !onRadio,
+              "it was sent, but this pilot is on another frequency");
+        check("and it went out on the radio, not to somebody",
+              shows(harness::draw(), "[122.800] HOSTER: meet me @ the hold short"));
+
+        harness::click(1, sx + 40, sy + 200);   // hand the keyboard back
     }
 
     printf("\nthe hosting tab reports what is going on\n");

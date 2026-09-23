@@ -82,6 +82,12 @@ void onIncomingFrame(uint32_t sid, uint16_t seq, const uint8_t* data, int len,
 // tuned to is scaled by that knob, like it would be in the aircraft.
 void setRadioVolumes(uint32_t com1Khz, float com1Vol, uint32_t com2Khz, float com2Vol);
 
+// How loud a transmission on guard is when neither radio is tuned there.
+// Everybody in range hears guard, but "everybody" still means everybody with
+// a working radio -- an aeroplane with the avionics off hears nothing at all,
+// so the caller passes 0 for that.
+void setGuardGain(float gain);
+
 // Signal quality last set for a pilot (1 if never set): for the window's bars.
 float signalQualityOf(uint32_t sid);
 
