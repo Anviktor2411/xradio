@@ -223,6 +223,22 @@ struct VoiceHeader {         // 12 bytes, followed by `opusLen` bytes of Opus
 
 #pragma pack(pop)
 
-static const int kMaxPacket = 1400;   // stay under a typical MTU
+// The whole datagram, header included.
+//
+// 1200 rather than the 1400 that fits an ethernet MTU, because a fair number
+// of XRadio flights do not go over plain ethernet: a group whose router will
+// not forward a port puts everyone on Tailscale or another WireGuard-based
+// VPN, and those hand you a 1280-byte link. With IPv4 and UDP headers on top
+// that leaves 1252 bytes, and a packet over it is fragmented -- which mostly
+// works, right up until the path where it does not, and then it looks like
+// traffic that stutters or voice that breaks up for one pilot only.
+static const int kMaxPacket = 1200;
+
+// How many aircraft fit in one traffic packet. Worked out from the structs
+// rather than written down, because it was written down once and went quietly
+// wrong the next time an entry grew.
+static const int kMaxTrafficEntries =
+    (kMaxPacket - (int)sizeof(Header) - (int)sizeof(TrafficHeader)) /
+    (int)sizeof(TrafficEntry);
 
 }  // namespace xr

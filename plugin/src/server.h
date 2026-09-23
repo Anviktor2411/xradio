@@ -15,6 +15,8 @@
 #include <string>
 #include <vector>
 
+#include "protocol.h"   // kMaxTrafficEntries: the cap is the structs' business
+
 namespace xr {
 namespace relay {
 
@@ -23,7 +25,12 @@ constexpr double kTrafficHz        = 10.0;   // twice the clients' report rate
 constexpr double kTrafficRangeNm   = 80.0;
 constexpr double kSessionTimeoutS  = 15.0;
 constexpr double kTxHoldS          = 0.4;
-constexpr int    kMaxEntriesPerPacket = 13;  // 13 * 104 + 16 < 1400 bytes
+constexpr int    kMaxEntriesPerPacket = kMaxTrafficEntries;   // from protocol.h
+// More aircraft in range than fit in one packet are sent in several, so the
+// packet size stops deciding how many aeroplanes a pilot can see. This is the
+// cap on the whole lot, nearest first -- a bound on the work one crowded
+// client can make the server do, not a limit anyone will meet in a flight.
+constexpr int    kMaxEntriesTotal  = 60;
 constexpr int    kMaxTextBytes     = 200;
 constexpr int    kMaxVoiceBytes    = 512;
 

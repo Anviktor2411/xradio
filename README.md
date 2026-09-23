@@ -51,6 +51,13 @@ hears the question. A dedicated server is still the better answer for a
 group that wants to fly without waiting for one particular person to be
 online — see [Running a dedicated server](#running-a-dedicated-server).
 
+**If the port will not open at all** — a router you cannot get into, or mobile
+internet where forwarding cannot work however you configure it — see
+**[Flying together when the router says no](docs/vpn.md)**.
+It walks through putting everyone on Tailscale (five minutes each, free for a
+group of six), the ZeroTier alternative, forwarding by hand, and renting a
+small VPS, with a table at the top for picking between them.
+
 ## Architecture
 
 ```
@@ -97,7 +104,13 @@ places and the two **must stay in sync**:
 - `plugin/src/protocol.h` (C++)
 - `server/protocol.py` (Python)
 
-`tools/check_sizes.cpp` verifies that the struct sizes match.
+`tools/check_sizes.cpp` verifies that the struct sizes match, and the same
+check covers the packet budget: every datagram stays under **1200 bytes**, not
+the 1400 an ethernet MTU allows, because a group whose router will not forward
+a port puts everyone on Tailscale or another WireGuard-based VPN and those
+hand you a 1280-byte link. More aircraft in range than fit in one traffic
+packet are sent in several, so the packet size never decides how many
+aeroplanes a pilot can see.
 
 ## Running a dedicated server
 

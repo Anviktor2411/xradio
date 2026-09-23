@@ -458,21 +458,29 @@ void Core::broadcastTraffic(double now) {
         std::sort(others.begin(), others.end(), [me](Session* a, Session* b) {
             return distanceNm(*me, *a) < distanceNm(*me, *b);
         });
-        if ((int)others.size() > kMaxEntriesPerPacket) {
-            others.resize((size_t)kMaxEntriesPerPacket);
+        if ((int)others.size() > kMaxEntriesTotal) {
+            others.resize((size_t)kMaxEntriesTotal);
         }
         sendTraffic(*me, others, now);
     }
 }
 
+// Sent in as many packets as it takes. The count in each header is the number
+// of entries in that packet, decided before anything is written -- a header
+// that promises more than it carries is how a receiver ends up reading a
+// neighbouring aircraft's bytes as a position.
 void Core::sendTraffic(Session& me, const std::vector<Session*>& others, double now) {
+  for (size_t first = 0; first == 0 || first < others.size();
+       first += (size_t)kMaxEntriesPerPacket) {
+    const size_t n = std::min((size_t)kMaxEntriesPerPacket, others.size() - first);
     uint8_t payload[kMaxPacket];
     TrafficHeader th{};
-    th.count = (uint16_t)others.size();
+    th.count = (uint16_t)n;
     memcpy(payload, &th, sizeof(th));
     size_t off = sizeof(th);
 
-    for (Session* o : others) {
+    for (size_t i = first; i < first + n; ++i) {
+        Session* o = others[i];
         uint8_t txActive = 0;
         if (now - o->lastVoice < kTxHoldS) {
             const uint32_t f = o->txFreq();
@@ -497,6 +505,7 @@ void Core::sendTraffic(Session& me, const std::vector<Session*>& others, double 
         off += sizeof(e);
     }
     send(me.peer, PT_TRAFFIC, me.sid, payload, (int)off);
+  }
 }
 
 // ---------------------------------------------------------------------------

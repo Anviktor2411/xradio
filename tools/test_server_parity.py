@@ -572,6 +572,56 @@ def scenario_transponder(port):
     return out
 
 
+def scenario_crowded_sky(port):
+    """More aircraft in range than fit in one packet.
+
+    A traffic packet holds ten. With more than that about, the rest have to
+    arrive in further packets -- not be dropped, and above all not be counted
+    in a header that promises more entries than the packet carries, which a
+    receiver reads as a position made of the next aircraft's bytes.
+    """
+    out = {}
+    n = P.MAX_TRAFFIC_ENTRIES + 4          # enough to need two packets
+    watcher = Client(port, "ESCRWD", 57.85, 27.02)
+    watcher.login()
+    others = []
+    for i in range(n):
+        c = Client(port, f"ESC{i:03d}", 57.85 + 0.001 * i, 27.02)
+        c.login()
+        others.append(c)
+
+    for _ in range(3):
+        for c in others:
+            c.position(time_ms=100)
+        watcher.position(time_ms=100)
+        time.sleep(0.15)
+
+    seen, packets, honest = set(), 0, True
+    for raw in watcher.drain(1.0)[P.PT_TRAFFIC]:
+        count, _ = P.TRAFFIC_HDR.unpack_from(raw, 0)
+        packets += 1
+        # The header must describe this packet, not the sender's intentions.
+        if P.TRAFFIC_HDR.size + count * P.TRAFFIC_ENTRY.size > len(raw):
+            honest = False
+            continue
+        if count > P.MAX_TRAFFIC_ENTRIES:
+            honest = False
+        off = P.TRAFFIC_HDR.size
+        for _ in range(count):
+            e = P.TRAFFIC_ENTRY.unpack_from(raw, off)
+            off += P.TRAFFIC_ENTRY.size
+            seen.add(e[1].rstrip(b"\x00").decode())
+
+    out["others"] = n
+    out["distinct_seen"] = len(seen)
+    out["header_counts_are_honest"] = honest
+    out["got_more_than_one_packet"] = packets > 1
+    watcher.close()
+    for c in others:
+        c.close()
+    return out
+
+
 SCENARIOS = [
     ("login and traffic", scenario_login_and_traffic),
     ("login validation", scenario_bad_login),
@@ -584,6 +634,7 @@ SCENARIOS = [
     ("flight password", scenario_password),
     ("shared weather", scenario_weather),
     ("transponder", scenario_transponder),
+    ("a crowded sky", scenario_crowded_sky),
 ]
 # scenarios whose server runs with a flight password
 PASSWORDED = {"flight password": "sky"}
@@ -779,6 +830,15 @@ def main():
     check("nor one above 7777", r["over_7777"][2] == 0, str(r["over_7777"]))
     check("a mode outside the enum becomes off, not something random",
           r["mode_out_of_range"][1] == P.XPDR_OFF, str(r["mode_out_of_range"]))
+
+    r = cpp["a crowded sky"]
+    check("a header never promises more entries than its packet carries",
+          r["header_counts_are_honest"])
+    check("more aircraft than fit in one packet are sent in several",
+          r["got_more_than_one_packet"])
+    check("and none of them is dropped on the way",
+          r["distinct_seen"] == r["others"],
+          f"{r['distinct_seen']} of {r['others']}")
 
     print()
     if failures:

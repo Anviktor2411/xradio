@@ -620,6 +620,24 @@ int main(int argc, char** argv) {
         // forwarding is the only way to fly with friends.
         check("it offers a way out when the router cannot be changed",
               shows(v, "Tailscale") || shows(v, "let a friend host"));
+        check("and says where the step-by-step is, not just that one exists",
+              shows(v, "docs/vpn.md"));
+
+        // Unlike the main window, this one does not truncate: a line longer
+        // than the window is drawn straight out over the cockpit. The lines
+        // here are the longest in the plugin, so this is where that happens.
+        {
+            int wl = 0, wt = 0, wr = 0, wb = 0;
+            harness::windowRect(kWin, &wl, &wt, &wr, &wb);
+            int over = 0;
+            std::string worst;
+            for (const auto& d : harness::drawnPositions()) {
+                const int endX = d.x + 7 * (int)d.text.size();   // 7 px a character
+                if (endX > wr) { ++over; worst = d.text; }
+            }
+            check("no line runs off the right-hand edge", over == 0,
+                  std::to_string(over) + " over, e.g. " + worst);
+        }
 
         // This tab says far more than the others, and a window sized for the
         // Connection tab used to cut off the join code, who is connected,

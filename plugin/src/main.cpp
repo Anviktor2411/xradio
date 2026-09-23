@@ -1778,6 +1778,10 @@ void drawSettings(XPLMWindowID win, void*) {
                     xr::ui::text(g_ui, "If you cannot change the router: let a friend host instead, or put", 1);
                     xr::ui::text(g_ui, "everyone on a VPN like Tailscale or ZeroTier and host on the address", 1);
                     xr::ui::text(g_ui, "it gives you -- no forwarding needed. server/ also runs on a VPS.", 1);
+                    // Saying "use a VPN" and stopping there is how a pilot
+                    // gives up. The guide is the rest of that sentence.
+                    xr::ui::text(g_ui,
+                        "Step by step:  github.com/Anviktor2411/xradio/blob/main/docs/vpn.md", 2);
                 }
             }
 

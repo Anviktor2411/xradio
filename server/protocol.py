@@ -40,7 +40,15 @@ def xpdr_transmitting(mode: int) -> bool:
     """Above standby is transmitting, so it is on other aircraft's TCAS."""
     return mode > XPDR_STANDBY
 
-MAX_PACKET = 1400
+# The whole datagram, header included. 1200 rather than the 1400 that fits an
+# ethernet MTU, because a group whose router will not forward a port puts
+# everyone on Tailscale or another WireGuard-based VPN, and those hand you a
+# 1280-byte link -- 1252 once IPv4 and UDP headers are on. See protocol.h.
+MAX_PACKET = 1200
+
+# How many aircraft fit in one traffic packet, worked out rather than written
+# down. Must equal xr::kMaxTrafficEntries.
+MAX_TRAFFIC_ENTRIES = (MAX_PACKET - 12 - 4) // 108
 
 HEADER = struct.Struct("<IBBHI")          # magic, type, version, payloadLen, sessionId
 LOGIN = struct.Struct("<16s8sHH16s32s")   # callsign, acIcao, protoVer, flags, livery, password

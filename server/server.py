@@ -29,7 +29,13 @@ TRAFFIC_HZ = 10.0           # traffic broadcast rate: twice the clients' report 
 TRAFFIC_RANGE_NM = 80.0     # how far away other aircraft are still sent
 SESSION_TIMEOUT_S = 15.0    # drop a client we have not heard from
 TX_HOLD_S = 0.4             # how long txActive stays set after the last voice frame
-MAX_ENTRIES_PER_PACKET = 13  # 13 * 104 + 16 < 1400 bytes
+# From the struct sizes, not written down: it was written down once and went
+# quietly wrong the next time an entry grew.
+MAX_ENTRIES_PER_PACKET = P.MAX_TRAFFIC_ENTRIES
+# More aircraft in range than fit in one packet go in several, so the packet
+# size stops deciding how many aeroplanes a pilot can see. This caps the whole
+# lot, nearest first: a bound on the work one crowded client can ask for.
+MAX_ENTRIES_TOTAL = 60
 MAX_TEXT_BYTES = 200        # cap relayed text so one client cannot spam huge frames
 MAX_VOICE_BYTES = 512       # one 20 ms Opus frame at 24 kbit/s is ~60 bytes
 
@@ -387,23 +393,31 @@ class XRadioServer(asyncio.DatagramProtocol):
                 others.append(other)
             # nearest first, so the packet cap drops the far ones
             others.sort(key=lambda o: distance_nm(me, o))
-            self._send_traffic(me, others[:MAX_ENTRIES_PER_PACKET], now)
+            self._send_traffic(me, others[:MAX_ENTRIES_TOTAL], now)
 
     def _send_traffic(self, me: Session, others: list, now: float):
-        parts = [P.TRAFFIC_HDR.pack(len(others), 0)]
-        for o in others:
-            tx_active = 0
-            if now - o.last_voice < TX_HOLD_S:
-                f = o.tx_freq()
-                tx_active = 1 if (f and me.listening_on(f)) else 0
-            parts.append(P.TRAFFIC_ENTRY.pack(
-                o.sid, P.pad(o.callsign, 16), P.pad(o.ac_icao, 8),
-                o.lat, o.lon, o.alt_m, o.heading, o.pitch, o.roll,
-                o.gs_ms, o.gear, o.flap,
-                o.lights, o.on_ground, tx_active, o.xpdr_mode,
-                o.time_ms, o.track, o.vs_ms,
-                P.pad(o.livery, 16), o.squawk, o.xpdr_ident, 0))
-        self._send(me.addr, P.PT_TRAFFIC, me.sid, b"".join(parts))
+        """Sent in as many packets as it takes.
+
+        The count in each header is what that packet actually carries: a
+        header promising more than it holds is how a receiver ends up reading
+        a neighbouring aircraft's bytes as a position.
+        """
+        for first in range(0, max(len(others), 1), MAX_ENTRIES_PER_PACKET):
+            chunk = others[first:first + MAX_ENTRIES_PER_PACKET]
+            parts = [P.TRAFFIC_HDR.pack(len(chunk), 0)]
+            for o in chunk:
+                tx_active = 0
+                if now - o.last_voice < TX_HOLD_S:
+                    f = o.tx_freq()
+                    tx_active = 1 if (f and me.listening_on(f)) else 0
+                parts.append(P.TRAFFIC_ENTRY.pack(
+                    o.sid, P.pad(o.callsign, 16), P.pad(o.ac_icao, 8),
+                    o.lat, o.lon, o.alt_m, o.heading, o.pitch, o.roll,
+                    o.gs_ms, o.gear, o.flap,
+                    o.lights, o.on_ground, tx_active, o.xpdr_mode,
+                    o.time_ms, o.track, o.vs_ms,
+                    P.pad(o.livery, 16), o.squawk, o.xpdr_ident, 0))
+            self._send(me.addr, P.PT_TRAFFIC, me.sid, b"".join(parts))
 
 
 async def main():

@@ -14,5 +14,10 @@ int main() {
     printf("TEXT_HDR %zu\n",      sizeof(xr::TextHeader));
     printf("VOICE_HDR %zu\n",     sizeof(xr::VoiceHeader));
     printf("WEATHER %zu\n",       sizeof(xr::WeatherPayload));
+    // Not a struct, but the same class of mistake: a packet budget or an
+    // entry cap that drifts apart between the two servers shows up as
+    // traffic that thins out for clients of one of them.
+    printf("MAX_PACKET %d\n",      xr::kMaxPacket);
+    printf("MAX_TRAFFIC_ENTRIES %d\n", xr::kMaxTrafficEntries);
     return 0;
 }
