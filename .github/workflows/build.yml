@@ -247,7 +247,10 @@ jobs:
                    build/Release/xradio_server.exe build/Release/xradio_server; do
             if [ -f "$p" ]; then cp "$p" dist/XRadio/server/${{ matrix.platdir }}/; fi
           done
-          cp server/server.py server/protocol.py dist/XRadio/server/
+          # The systemd unit too: somebody setting a server up from the
+          # release zip should not have to go and find it in the repository.
+          cp server/server.py server/protocol.py server/xradio.service \
+             dist/XRadio/server/
           mkdir -p dist/XRadio/Resources/CSL
           cat > dist/XRadio/Resources/CSL/README.txt <<'EOF'
           CSL models go here
