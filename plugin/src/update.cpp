@@ -44,9 +44,11 @@ bool safeUrl(const std::string& u) {
     if (u.size() < 8 || u.size() > 300) return false;
     if (u.rfind("http://", 0) != 0 && u.rfind("https://", 0) != 0) return false;
     for (char c : u) {
+        // c != 0 first, deliberately: strchr answers "yes, at the end" for a
+        // null byte, so without it an embedded NUL would pass as acceptable.
         const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
                         (c >= '0' && c <= '9') ||
-                        strchr(":/._~?=&%-+", c) != nullptr;
+                        (c != '\0' && strchr(":/._~?=&%-+", c) != nullptr);
         if (!ok) return false;
     }
     return true;

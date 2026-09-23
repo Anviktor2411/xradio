@@ -117,6 +117,8 @@ def checks():
                       ["bash", "tools/check_windows_build.sh"])
         else:
             say("  the plugin compiles for Windows ... skipped (no mingw-w64 here)")
+        ok &= run("the CSL bridge compiles against real XPMP2",
+                  ["bash", "tools/check_xpmp2_build.sh"])
     if have("python3"):
         ok &= run("server protocol and routing", ["python3", "tools/test_server.py"])
 

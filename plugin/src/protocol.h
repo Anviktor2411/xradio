@@ -11,7 +11,7 @@ namespace xr {
 
 // "XRC1" as little-endian bytes.
 static const uint32_t kMagic       = 0x31435258u;
-static const uint16_t kProtoVersion = 3;   // v3: livery, flight password, login rejection
+static const uint16_t kProtoVersion = 4;   // v4: transponder (squawk, mode, ident)
 
 enum PacketType : uint8_t {
     PT_LOGIN     = 1,  // client -> server
@@ -38,6 +38,40 @@ enum RejectReason : uint16_t {
 
 // Transmit selector
 enum TxRadio : uint8_t { TX_NONE = 0, TX_COM1 = 1, TX_COM2 = 2 };
+
+// Transponder mode. Deliberately the same numbering X-Plane uses for both
+// `sim/cockpit/radios/transponder_mode` and the TCAS target dataref
+// `sim/cockpit2/tcas/targets/ssr_mode`, and the same as XPMP2's
+// XPMPTransponderMode -- so a mode read out of one sim goes into the other
+// end's TCAS untranslated, and nobody has to remember a mapping.
+enum XpdrMode : uint8_t {
+    XPDR_OFF     = 0,
+    XPDR_STANDBY = 1,
+    XPDR_ON      = 2,   // mode A: identity only, no altitude
+    XPDR_ALT     = 3,   // mode C: identity and altitude
+    XPDR_TEST    = 4,
+    XPDR_GROUND  = 5,   // mode S
+    XPDR_TA_ONLY = 6,
+    XPDR_TA_RA   = 7,
+};
+
+// A squawk is four octal digits, so 7777 is the largest there is and no digit
+// may be an 8 or a 9. Stored as the decimal number that spells those digits,
+// which is what the panel shows and what X-Plane keeps.
+inline bool validSquawk(uint16_t code) {
+    if (code > 7777) return false;
+    for (uint16_t c = code; c; c /= 10)
+        if (c % 10 > 7) return false;
+    return true;
+}
+
+// Anything above standby is transmitting, so it is on other aircraft's TCAS.
+inline bool xpdrTransmitting(uint8_t mode) { return mode > XPDR_STANDBY; }
+// Only mode C and above report pressure altitude. A mode A target is a
+// bearing-only target: you know it is there, not how high it is.
+inline bool xpdrReportsAltitude(uint8_t mode) {
+    return mode >= XPDR_ALT && mode != XPDR_TEST;
+}
 
 // Receive mask bits
 static const uint8_t RX_COM1 = 1 << 0;
@@ -81,7 +115,7 @@ struct LoginRejectPayload {  // 4 bytes
 };
 
 // State of our own aircraft, sent to the server.
-struct PositionPayload {     // 68 bytes
+struct PositionPayload {     // 72 bytes (v4)
     double   lat;            // degrees
     double   lon;            // degrees
     float    altMslM;        // metres MSL
@@ -102,10 +136,16 @@ struct PositionPayload {     // 68 bytes
     uint32_t timeMs;         // sender's clock, ms, wraps freely
     float    trackTrue;      // degrees, direction of travel (differs from heading in wind)
     float    vsMs;           // vertical speed, m/s, up positive
+    // v4. The squawk is the four digits as they read on the panel -- 1200 is
+    // literally 1200 -- which is how X-Plane stores it too. Every digit is
+    // 0..7, so 7777 is the largest there is.
+    uint16_t squawk;
+    uint8_t  xpdrMode;       // XpdrMode
+    uint8_t  xpdrIdent;      // 1 while IDENT is being squawked
 };
 
 // One other aircraft, as the server sees it.
-struct TrafficEntry {        // 104 bytes
+struct TrafficEntry {        // 108 bytes (v4)
     uint32_t sessionId;
     char     callsign[16];
     char     acIcao[8];
@@ -121,11 +161,14 @@ struct TrafficEntry {        // 104 bytes
     uint8_t  lights;
     uint8_t  onGround;
     uint8_t  txActive;       // 1 while this aircraft is keying a radio we hear
-    uint8_t  reserved;
+    uint8_t  xpdrMode;       // v4, was reserved: XpdrMode
     uint32_t timeMs;         // the sender's timestamp, passed through untouched
     float    trackTrue;
     float    vsMs;
     char     livery[16];     // v3, from the login
+    uint16_t squawk;         // v4
+    uint8_t  xpdrIdent;      // v4
+    uint8_t  reserved;
 };
 
 struct TrafficHeader {       // 4 bytes, followed by `count` TrafficEntry

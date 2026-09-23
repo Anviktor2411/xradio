@@ -97,7 +97,8 @@ class Session:
     def position(self):
         self.sock.sendto(P.pack(P.PT_POSITION, self.sid, P.POSITION.pack(
             57.85, 27.02, 914.0, 90.0, 0.0, 0.0, 50.0, 0.0, 0.0,
-            122800, 0, 0, 0, P.TX_COM1, P.RX_COM1, 0, 90.0, 0.0)), self.dest)
+            122800, 0, 0, 0, P.TX_COM1, P.RX_COM1, 0, 90.0, 0.0,
+            1200, P.XPDR_ALT, 0)), self.dest)
 
     def alive(self):
         """Ping and wait for the pong: proof the server is still serving.
@@ -176,7 +177,12 @@ def main():
                                        rng.randint(0, 255), rng.randint(0, 255),
                                        rng.randint(0, 2**32 - 1),
                                        rng.choice(WILD_FLOATS),
-                                       rng.choice(WILD_FLOATS))
+                                       rng.choice(WILD_FLOATS),
+                                       # transponder: every squawk a client
+                                       # could claim, including the impossible
+                                       rng.randint(0, 65535),
+                                       rng.randint(0, 255),
+                                       rng.randint(0, 255))
             except (OverflowError, struct.error):
                 continue
             pkt = P.pack(P.PT_POSITION, attacker.sid, body)
@@ -194,7 +200,7 @@ def main():
         elif pick == 7:                                  # a valid packet, mangled
             base = P.pack(P.PT_POSITION, attacker.sid, P.POSITION.pack(
                 57.85, 27.02, 914.0, 90.0, 0.0, 0.0, 50.0, 0.0, 0.0,
-                122800, 0, 0, 0, 1, 1, 0, 90.0, 0.0))
+                122800, 0, 0, 0, 1, 1, 0, 90.0, 0.0, 1200, P.XPDR_ALT, 0))
             pkt = mutate(rng, base)
         elif pick == 8:                                  # someone else's session
             pkt = P.pack(P.PT_TEXT, rng.randint(0, 2**32 - 1),

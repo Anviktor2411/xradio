@@ -64,6 +64,9 @@ class Session:
     time_ms: int = 0            # the client's own timestamp, relayed untouched
     track: float = 0.0
     vs_ms: float = 0.0
+    squawk: int = 1200          # the four digits as they read on the panel
+    xpdr_mode: int = P.XPDR_ALT
+    xpdr_ident: int = 0
 
     @property
     def alt_ft(self) -> float:
@@ -235,7 +238,8 @@ class XRadioServer(asyncio.DatagramProtocol):
         (lat, lon, alt_m, heading, pitch, roll, gs_ms,
          gear, flap, com1, com2,
          lights, on_ground, tx_radio, rx_mask,
-         time_ms, track, vs_ms) = P.POSITION.unpack_from(payload, 0)
+         time_ms, track, vs_ms,
+         squawk, xpdr_mode, xpdr_ident) = P.POSITION.unpack_from(payload, 0)
 
         # A client can send anything. NaN or a wild coordinate would be relayed
         # to everyone else and poison their renderer, and it breaks the
@@ -264,6 +268,12 @@ class XRadioServer(asyncio.DatagramProtocol):
         s.lights, s.on_ground = lights, on_ground
         s.tx_radio, s.rx_mask = tx_radio, rx_mask
         s.time_ms, s.track, s.vs_ms = time_ms, track % 360.0, vs_ms
+        # A squawk is four octal digits. Anything else is a client bug or a
+        # client being clever, and either way it is not relayed as if real.
+        s.squawk = squawk if 0 <= squawk <= 7777 and all(
+            c <= "7" for c in f"{squawk:04d}") else 0
+        s.xpdr_mode = xpdr_mode if xpdr_mode <= P.XPDR_TA_RA else P.XPDR_OFF
+        s.xpdr_ident = 1 if xpdr_ident else 0
         s.has_position = True
 
     def _on_text(self, s: Session, payload):
@@ -390,9 +400,9 @@ class XRadioServer(asyncio.DatagramProtocol):
                 o.sid, P.pad(o.callsign, 16), P.pad(o.ac_icao, 8),
                 o.lat, o.lon, o.alt_m, o.heading, o.pitch, o.roll,
                 o.gs_ms, o.gear, o.flap,
-                o.lights, o.on_ground, tx_active, 0,
+                o.lights, o.on_ground, tx_active, o.xpdr_mode,
                 o.time_ms, o.track, o.vs_ms,
-                P.pad(o.livery, 16)))
+                P.pad(o.livery, 16), o.squawk, o.xpdr_ident, 0))
         self._send(me.addr, P.PT_TRAFFIC, me.sid, b"".join(parts))
 
 

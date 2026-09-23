@@ -37,14 +37,15 @@ FLAGS=(-std=c++17 -fsyntax-only -Wall -Wextra
 # Voice needs Opus and miniaudio; skip it rather than fail if they are absent.
 if [ -f lib/miniaudio/miniaudio.h ] && [ -d lib/opus/include ]; then
     FLAGS+=(-DXRADIO_USE_VOICE=1 -Ilib/miniaudio -Ilib/opus/include)
-    SOURCES="plugin/src/main.cpp plugin/src/net.cpp plugin/src/server.cpp
-             plugin/src/ui.cpp plugin/src/upnp.cpp plugin/src/voice.cpp
-             plugin/src/xpmp_bridge.cpp tools/server_main.cpp"
+    SOURCES="plugin/src/clipboard.cpp plugin/src/main.cpp plugin/src/net.cpp
+             plugin/src/server.cpp plugin/src/ui.cpp plugin/src/upnp.cpp
+             plugin/src/voice.cpp plugin/src/xpmp_bridge.cpp
+             tools/server_main.cpp"
 else
     echo "  note  Opus/miniaudio not fetched -- skipping voice.cpp"
-    SOURCES="plugin/src/main.cpp plugin/src/net.cpp plugin/src/server.cpp
-             plugin/src/ui.cpp plugin/src/upnp.cpp plugin/src/xpmp_bridge.cpp
-             tools/server_main.cpp"
+    SOURCES="plugin/src/clipboard.cpp plugin/src/main.cpp plugin/src/net.cpp
+             plugin/src/server.cpp plugin/src/ui.cpp plugin/src/upnp.cpp
+             plugin/src/xpmp_bridge.cpp tools/server_main.cpp"
 fi
 
 fails=0

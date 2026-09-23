@@ -45,6 +45,9 @@ class Handler(BaseHTTPRequestHandler):
         else:
             r = dict(RELEASE)
             if MODE == "same":
+                # Must match the version update_test says it is running, or
+                # this mood silently turns into the "older" one. The test
+                # asserts on the value, so a change here fails loudly.
                 r["tag_name"] = "v0.5.2"
             elif MODE == "older":
                 r["tag_name"] = "v0.1.3"
@@ -63,5 +66,14 @@ if __name__ == "__main__":
     ap.add_argument("--port", type=int, default=5399)
     args = ap.parse_args()
     MODE = args.mode
+    # Bind first, announce second. Printing before the bind is how a caller
+    # that waits for this line ends up talking to a port nothing is listening
+    # on yet -- or, worse, to the previous run's server that never exited.
+    server = HTTPServer(("127.0.0.1", args.port), Handler)
     print(f"fake release endpoint on {args.port}, mode {args.mode}", flush=True)
-    HTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()

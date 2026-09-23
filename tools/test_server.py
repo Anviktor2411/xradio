@@ -53,13 +53,15 @@ class Client:
             self.sid, _ = P.LOGIN_ACK.unpack_from(pkt, 0)
         return self.sid
 
-    def position(self, tx=P.TX_NONE, rx=P.RX_COM1, sid=None):
+    def position(self, tx=P.TX_NONE, rx=P.RX_COM1, sid=None,
+                 squawk=1200, xpdr=P.XPDR_ALT, ident=0):
         self.sock.sendto(P.pack(P.PT_POSITION, self.sid if sid is None else sid,
                                 P.POSITION.pack(
                                     self.lat, self.lon, self.alt_ft / 3.28084,
                                     90.0, 0.0, 0.0, 60.0, 0.0, 0.0,
                                     self.com1, self.com2, 0, 0, tx, rx,
-                                    int(time.monotonic() * 1000) & 0xFFFFFFFF, 90.0, 0.0)),
+                                    int(time.monotonic() * 1000) & 0xFFFFFFFF, 90.0, 0.0,
+                                    squawk, xpdr, ident)),
                          self.dest)
 
     def text(self, msg, freq, sid=None):
@@ -133,8 +135,8 @@ def run():
 
     print("\nwire format")
     check("C++/Python struct sizes agree", all([
-        P.HEADER.size == 12, P.LOGIN.size == 76, P.POSITION.size == 68,
-        P.TRAFFIC_ENTRY.size == 104, P.TEXT_HDR.size == 26, P.VOICE_HDR.size == 12,
+        P.HEADER.size == 12, P.LOGIN.size == 76, P.POSITION.size == 72,
+        P.TRAFFIC_ENTRY.size == 108, P.TEXT_HDR.size == 26, P.VOICE_HDR.size == 12,
     ]))
     check("bad magic is rejected",
           P.unpack_header(struct.pack("<IBBHI", 0xDEADBEEF, 1, 1, 0, 0)) is None)
@@ -173,7 +175,8 @@ def run():
         pass
     a.sock.sendto(P.pack(P.PT_POSITION, a.sid, P.POSITION.pack(
         a.lat, a.lon, a.alt_ft / 3.28084, 90.0, 0.0, 0.0, 60.0, 0.0, 0.0,
-        a.com1, 0, 0, 0, P.TX_NONE, P.RX_COM1, stamp, 123.5, -2.5)), a.dest)
+        a.com1, 0, 0, 0, P.TX_NONE, P.RX_COM1, stamp, 123.5, -2.5,
+        1200, P.XPDR_ALT, 0)), a.dest)
     pump(0.4)
     relayed = None
     for _ in range(30):
@@ -259,7 +262,8 @@ def run():
     ]:
         bad.sock.sendto(P.pack(P.PT_POSITION, bad.sid, P.POSITION.pack(
             lat, lon, alt, 90.0, 0.0, 0.0, gs, 0.0, 0.0,
-            FREQ, 0, 0, 0, P.TX_NONE, P.RX_COM1, 0, 90.0, 0.0)), bad.dest)
+            FREQ, 0, 0, 0, P.TX_NONE, P.RX_COM1, 0, 90.0, 0.0,
+            1200, P.XPDR_ALT, 0)), bad.dest)
     pump(0.4)
     now_lat = next((x.lat for x in srv.sessions.values() if x.callsign == "ESBAD1"), None)
     check("implausible position reports are rejected",
@@ -269,7 +273,8 @@ def run():
     # gear/flap outside 0..1 get clamped rather than relayed raw
     bad.sock.sendto(P.pack(P.PT_POSITION, bad.sid, P.POSITION.pack(
         57.85, 27.02, 900.0, 90.0, 0.0, 0.0, 60.0, 9.0, -4.0,
-        FREQ, 0, 0, 0, P.TX_NONE, P.RX_COM1, 0, 90.0, 0.0)), bad.dest)
+        FREQ, 0, 0, 0, P.TX_NONE, P.RX_COM1, 0, 90.0, 0.0,
+        1200, P.XPDR_ALT, 0)), bad.dest)
     pump(0.3)
     sess = next((x for x in srv.sessions.values() if x.callsign == "ESBAD1"), None)
     check("gear and flap ratios are clamped to 0..1",

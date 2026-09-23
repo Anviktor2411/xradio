@@ -64,6 +64,7 @@ endif()
 
 # --- common settings for anything that compiles the plugin sources ----------
 set(XR_PLUGIN_SOURCES
+    plugin/src/clipboard.cpp
     plugin/src/main.cpp
     plugin/src/natpmp.cpp
     plugin/src/net.cpp
@@ -143,7 +144,9 @@ if(WIN32)
     find_library(XPLM_LIBRARY NAMES XPLM_64.lib XPLM
                  PATHS "${XPLANE_SDK}/Libraries/Win" REQUIRED)
     # winhttp: the update check, which uses the HTTP stack Windows already has
-    target_link_libraries(XRadio PRIVATE ${XPLM_LIBRARY} wsock32 ws2_32 iphlpapi winhttp)
+    # user32: the clipboard, for the "copy the join code" button
+    target_link_libraries(XRadio PRIVATE ${XPLM_LIBRARY} wsock32 ws2_32 iphlpapi
+                                         winhttp user32)
     set(XR_PLATDIR "win_x64")
 
 elseif(APPLE)
@@ -241,6 +244,18 @@ if(XRADIO_BUILD_TESTS)
     # The UPnP client alone, against tools/harness/fake_igd.py.
     add_executable(upnp_test tools/harness/upnp_test.cpp plugin/src/upnp.cpp
                              plugin/src/natpmp.cpp plugin/src/net.cpp)
+
+    # The clipboard on its own: mostly about what it refuses to copy.
+    add_executable(clipboard_test tools/harness/clipboard_test.cpp
+                                  plugin/src/clipboard.cpp)
+    target_include_directories(clipboard_test PRIVATE plugin/src)
+    if(WIN32)
+        target_link_libraries(clipboard_test PRIVATE user32)
+    endif()
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(clipboard_test PRIVATE -g -O1 -fsanitize=address,undefined)
+        target_link_options(clipboard_test    PRIVATE -fsanitize=address,undefined)
+    endif()
 
     add_executable(update_test tools/harness/update_test.cpp plugin/src/update.cpp)
     target_include_directories(update_test PRIVATE plugin/src)

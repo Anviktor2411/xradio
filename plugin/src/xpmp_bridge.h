@@ -30,6 +30,12 @@ struct RemoteState {
     uint32_t    timeMs   = 0;     // sender's clock, for interpolation
     float       track    = 0.f;   // degrees true, direction of travel
     float       vsFps    = 0.f;   // vertical speed, ft/s
+    // The transponder, passed through to XPMP2 as this aircraft's radar
+    // answer. Off or standby and it is not on anyone's TCAS -- though it is
+    // still out there to be seen, so the model is drawn either way.
+    uint16_t    squawk   = 0;
+    uint8_t     xpdrMode = 0;     // xr::XpdrMode
+    bool        xpdrIdent = false;
 };
 
 namespace csl {

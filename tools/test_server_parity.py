@@ -80,13 +80,15 @@ class Client:
 
     def position(self, tx=P.TX_NONE, rx=P.RX_COM1, sid=None, lat=None, lon=None,
                  alt_ft=None, gs=50.0, gear=0.0, flap=0.0, time_ms=0,
-                 track=90.0, vs=0.0, heading=90.0):
+                 track=90.0, vs=0.0, heading=90.0,
+                 squawk=1200, xpdr=P.XPDR_ALT, ident=0):
         self.send(P.PT_POSITION, P.POSITION.pack(
             self.lat if lat is None else lat,
             self.lon if lon is None else lon,
             (self.alt_ft if alt_ft is None else alt_ft) / 3.28084,
             heading, 0.0, 0.0, gs, gear, flap,
-            self.com1, self.com2, 0, 0, tx, rx, time_ms, track, vs), sid=sid)
+            self.com1, self.com2, 0, 0, tx, rx, time_ms, track, vs,
+            squawk, xpdr, ident), sid=sid)
 
     def text(self, body, freq=0, sid=None):
         raw = body.encode()
@@ -519,6 +521,57 @@ def scenario_weather(port):
     return out
 
 
+def scenario_transponder(port):
+    """The transponder is relayed as sent, except where it cannot be true.
+
+    The receiving end decides what to do with a squawk -- whether the aircraft
+    is on TCAS, whether it has an altitude to show -- so a server that quietly
+    alters one, or passes on a code that no transponder could produce, breaks
+    that decision on every client at once.
+    """
+    out = {}
+    a = Client(port, "ESXPA1", 57.85, 27.02)
+    b = Client(port, "ESXPB1", 57.851, 27.021)
+    a.login(); b.login()
+
+    def seen(sender, squawk, xpdr, ident, time_ms):
+        sender.position(squawk=squawk, xpdr=xpdr, ident=ident, time_ms=time_ms)
+        b.position(time_ms=time_ms)
+        time.sleep(0.25)
+        for raw in b.drain(0.5)[P.PT_TRAFFIC]:
+            count, _ = P.TRAFFIC_HDR.unpack_from(raw, 0)
+            off = P.TRAFFIC_HDR.size
+            for _ in range(count):
+                e = P.TRAFFIC_ENTRY.unpack_from(raw, off)
+                off += P.TRAFFIC_ENTRY.size
+                # 15 xpdrMode, 16 timeMs, 20 squawk, 21 xpdrIdent
+                if e[1].rstrip(b"\x00") == b"ESXPA1" and e[16] == time_ms:
+                    return [e[16], e[15], e[20], e[21]]   # time, mode, squawk, ident
+        return []
+
+    # An ordinary VFR aircraft, then an airliner squawking a discrete code.
+    out["vfr"] = seen(a, 1200, P.XPDR_ALT, 0, 11)
+    out["discrete"] = seen(a, 4671, P.XPDR_ALT, 0, 12)
+    # Mode A, standby and off all have to arrive as themselves: the client
+    # cannot make its own decision about TCAS if the server flattens them.
+    out["mode_a"] = seen(a, 4671, P.XPDR_ON, 0, 13)
+    out["standby"] = seen(a, 4671, P.XPDR_STANDBY, 0, 14)
+    out["off"] = seen(a, 4671, P.XPDR_OFF, 0, 15)
+    out["ident"] = seen(a, 4671, P.XPDR_ALT, 1, 16)
+    out["emergency"] = seen(a, 7700, P.XPDR_ALT, 0, 17)
+    out["highest_real_code"] = seen(a, 7777, P.XPDR_ALT, 0, 18)
+
+    # Codes no transponder can produce: a squawk is four octal digits.
+    out["digit_eight"] = seen(a, 7788, P.XPDR_ALT, 0, 19)
+    out["digit_nine"] = seen(a, 1299, P.XPDR_ALT, 0, 20)
+    out["over_7777"] = seen(a, 9999, P.XPDR_ALT, 0, 21)
+    # And a mode outside the enum.
+    out["mode_out_of_range"] = seen(a, 1200, 99, 0, 22)
+
+    a.close(); b.close()
+    return out
+
+
 SCENARIOS = [
     ("login and traffic", scenario_login_and_traffic),
     ("login validation", scenario_bad_login),
@@ -530,6 +583,7 @@ SCENARIOS = [
     ("garbage packets", scenario_garbage),
     ("flight password", scenario_password),
     ("shared weather", scenario_weather),
+    ("transponder", scenario_transponder),
 ]
 # scenarios whose server runs with a flight password
 PASSWORDED = {"flight password": "sky"}
@@ -700,6 +754,31 @@ def main():
           str((r["old_version_reason"], r["old_header_reason"])))
     check("the livery given at login is relayed in traffic", r["livery_seen"] == ["Lufthansa"],
           str(r["livery_seen"]))
+
+    r = cpp["transponder"]
+    # [timeMs, mode, squawk, ident]
+    check("an ordinary VFR squawk is relayed untouched",
+          r["vfr"][1:] == [P.XPDR_ALT, 1200, 0], str(r["vfr"]))
+    check("so is a discrete code", r["discrete"][1:] == [P.XPDR_ALT, 4671, 0],
+          str(r["discrete"]))
+    check("mode A arrives as mode A, not flattened to mode C",
+          r["mode_a"][1:] == [P.XPDR_ON, 4671, 0], str(r["mode_a"]))
+    check("standby arrives as standby, so the client can drop it from TCAS",
+          r["standby"][1:] == [P.XPDR_STANDBY, 4671, 0], str(r["standby"]))
+    check("and off as off", r["off"][1:] == [P.XPDR_OFF, 4671, 0], str(r["off"]))
+    check("ident is relayed", r["ident"][1:] == [P.XPDR_ALT, 4671, 1], str(r["ident"]))
+    check("an emergency squawk is passed on, not swallowed",
+          r["emergency"][1:] == [P.XPDR_ALT, 7700, 0], str(r["emergency"]))
+    check("7777 is a real code and survives",
+          r["highest_real_code"][1:] == [P.XPDR_ALT, 7777, 0],
+          str(r["highest_real_code"]))
+    # Octal: no digit above 7, nothing above 7777.
+    check("a squawk with an 8 in it is not relayed as real",
+          r["digit_eight"][2] == 0, str(r["digit_eight"]))
+    check("nor one with a 9", r["digit_nine"][2] == 0, str(r["digit_nine"]))
+    check("nor one above 7777", r["over_7777"][2] == 0, str(r["over_7777"]))
+    check("a mode outside the enum becomes off, not something random",
+          r["mode_out_of_range"][1] == P.XPDR_OFF, str(r["mode_out_of_range"]))
 
     print()
     if failures:

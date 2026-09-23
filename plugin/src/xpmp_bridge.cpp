@@ -121,6 +121,7 @@ public:
 
     // Last state received from the server (configuration, lights, labels).
     RemoteState st;
+    bool        firstPose = true;   // see UpdatePosition, vertOfsRatio
 
     // Position and attitude come from the smoother, which interpolates in
     // the sender's own timeline. See smoothing.h for why: drawing reports as
@@ -140,6 +141,28 @@ public:
     void UpdatePosition(float elapsedSinceLastCall, int) override {
         const Pose p = smoother.sample(elapsedSinceLastCall);
 
+        // XPMP2 adds the model's VERT_OFFSET -- the height of its own gear --
+        // to whatever altitude we give it. That is right on the ground, where
+        // the sender transmits the terrain elevation and each model needs to
+        // stand its own wheels on it. In the air the sender transmits its
+        // actual datum altitude, which is already where the aircraft is, so
+        // the offset would push it a metre or two too high: phase it out.
+        // (This is what vertOfsRatio is for; see sendPosition() for the other
+        // half of the arrangement.)
+        //
+        // Eased rather than switched, because the sender's altitude changes
+        // reference at the same moment and reaches us through the smoother,
+        // which takes a few hundred milliseconds to get there. Snapping the
+        // offset would show that lag as a bounce at every touchdown; moving
+        // both over the same sort of interval hides it.
+        const float want = st.onGround ? 1.0f : 0.0f;
+        if (firstPose) {
+            firstPose = false;
+            vertOfsRatio = want;        // an aircraft appearing should not settle
+        } else {
+            const float step = elapsedSinceLastCall / 0.35f;
+            vertOfsRatio += (want - vertOfsRatio) * (step < 1.0f ? step : 1.0f);
+        }
         SetLocation(p.lat, p.lon, p.altFt, st.onGround);
         drawInfo.pitch   = p.pitch;
         drawInfo.roll    = p.roll;
@@ -161,6 +184,14 @@ public:
         SetEngineRotRpm(st.gsKt > 5.f ? 1200.f : 0.f);
         SetPropRotRpm  (st.gsKt > 5.f ? 1200.f : 0.f);
         SetThrustRatio (st.onGround ? 0.2f : 0.8f);
+
+        // The radar answer. XPMP2 forwards this straight to X-Plane's TCAS
+        // target dataRefs, and treats anything at standby or below as not a
+        // TCAS target at all -- which is what we want, because a transponder
+        // that is off is exactly an aircraft your TCAS cannot see. The model
+        // keeps being drawn: you can still look out of the window at it.
+        acRadar.code = (long)st.squawk;
+        acRadar.mode = (XPMPTransponderMode)st.xpdrMode;
 
         // Highlight whoever is transmitting on a frequency we monitor.
         if (st.txActive) {

@@ -16,6 +16,7 @@
 #include "joincode.h"
 #include "smoothing.h"
 #include "ui.h"
+#include "clipboard.h"
 #include "update.h"
 #include "voice.h"
 #include "weather.h"
@@ -113,11 +114,12 @@ void loadConfig() {
 // datarefs
 // ---------------------------------------------------------------------------
 struct Refs {
-    XPLMDataRef lat, lon, elev, psi, theta, phi, gs, hpath, vh;
+    XPLMDataRef lat, lon, elev, psi, theta, phi, gs, hpath, vh, yAgl;
     XPLMDataRef gear, flap, onGround;
     XPLMDataRef com1, com2, audioComSel, rxCom1, rxCom2, volCom1, volCom2;
     XPLMDataRef ltNav, ltBeacon, ltStrobe, ltLanding, ltTaxi;
     XPLMDataRef avionicsOn, com1Power, com2Power, busVolts;
+    XPLMDataRef xpdrMode, xpdrCode, xpdrIdent;
     XPLMDataRef acfIcao, acfLivery;
 } g_ref;
 
@@ -136,6 +138,16 @@ XPLMDataRef findRef(const char* name) {
     return r;
 }
 
+// The first of these names this aircraft actually has, without complaining
+// about the ones it does not: some things moved between the cockpit and
+// cockpit2 namespaces and an aircraft is entitled to have only one.
+XPLMDataRef firstRefOf(std::initializer_list<const char*> names) {
+    for (const char* n : names) {
+        if (XPLMDataRef r = XPLMFindDataRef(n)) return r;
+    }
+    return nullptr;
+}
+
 void findRefs() {
     g_ref.lat      = findRef("sim/flightmodel/position/latitude");
     g_ref.lon      = findRef("sim/flightmodel/position/longitude");
@@ -146,6 +158,10 @@ void findRefs() {
     g_ref.gs       = findRef("sim/flightmodel/position/groundspeed");
     g_ref.hpath    = findRef("sim/flightmodel/position/hpath");    // ground track, deg true
     g_ref.vh       = findRef("sim/flightmodel/position/vh_ind");   // vertical speed, m/s
+    // How far our datum point sits above the terrain. On the ground that is
+    // the height of the gear, which is exactly what we must not send -- see
+    // sendPosition().
+    g_ref.yAgl     = findRef("sim/flightmodel/position/y_agl");
     g_ref.gear     = findRef("sim/flightmodel2/gear/deploy_ratio");
     g_ref.flap     = findRef("sim/cockpit2/controls/flap_ratio");
     g_ref.onGround = findRef("sim/flightmodel/failures/onground_any");
@@ -166,6 +182,19 @@ void findRefs() {
     g_ref.com1Power  = findRef("sim/cockpit2/radios/actuators/com1_power");
     g_ref.com2Power  = findRef("sim/cockpit2/radios/actuators/com2_power");
     g_ref.busVolts   = findRef("sim/cockpit2/electrical/bus_volts");
+
+    // The transponder. X-Plane 12 keeps it under cockpit2; older aircraft and
+    // some add-ons only drive the original cockpit datarefs, and both use the
+    // same numbering, so either will do. Tried quietly -- a missing name here
+    // is expected, not a fault worth a warning in Log.txt.
+    g_ref.xpdrMode  = firstRefOf({"sim/cockpit2/radios/actuators/transponder_mode",
+                                  "sim/cockpit/radios/transponder_mode"});
+    g_ref.xpdrCode  = firstRefOf({"sim/cockpit2/radios/actuators/transponder_code",
+                                  "sim/cockpit/radios/transponder_code"});
+    g_ref.xpdrIdent = firstRefOf({"sim/cockpit2/radios/actuators/transponder_id",
+                                  "sim/cockpit/radios/transponder_id"});
+    if (!g_ref.xpdrMode)
+        logMsg("no transponder dataref in this aircraft -- treating it as mode C");
 
     g_ref.ltNav     = findRef("sim/cockpit2/switches/navigation_lights_on");
     g_ref.ltBeacon  = findRef("sim/cockpit2/switches/beacon_on");
@@ -214,6 +243,41 @@ bool comPowered(int which) {
 }
 
 bool anyComPowered() { return comPowered(1) || comPowered(2); }
+
+// Our own transponder, as it would answer an interrogation.
+//
+// It lives on the same avionics bus the radios do, so a cold and dark
+// aircraft is not squawking -- which is the whole point of the thing being
+// modelled rather than assumed. An aircraft with no transponder dataref at
+// all is treated as squawking mode C, because the alternative is that every
+// pilot in an add-on that does not model one vanishes from everybody's TCAS.
+uint8_t ownXpdrMode() {
+    if (!g_ref.xpdrMode) return comPowered(1) ? xr::XPDR_ALT : xr::XPDR_OFF;
+    if (!comPowered(1) && !comPowered(2)) return xr::XPDR_OFF;
+    const int m = id(g_ref.xpdrMode);
+    if (m < 0 || m > xr::XPDR_TA_RA) return xr::XPDR_OFF;
+    return (uint8_t)m;
+}
+
+uint16_t ownSquawk() {
+    const int c = id(g_ref.xpdrCode);
+    if (c < 0 || c > 7777) return 0;
+    return xr::validSquawk((uint16_t)c) ? (uint16_t)c : 0;
+}
+
+// Human-readable, the way it is written on a panel and said on the radio.
+const char* xpdrModeName(uint8_t mode) {
+    switch (mode) {
+        case xr::XPDR_OFF:     return "OFF";
+        case xr::XPDR_STANDBY: return "STBY";
+        case xr::XPDR_ON:      return "ON";
+        case xr::XPDR_ALT:     return "ALT";
+        case xr::XPDR_TEST:    return "TEST";
+        case xr::XPDR_GROUND:  return "GND";
+        case xr::XPDR_TA_ONLY: return "TA";
+        default:               return "TA/RA";
+    }
+}
 
 // A byte-array dataref as a trimmed string.
 std::string sd(XPLMDataRef r, int maxLen) {
@@ -285,6 +349,9 @@ struct Remote {
     float       altMslM = 0, heading = 0, pitch = 0, roll = 0, gsMs = 0;
     float       gear = 0, flap = 0;
     uint8_t     lights = 0, onGround = 0, txActive = 0;
+    uint16_t    squawk = 0;
+    uint8_t     xpdrMode = 0;   // xr::XpdrMode, as their transponder answers
+    uint8_t     xpdrIdent = 0;
     float       lastSeen = 0;   // seconds since plugin start
 };
 
@@ -296,6 +363,13 @@ std::string shareAddress();
 void reconnect();
 void setPtt(bool down);
 float g_lastWeatherSend = -1000.f;   // see sendWeather()
+// When somebody else's sky last arrived. The server awards the weather claim
+// to the first pilot who asks for it, and does not tell the losers -- but a
+// loser can see it, because weather is relayed to everyone except whoever
+// sent it. So: receiving means we are not the source, and should stop
+// sending. It settles itself within one interval and costs no wire bytes.
+float g_lastWeatherRx = -1000.f;
+bool  someoneElseIsTheSky();
 void handleWeather(const uint8_t* payload, int len);
 double distanceNm(double lat1, double lon1, double lat2, double lon2);
 
@@ -331,6 +405,8 @@ float            g_lastRxTime   = -99.f;
 bool             g_pttDown      = false;
 std::string      g_status       = "not connected";
 std::vector<std::string> g_chatLog;   // newest last, capped
+
+bool someoneElseIsTheSky() { return g_elapsed - g_lastWeatherRx < 30.f; }
 
 // The one-line text input at the bottom of the main window. Only the main
 // thread touches it, so keys are applied as they arrive.
@@ -373,9 +449,11 @@ void sendLogin() {
     strncpy(p.livery,   g_loginLivery.c_str(),  sizeof(p.livery)   - 1);
     strncpy(p.password, g_cfg.password.c_str(), sizeof(p.password) - 1);
     p.protoVer = xr::kProtoVersion;
-    // Hosting is what makes a pilot the authority on the sky: their machine
-    // is the one everyone else joined. The server takes the first claim.
-    p.flags = (xr::relay::running() && g_cfg.shareWeather) ? xr::LF_WEATHER_SOURCE : 0;
+    // Offer to be the authority on the sky. The server takes the first claim
+    // and ignores the rest, so this is an offer, not an announcement -- which
+    // is the only way it can work on a dedicated server, where there is no
+    // host whose sim could be the obvious answer.
+    p.flags = g_cfg.shareWeather ? xr::LF_WEATHER_SOURCE : 0;
     memcpy(buf + off, &p, sizeof(p));
     g_sock.send(buf, off + (int)sizeof(p));
     g_lastLogin = g_elapsed;
@@ -387,7 +465,22 @@ void sendPosition() {
     xr::PositionPayload p{};
     p.lat         = dd(g_ref.lat);
     p.lon         = dd(g_ref.lon);
-    p.altMslM     = (float)dd(g_ref.elev);
+    // Altitude is the one field the receiver cannot simply draw as sent.
+    // `elevation` is where our *datum point* is, which on the ground is a
+    // metre or three up in the air, on top of the gear. The receiver then
+    // hands it to XPMP2, which adds the CSL model's own VERT_OFFSET to stand
+    // it on its wheels -- so the gear height gets counted twice and the model
+    // hovers. What the receiver actually needs while we are on the ground is
+    // the ground: send the terrain elevation and let each model's own offset
+    // put its own wheels on it. In the air the datum is right and the
+    // receiver drops the offset instead (see xpmp_bridge.cpp).
+    // A missing y_agl reads 0, which leaves the old behaviour rather than a
+    // new kind of wrong; the cap keeps a nonsense reading from burying the
+    // model, which would look far worse than the hover it replaces.
+    const bool  onGnd  = id(g_ref.onGround) != 0;
+    float       gearUp = onGnd ? fd(g_ref.yAgl) : 0.f;
+    if (!(gearUp > 0.f) || gearUp > 12.f) gearUp = 0.f;     // also catches NaN
+    p.altMslM     = (float)(dd(g_ref.elev) - gearUp);
     p.headingTrue = fd(g_ref.psi);
     p.pitch       = fd(g_ref.theta);
     p.roll        = fd(g_ref.phi);
@@ -398,7 +491,10 @@ void sendPosition() {
     // anyone's voice to us and other pilots do not see us listening.
     p.com1Khz     = comPowered(1) ? (uint32_t)id(g_ref.com1) : 0u;
     p.com2Khz     = comPowered(2) ? (uint32_t)id(g_ref.com2) : 0u;
-    p.onGround    = id(g_ref.onGround) ? 1 : 0;
+    p.onGround    = onGnd ? 1 : 0;
+    p.xpdrMode    = ownXpdrMode();
+    p.squawk      = ownSquawk();
+    p.xpdrIdent   = (xr::xpdrTransmitting(p.xpdrMode) && id(g_ref.xpdrIdent)) ? 1 : 0;
 
     uint8_t lights = 0;
     if (id(g_ref.ltNav))     lights |= xr::LT_NAV;
@@ -534,6 +630,9 @@ void handleTraffic(const uint8_t* payload, int len) {
         r.lights    = e.lights;
         r.onGround  = e.onGround;
         r.txActive  = e.txActive;
+        r.squawk    = xr::validSquawk(e.squawk) ? e.squawk : 0;
+        r.xpdrMode  = e.xpdrMode <= xr::XPDR_TA_RA ? e.xpdrMode : (uint8_t)xr::XPDR_OFF;
+        r.xpdrIdent = e.xpdrIdent ? 1 : 0;
         r.lastSeen  = g_elapsed;
 
         xr::RemoteState st;
@@ -556,6 +655,15 @@ void handleTraffic(const uint8_t* payload, int len) {
         st.timeMs   = e.timeMs;
         st.track    = e.trackTrue;
         st.vsFps    = e.vsMs * 3.28084f;
+        st.squawk   = r.squawk;
+        // Our own transponder has to be working for our TCAS to see anyone:
+        // the interrogation comes from us. With ours off or in standby the
+        // aircraft are still out of the window, but the TCAS display is
+        // blank -- so their mode is passed on as standby, which is exactly
+        // what XPMP2 reads as "not a TCAS target".
+        st.xpdrMode = xr::xpdrTransmitting(ownXpdrMode()) ? r.xpdrMode
+                                                          : (uint8_t)xr::XPDR_STANDBY;
+        st.xpdrIdent = r.xpdrIdent != 0;
         xr::csl::upsert(st);
     }
 
@@ -774,6 +882,9 @@ void sendWeather() {
 
 void handleWeather(const uint8_t* payload, int len) {
     if (len != (int)sizeof(xr::WeatherPayload)) return;
+    // Noted before the opt-out below: a pilot who is not following still
+    // needs to know somebody else holds the claim, so they stop offering.
+    g_lastWeatherRx = g_elapsed;
     if (!g_cfg.followWeather) return;
     xr::WeatherPayload w{};
     memcpy(&w, payload, sizeof(w));
@@ -865,7 +976,7 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
         }
     }
 
-    if (g_connected && xr::relay::running() && g_cfg.shareWeather &&
+    if (g_connected && g_cfg.shareWeather && !someoneElseIsTheSky() &&
         g_elapsed - g_lastWeatherSend >= kWeatherIntervalS) {
         g_lastWeatherSend = g_elapsed;
         sendWeather();
@@ -882,6 +993,8 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
         g_sessionId.store(0);
         g_remote.clear();
         xr::csl::removeAll();
+        g_lastWeatherRx   = -1000.f;
+        g_lastWeatherSend = -1000.f;
         g_status = "lost server, retrying...";
         logMsg("server went quiet, re-logging in");
     }
@@ -968,6 +1081,7 @@ void drawWindow(XPLMWindowID win, void*) {
     float white[] = {1.f, 1.f, 1.f};
     float green[] = {0.4f, 1.f, 0.4f};
     float amber[] = {1.f, 0.8f, 0.3f};
+    float grey[]  = {0.78f, 0.82f, 0.88f};
 
     int y = t - 20;
     const int x = l + 10;
@@ -991,6 +1105,21 @@ void drawWindow(XPLMWindowID win, void*) {
                  "Hosting  ·  %d connected  ·  friends type %s",
                  st.clients, shareAddress().c_str());
         drawFit(green, x, y, r, hostLine, xplmFont_Basic);
+        y -= 16;
+    }
+
+    // Whose sky we are flying. Worth a row of its own: when it is not the one
+    // the pilot expected, this line is the difference between "it is broken"
+    // and "somebody else got there first".
+    if (g_connected) {
+        const char* sky = "my own";
+        if (someoneElseIsTheSky())
+            sky = g_cfg.followWeather ? "the flight's" : "the flight's (not following)";
+        else if (g_cfg.shareWeather)
+            sky = "mine, shared with the flight";
+        char line[120];
+        snprintf(line, sizeof(line), "Weather and time: %s", sky);
+        drawFit(grey, x, y, r, line, xplmFont_Basic);
         y -= 16;
     }
     y -= 2;
@@ -1052,30 +1181,67 @@ void drawWindow(XPLMWindowID win, void*) {
     }
     y -= 22;
 
-    char title[96];
+    // What TCAS can actually see, which is not the same as who is out there.
+    // An aircraft answers an interrogation only with its transponder above
+    // standby, and the interrogation comes from us, so ours has to be up too.
+    // Everyone else is still drawn out of the window and still on the radio:
+    // neither needs a transponder, and that is the point of modelling it.
+    const uint8_t myXpdr   = ownXpdrMode();
+    const bool    myXpdrUp = xr::xpdrTransmitting(myXpdr);
+    std::vector<const Remote*> contacts;
+    if (myXpdrUp) {
+        for (const auto& kv : g_remote)
+            if (xr::xpdrTransmitting(kv.second.xpdrMode)) contacts.push_back(&kv.second);
+    }
+
+    char ownXpdrText[40];
+    if (myXpdrUp) {
+        snprintf(ownXpdrText, sizeof(ownXpdrText), "XPDR %04u %s%s",
+                 (unsigned)ownSquawk(), xpdrModeName(myXpdr),
+                 id(g_ref.xpdrIdent) ? " ID" : "");
+    } else {
+        snprintf(ownXpdrText, sizeof(ownXpdrText), "TCAS off -- XPDR %s",
+                 xpdrModeName(myXpdr));
+    }
+
+    char title[160];
     if (xr::csl::available()) {
         const std::string src = xr::csl::cslModelSource();
-        snprintf(title, sizeof(title), "Traffic (%d)  ·  %d CSL models%s%s%s",
-                 (int)g_remote.size(), xr::csl::cslModelCount(),
+        snprintf(title, sizeof(title), "Traffic (%d)  ·  %s  ·  %d CSL models%s%s%s",
+                 (int)contacts.size(), ownXpdrText, xr::csl::cslModelCount(),
                  src.empty() ? "" : " from ", src.c_str(),
                  g_rejected ? "  · bad data rejected" : "");
     } else {
-        snprintf(title, sizeof(title), "Traffic (%d)  ·  no 3D models%s",
-                 (int)g_remote.size(), g_rejected ? "  · bad data rejected" : "");
+        snprintf(title, sizeof(title), "Traffic (%d)  ·  %s  ·  no 3D models%s",
+                 (int)contacts.size(), ownXpdrText,
+                 g_rejected ? "  · bad data rejected" : "");
     }
-    drawFit(white, x, y, r, title, xplmFont_Proportional);
+    drawFit(myXpdrUp ? white : amber, x, y, r, title, xplmFont_Proportional);
     y -= 16;
 
     const double myLat = dd(g_ref.lat), myLon = dd(g_ref.lon);
-    for (auto& kv : g_remote) {
+    for (const Remote* rp : contacts) {
         if (y < b + 100) break;
-        const Remote& rm = kv.second;
-        char line[160];
-        snprintf(line, sizeof(line), "%-8s %-5s %5.0f ft  %5.1f nm  %3.0f kt %s",
-                 rm.callsign.c_str(), rm.acIcao.c_str(), rm.altMslM * 3.28084f,
+        const Remote& rm = *rp;
+        // Mode A answers with an identity and nothing else. Your TCAS knows
+        // it is there and roughly where, but not how high -- a bearing-only
+        // target. Inventing an altitude for it would be a lie in the one
+        // place a pilot is entitled to trust the display.
+        char alt[16];
+        if (xr::xpdrReportsAltitude(rm.xpdrMode))
+            snprintf(alt, sizeof(alt), "%5.0f ft", rm.altMslM * 3.28084f);
+        else
+            snprintf(alt, sizeof(alt), "  no alt");
+        char line[200];
+        snprintf(line, sizeof(line), "%-8s %-5s %s  %5.1f nm  %3.0f kt  %04u%s%s",
+                 rm.callsign.c_str(), rm.acIcao.c_str(), alt,
                  distanceNm(myLat, myLon, rm.lat, rm.lon), rm.gsMs * 1.94384f,
-                 rm.txActive ? "<<TX" : "");
-        drawFit(rm.txActive ? green : white, x, y, r, line, xplmFont_Basic);
+                 (unsigned)rm.squawk, rm.xpdrIdent ? " ID" : "",
+                 rm.txActive ? "  <<TX" : "");
+        const bool emergency = rm.squawk == 7500 || rm.squawk == 7600 ||
+                               rm.squawk == 7700;
+        drawFit(rm.txActive ? green : (emergency ? amber : white), x, y, r, line,
+                xplmFont_Basic);
         y -= 14;
     }
 
@@ -1233,6 +1399,11 @@ void createWindow() {
 // server that server.py runs, on its own thread, and its own client connects
 // to it over the loopback.
 std::string g_hostNote;      // why hosting is not working, if it is not
+// What the last click on a Copy button did, shown for a few seconds. A
+// clipboard operation that silently did nothing is worse than no button.
+std::string g_copyNote;
+float       g_copyNoteAt = -100.f;
+bool        g_copyOk = false;
 
 void applyHosting() {
     const uint16_t port = (uint16_t)g_cfg.hostPort_i();
@@ -1272,6 +1443,23 @@ std::string lanAddress() {
 // an address the internet can reach counts; until the port is known to be
 // open it is the LAN one, marked as such, so nobody passes on a 192.168
 // address to a friend across town.
+// The two things worth copying, plain: the address a friend types into their
+// Connection tab, and the short code that stands in for it. shareAddress()
+// above is the same information dressed for reading, which is not what you
+// want on a clipboard.
+std::string shareAddressPlain() {
+    const xr::upnp::Result u = xr::upnp::latest();
+    if (u.mapped && !u.externalIp.empty())
+        return u.externalIp + ":" + std::to_string(g_cfg.hostPort_i());
+    return lanAddress();
+}
+
+std::string shareJoinCode() {
+    const xr::upnp::Result u = xr::upnp::latest();
+    if (u.externalIp.empty()) return "";
+    return xr::joincode::encode(u.externalIp, (uint16_t)g_cfg.hostPort_i());
+}
+
 std::string shareAddress() {
     const xr::upnp::Result u = xr::upnp::latest();
     if (u.mapped && !u.externalIp.empty()) {
@@ -1301,6 +1489,10 @@ void reconnect() {
     g_sessionId.store(0);
     g_remote.clear();
     xr::csl::removeAll();
+    // A new connection knows nothing about who holds the sky, so offer again
+    // rather than staying quiet on the strength of the old flight's answer.
+    g_lastWeatherRx  = -1000.f;
+    g_lastWeatherSend = -1000.f;
     {
         std::lock_guard<std::mutex> lk(g_inboxMx);
         g_inbox.clear();
@@ -1594,6 +1786,37 @@ void drawSettings(XPLMWindowID win, void*) {
                 for (const auto& c : st.callsigns) who += " " + c;
                 xr::ui::text(g_ui, who.c_str(), 0);
             }
+
+            // Nothing drawn in an X-Plane window can be selected with the
+            // mouse, so up to here a join code is something you read out
+            // loud or photograph. These put it on the clipboard instead.
+            const std::string addr = shareAddressPlain();
+            const std::string code = shareJoinCode();
+            std::vector<const char*>        labels;
+            std::vector<const std::string*> values;
+            if (!code.empty()) {
+                labels.push_back("Copy join code");
+                values.push_back(&code);
+            }
+            // lanAddress() says "<this computer>" when it cannot find one,
+            // which is a sentence, not an address: nothing to paste.
+            if (!addr.empty() && addr.find('<') == std::string::npos) {
+                labels.push_back("Copy address");
+                values.push_back(&addr);
+            }
+            if (!labels.empty()) {
+                g_ui.nextRow();
+                const int hit = xr::ui::buttons(g_ui, labels.data(), (int)labels.size());
+                if (hit >= 0) {
+                    std::string err;
+                    g_copyOk = xr::clipboard::set(*values[(size_t)hit], &err);
+                    g_copyNote = g_copyOk ? "Copied:  " + *values[(size_t)hit]
+                                          : "Could not copy -- " + err;
+                    g_copyNoteAt = g_elapsed;
+                }
+                if (!g_copyNote.empty() && g_elapsed - g_copyNoteAt < 8.f)
+                    xr::ui::text(g_ui, g_copyNote.c_str(), g_copyOk ? 2 : 3);
+            }
         }
     }
 
@@ -1620,6 +1843,13 @@ void drawSettings(XPLMWindowID win, void*) {
     const int noteRow = g_ui.y;
     g_ui.nextRow();
 
+    // Measured here, before the clamp on the next line moves the row back up
+    // on screen. Measuring after it would report little more than the height
+    // the window already has, so a window a pilot had made short would claw
+    // back a row per frame and stop as soon as the buttons fitted -- with the
+    // content above them still cut off, and no way to get it back.
+    const int wantHeight = g_ui.heightFor(g_ui.y);
+
     // Whatever happened above, the buttons have to be on screen and
     // clickable: a settings window you cannot save or close is a trap.
     if (g_ui.y < b + xr::ui::Ctx::kRowH) g_ui.y = b + 12;
@@ -1641,10 +1871,15 @@ void drawSettings(XPLMWindowID win, void*) {
     // Only when the content itself changed size, not on every frame it does
     // not fit: growing between a draw and the click that draw produced moves
     // the row out from under the pilot's cursor.
-    static int g_lastGrownTo = 0;
-    if (g_ui.clipped && g_ui.neededHeight() != g_lastGrownTo) {
-        const int want = g_ui.neededHeight();
-        g_lastGrownTo = want;
+    // Remembered as a pair: what we asked for, and the height we asked it
+    // from. Keyed on the wanted height alone, a pilot who drags the window
+    // short while a tall tab is open never gets the content back -- the tab
+    // has not changed size, so the same answer is refused for ever.
+    static int g_grownTo = 0, g_grownFrom = 0;
+    if (g_ui.clipped && (wantHeight != g_grownTo || (t - b) != g_grownFrom)) {
+        const int want = wantHeight;
+        g_grownTo = want;
+        g_grownFrom = t - b;
         if (want > t - b) {
             int sl, st, sr, sb;
             XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);

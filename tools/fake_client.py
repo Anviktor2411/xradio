@@ -113,7 +113,10 @@ def run(args):
                 P.RX_COM1,                                  # rxMask
                 int(time.monotonic() * 1000) & 0xFFFFFFFF,  # timeMs
                 args.heading,                               # trackTrue
-                0.0)), dest)                                # vsMs
+                0.0,                                        # vsMs
+                args.squawk,                                # squawk
+                args.xpdr,                                  # xpdrMode
+                0)), dest)                                  # xpdrIdent
 
             # Text names its own frequency and does not need the PTT held.
             if args.talk and time.time() >= next_text:
@@ -143,6 +146,9 @@ if __name__ == "__main__":
     ap.add_argument("--heading", type=float, default=90.0)
     ap.add_argument("--speed-kt", type=float, default=110.0)
     ap.add_argument("--com1", type=int, default=122800, help="kHz, e.g. 122800")
+    ap.add_argument("--squawk", type=int, default=1200, help="four octal digits")
+    ap.add_argument("--xpdr", type=int, default=P.XPDR_ALT,
+                    help="transponder mode: 0 off, 1 stby, 2 on, 3 alt")
     ap.add_argument("--talk", action="store_true", help="send a text message every 5 s")
     ap.add_argument("--parrot", action="store_true",
                     help="re-transmit any voice frames received, for loopback tests")

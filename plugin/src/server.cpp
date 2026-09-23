@@ -40,6 +40,9 @@ struct Session {
     bool    hasPosition = false;
     uint32_t timeMs = 0;
     float   track = 0, vsMs = 0;
+    uint16_t squawk = 1200;          // the four digits as they read on the panel
+    uint8_t  xpdrMode = XPDR_ALT;
+    uint8_t  xpdrIdent = 0;
 
     double altFt() const { return (double)altM * 3.28084; }
 
@@ -304,6 +307,11 @@ void Core::onPosition(Session& s, const uint8_t* p, int len) {
     s.timeMs = pp.timeMs;
     s.track = wrap360(pp.trackTrue);
     s.vsMs = pp.vsMs;
+    // A squawk is four octal digits. Anything else is a client bug or a
+    // client being clever, and either way it is not relayed as if real.
+    s.squawk = validSquawk(pp.squawk) ? pp.squawk : 0;
+    s.xpdrMode = pp.xpdrMode <= XPDR_TA_RA ? pp.xpdrMode : (uint8_t)XPDR_OFF;
+    s.xpdrIdent = pp.xpdrIdent ? 1 : 0;
     s.hasPosition = true;
 }
 
@@ -479,9 +487,10 @@ void Core::sendTraffic(Session& me, const std::vector<Session*>& others, double 
         e.pitch = o->pitch; e.roll = o->roll;
         e.gsMs = o->gsMs; e.gearRatio = o->gear; e.flapRatio = o->flap;
         e.lights = o->lights; e.onGround = o->onGround;
-        e.txActive = txActive; e.reserved = 0;
+        e.txActive = txActive; e.xpdrMode = o->xpdrMode;
         e.timeMs = o->timeMs; e.trackTrue = o->track; e.vsMs = o->vsMs;
         padInto(e.livery, sizeof(e.livery), o->livery);
+        e.squawk = o->squawk; e.xpdrIdent = o->xpdrIdent; e.reserved = 0;
 
         if (off + sizeof(e) > sizeof(payload)) break;
         memcpy(payload + off, &e, sizeof(e));

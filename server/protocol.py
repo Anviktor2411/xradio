@@ -7,7 +7,7 @@ means no alignment padding, which matches #pragma pack(1) on the C++ side).
 import struct
 
 MAGIC = 0x31435258  # b"XRC1" little-endian
-PROTO_VERSION = 3   # v3: livery, flight password, login rejection
+PROTO_VERSION = 4   # v4: transponder (squawk, mode, ident)
 
 # packet types
 PT_LOGIN = 1
@@ -29,15 +29,26 @@ LF_WEATHER_SOURCE = 1 << 0    # LoginPayload.flags: "my weather is the flight's"
 TX_NONE, TX_COM1, TX_COM2 = 0, 1, 2
 RX_COM1, RX_COM2 = 1, 2
 
+# Transponder mode, numbered exactly as X-Plane numbers it in both
+# sim/cockpit/radios/transponder_mode and sim/cockpit2/tcas/targets/ssr_mode,
+# so a mode read out of one sim goes straight into the other end's TCAS.
+XPDR_OFF, XPDR_STANDBY, XPDR_ON, XPDR_ALT = 0, 1, 2, 3
+XPDR_TEST, XPDR_GROUND, XPDR_TA_ONLY, XPDR_TA_RA = 4, 5, 6, 7
+
+
+def xpdr_transmitting(mode: int) -> bool:
+    """Above standby is transmitting, so it is on other aircraft's TCAS."""
+    return mode > XPDR_STANDBY
+
 MAX_PACKET = 1400
 
 HEADER = struct.Struct("<IBBHI")          # magic, type, version, payloadLen, sessionId
 LOGIN = struct.Struct("<16s8sHH16s32s")   # callsign, acIcao, protoVer, flags, livery, password
 LOGIN_ACK = struct.Struct("<II")          # sessionId, serverTimeMs
 LOGIN_REJECT = struct.Struct("<HH")       # reason, reserved
-POSITION = struct.Struct("<2d7f2I4BI2f")  # see PositionPayload
+POSITION = struct.Struct("<2d7f2I4BI2fHBB")  # see PositionPayload
 TRAFFIC_HDR = struct.Struct("<HH")        # count, reserved
-TRAFFIC_ENTRY = struct.Struct("<I16s8s2d7f4BI2f16s")   # ... + livery
+TRAFFIC_ENTRY = struct.Struct("<I16s8s2d7f4BI2f16sHBB")  # ... + livery, squawk
 TEXT_HDR = struct.Struct("<II16sH")       # freqKhz, fromSession, from, textLen
 VOICE_HDR = struct.Struct("<IIHH")        # freqKhz, fromSession, seq, opusLen
 
@@ -50,8 +61,8 @@ WEATHER = struct.Struct("<Ififfffffi" + f"{4 * CLOUD_LAYERS}f" + f"{7 * AIR_LAYE
 # Sanity: these sizes are asserted against the C++ structs in tools/check_sizes.py
 assert HEADER.size == 12
 assert LOGIN.size == 76
-assert POSITION.size == 68
-assert TRAFFIC_ENTRY.size == 104
+assert POSITION.size == 72
+assert TRAFFIC_ENTRY.size == 108
 assert WEATHER.size == 452
 
 

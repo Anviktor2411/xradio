@@ -45,10 +45,13 @@ struct Settings {
     bool        hostEnabled = false;
     std::string hostPort    = "49100";
     bool        hostUpnp    = true;        // ask the router to open the port
-    // The host's sim decides the sky for everyone who wants it. Both halves
-    // are opt-out: a pilot who has set up their own weather can keep it.
-    bool        shareWeather  = true;      // host: my weather and time are the flight's
-    bool        followWeather = true;      // everyone else: take them from the host
+    // One sim decides the sky for everyone who wants it. Which one is settled
+    // by the server, first come: on a flight hosted in X-Plane that is
+    // naturally the host, but on a dedicated server -- which has no weather of
+    // its own -- it is whoever connected first with this switched on. Both
+    // halves are opt-out: a pilot who has set up their own weather keeps it.
+    bool        shareWeather  = true;      // "mine can be the flight's"
+    bool        followWeather = true;      // "give me the flight's"
 
     // --- traffic ---
     bool        showTraffic = true;
@@ -126,13 +129,14 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"range",       "Traffic range", Kind::Slider, 2, &s.trafficRangeNm, 5.f, 200.f, " nm", 0},
         {"cslpath",     "CSL folder (blank = find one)", Kind::Text, 2, &s.cslPath,
                         0, 0, "", 0, 255},
+        {"shareweather",  "Offer my weather and time to the flight", Kind::Bool, 2,
+                          &s.shareWeather},
+        {"followweather", "Fly the flight's weather and time", Kind::Bool, 2,
+                          &s.followWeather},
 
         {"hosting",     "Host a flight here", Kind::Bool, 3, &s.hostEnabled},
         {"hostport",    "Port to host on",    Kind::Text, 3, &s.hostPort, 0,0,"",0, 5, true},
         {"hostupnp",    "Ask the router to open it", Kind::Bool, 3, &s.hostUpnp},
-        {"shareweather", "Share my weather and time", Kind::Bool, 3, &s.shareWeather},
-        {"followweather", "Follow the host's weather and time", Kind::Bool, 2,
-                         &s.followWeather},
     };
 }
 

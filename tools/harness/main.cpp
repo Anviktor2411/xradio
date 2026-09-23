@@ -5,6 +5,7 @@
 // Flies a straight line, reports what the plugin's own window would display,
 // and exits non-zero if the plugin failed to connect.
 #include "harness.h"
+#include "protocol.h"
 #include "voice.h"
 
 #include <chrono>
@@ -59,6 +60,11 @@ int main(int argc, char** argv) {
     harness::set("sim/cockpit2/radios/actuators/com1_power", 1);
     harness::set("sim/cockpit2/radios/actuators/com2_power", 1);
     harness::set("sim/cockpit2/electrical/bus_volts", 24.0);
+    // Squawking mode C. TCAS interrogates with our own transponder, so with
+    // this off there is no traffic display at all -- correctly, but it is not
+    // what this harness is here to prove.
+    harness::set("sim/cockpit2/radios/actuators/transponder_mode", xr::XPDR_ALT);
+    harness::set("sim/cockpit2/radios/actuators/transponder_code", 1200);
     harness::set("sim/cockpit2/radios/actuators/audio_com_selection", 6);
     harness::set("sim/cockpit2/switches/navigation_lights_on", 1);
 

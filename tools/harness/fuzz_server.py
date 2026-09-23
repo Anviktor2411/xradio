@@ -31,9 +31,10 @@ def traffic_entry(callsign=b"FUZZ01", **kw):
         kw.get("sid", 7), P.pad(callsign.decode(), 16), P.pad("C172", 8),
         kw.get("lat", 57.85), kw.get("lon", 27.02),
         kw.get("alt", 900.0), 90.0, 0.0, 0.0, 50.0, 0.0, 0.0,
-        0, 0, kw.get("tx", 0), 0,
+        0, 0, kw.get("tx", 0), kw.get("xpdr", P.XPDR_ALT),
         kw.get("t", 1000), kw.get("track", 90.0), kw.get("vs", 0.0),
-        P.pad(kw.get("livery", ""), 16))
+        P.pad(kw.get("livery", ""), 16),
+        kw.get("squawk", 1200), kw.get("ident", 0), 0)
 
 
 def nasty_packets(sid, rnd):
@@ -56,12 +57,15 @@ def nasty_packets(sid, rnd):
         raw(P.PT_TRAFFIC, sid, P.TRAFFIC_HDR.pack(1, 0) +
             P.TRAFFIC_ENTRY.pack(9, b"A" * 16, b"B" * 8, 57.0, 27.0,
                                  900.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0.0, 0.0,
-                                 b"L" * 16))
+                                 b"L" * 16, 0, 0, 0))
     yield "traffic: NaN track and absurd vertical speed", \
         raw(P.PT_TRAFFIC, sid, P.TRAFFIC_HDR.pack(1, 0) +
             traffic_entry(track=float("nan"), vs=1e9))
     yield "traffic: timestamp going backwards", \
         raw(P.PT_TRAFFIC, sid, P.TRAFFIC_HDR.pack(1, 0) + traffic_entry(t=5))
+    yield "traffic: a squawk no transponder could produce", \
+        raw(P.PT_TRAFFIC, sid, P.TRAFFIC_HDR.pack(1, 0) +
+            traffic_entry(squawk=65535, xpdr=255, ident=255))
     yield "traffic: timestamp at the 32-bit wrap", \
         raw(P.PT_TRAFFIC, sid, P.TRAFFIC_HDR.pack(1, 0) + traffic_entry(t=0xFFFFFFFF))
 

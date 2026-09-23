@@ -57,7 +57,13 @@ struct Ctx {
 
     // How tall the window would have to be for everything drawn so far to
     // fit, including a bottom margin.
-    int neededHeight() const { return top - y + kRowH + 10; }
+    int neededHeight() const { return heightFor(y); }
+
+    // The same, for a row position recorded earlier. Callers that move `y`
+    // back up -- to keep a button on screen, say -- have to measure before
+    // they do it, or the answer is barely more than the height the window
+    // already has, and it grows a row at a time instead of in one go.
+    int heightFor(int rowY) const { return top - rowY + kRowH + 10; }
     void endInput() { clicked = false; keys.clear(); }
 
     bool rowHit() const {

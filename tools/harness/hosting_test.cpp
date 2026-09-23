@@ -8,11 +8,13 @@
 #include "settings.h"
 #include "ui.h"
 
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -132,7 +134,17 @@ public:
         p.rxMask = xr::RX_COM1;
         p.txRadio = xr::TX_COM1;
         p.timeMs = ++clock_;
+        p.squawk = squawk_;
+        p.xpdrMode = xpdrMode_;
+        p.xpdrIdent = ident_;
         send(xr::PT_POSITION, sid_, &p, sizeof(p));
+    }
+
+    // How this pilot's transponder is set. The default is a VFR aircraft
+    // squawking mode C, because that is what almost every test wants and an
+    // aircraft with its transponder off is deliberately invisible to TCAS.
+    void transponder(uint16_t squawk, uint8_t mode, uint8_t ident = 0) {
+        squawk_ = squawk; xpdrMode_ = mode; ident_ = ident;
     }
 
     void text(const char* body, uint32_t freq = 122800) {
@@ -155,6 +167,7 @@ public:
         std::vector<std::string> sawTypes;      // "B738/Ryanair" per entry
         std::vector<std::string> texts;
         std::vector<xr::WeatherPayload> weather;
+        std::vector<xr::TrafficEntry> entries;
     };
     Bag drain(int ms) {
         Bag bag;
@@ -176,6 +189,7 @@ public:
                     xr::TrafficEntry e{};
                     memcpy(&e, buf + off, sizeof(e));
                     off += sizeof(e);
+                    bag.entries.push_back(e);
                     char cs[17] = {0};
                     memcpy(cs, e.callsign, 16);
                     bag.sawCallsigns.push_back(cs);
@@ -232,6 +246,9 @@ private:
     double      lat_, lon_;
     int         fd_ = -1;
     uint32_t    sid_ = 0;
+    uint16_t    squawk_ = 1200;
+    uint8_t     xpdrMode_ = xr::XPDR_ALT;
+    uint8_t     ident_ = 0;
     uint32_t    clock_ = 0;
     sockaddr_in dst_{};
 };
@@ -240,6 +257,147 @@ static bool contains(const std::vector<std::string>& v, const std::string& s) {
     for (const auto& x : v) if (x == s) return true;
     return false;
 }
+
+// Is this callsign on the traffic list, as opposed to merely somewhere in
+// the window? Radio messages carry a callsign too, and an aircraft that has
+// dropped off TCAS can still be talking -- which is the whole point of the
+// transponder tests, so they must not confuse the two.
+static std::string trafficRow(const std::vector<std::string>& w,
+                              const std::string& callsign) {
+    for (const auto& line : w)
+        if (line.find(" nm") != std::string::npos &&
+            line.find(callsign) != std::string::npos) return line;
+    return "";
+}
+static bool onTrafficList(const std::vector<std::string>& w, const std::string& callsign) {
+    return !trafficRow(w, callsign).empty();
+}
+
+// The newest traffic entry for one callsign, or nothing.
+static const xr::TrafficEntry* entryFor(const Peer::Bag& bag, const char* callsign) {
+    const xr::TrafficEntry* found = nullptr;
+    for (const auto& e : bag.entries) {
+        char cs[17] = {0};
+        memcpy(cs, e.callsign, 16);
+        if (!strcmp(cs, callsign)) found = &e;
+    }
+    return found;
+}
+
+// ---------------------------------------------------------------------------
+// A server that is nobody's X-Plane: a VPS, in other words.
+// ---------------------------------------------------------------------------
+// It speaks just enough of the protocol to let the plugin in and keep it
+// there, and it writes down what the plugin offered on the way past. The
+// point is what it has not got: a sim, and therefore any weather of its own.
+class FakeServer {
+public:
+    explicit FakeServer(uint16_t port) {
+        fd_ = (int)socket(AF_INET, SOCK_DGRAM, 0);
+        timeval tv{0, 100 * 1000};
+        setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
+        sockaddr_in me{};
+        me.sin_family = AF_INET;
+        me.sin_port = htons(port);
+        me.sin_addr.s_addr = inet_addr("127.0.0.1");
+        ok_ = ::bind(fd_, (const sockaddr*)&me, sizeof(me)) == 0;
+        if (ok_) worker_ = std::thread(&FakeServer::run, this);
+    }
+    ~FakeServer() {
+        stop_ = true;
+        if (worker_.joinable()) worker_.join();
+        if (fd_ >= 0) CLOSESOCK(fd_);
+    }
+
+    bool ok()       const { return ok_; }
+    int  logins()   const { return logins_.load(); }
+    int  claims()   const { return claims_.load(); }   // logins offering the sky
+    int  weathers() const { return weathers_.load(); }
+    void reset() { logins_ = 0; claims_ = 0; weathers_ = 0; }
+
+    // Relay a sky, as the real server would on behalf of whoever holds the
+    // claim. The plugin should read this as "not me, then".
+    void pushWeather(const xr::WeatherPayload& w) {
+        std::lock_guard<std::mutex> lk(mx_);
+        pending_ = w;
+        havePending_ = true;
+    }
+
+private:
+    void run() {
+        uint8_t buf[xr::kMaxPacket];
+        while (!stop_) {
+            sockaddr_in from{};
+#ifdef _WIN32
+            int fromLen = (int)sizeof(from);
+#else
+            socklen_t fromLen = sizeof(from);
+#endif
+            const int n = (int)recvfrom(fd_, (char*)buf, sizeof(buf), 0,
+                                        (sockaddr*)&from, &fromLen);
+            if (n >= (int)sizeof(xr::Header)) {
+                xr::Header h{};
+                memcpy(&h, buf, sizeof(h));
+                if (h.magic == xr::kMagic) {
+                    std::lock_guard<std::mutex> lk(mx_);
+                    peer_ = from;
+                    havePeer_ = true;
+                    if (h.type == xr::PT_LOGIN &&
+                        n >= (int)(sizeof(h) + sizeof(xr::LoginPayload))) {
+                        xr::LoginPayload lp{};
+                        memcpy(&lp, buf + sizeof(h), sizeof(lp));
+                        ++logins_;
+                        if (lp.flags & xr::LF_WEATHER_SOURCE) ++claims_;
+                        xr::LoginAckPayload ack{};
+                        ack.sessionId = sid_;
+                        ack.serverTimeMs = 0;
+                        send(xr::PT_LOGIN_ACK, &ack, (int)sizeof(ack));
+                    } else if (h.type == xr::PT_WEATHER) {
+                        ++weathers_;
+                    } else if (h.type == xr::PT_POSITION) {
+                        // An empty traffic reply: the plugin drops a server
+                        // that has gone quiet, and this one must not look
+                        // like it has.
+                        xr::TrafficHeader th{};
+                        send(xr::PT_TRAFFIC, &th, (int)sizeof(th));
+                    }
+                }
+            }
+            std::lock_guard<std::mutex> lk(mx_);
+            if (havePending_ && havePeer_) {
+                havePending_ = false;
+                send(xr::PT_WEATHER, &pending_, (int)sizeof(pending_));
+            }
+        }
+    }
+
+    // Call with mx_ held and peer_ known.
+    void send(uint8_t type, const void* payload, int len) {
+        uint8_t out[xr::kMaxPacket];
+        xr::Header h{};
+        h.magic = xr::kMagic;
+        h.type = type;
+        h.version = (uint8_t)xr::kProtoVersion;
+        h.payloadLen = (uint16_t)len;
+        h.sessionId = sid_;
+        memcpy(out, &h, sizeof(h));
+        memcpy(out + sizeof(h), payload, (size_t)len);
+        sendto(fd_, (const char*)out, sizeof(h) + (size_t)len, 0,
+               (const sockaddr*)&peer_, sizeof(peer_));
+    }
+
+    static const uint32_t sid_ = 7;
+    int                fd_ = -1;
+    bool               ok_ = false;
+    std::atomic<bool>  stop_{false};
+    std::atomic<int>   logins_{0}, claims_{0}, weathers_{0};
+    std::thread        worker_;
+    std::mutex         mx_;
+    sockaddr_in        peer_{};
+    bool               havePeer_ = false;
+    xr::WeatherPayload pending_{};
+    bool               havePending_ = false;
+};
 
 // Switch hosting on through the window, exactly as a pilot would.
 static void turnHostingOn() {
@@ -273,7 +431,11 @@ int main(int argc, char** argv) {
         s.callsign = "HOSTER";
         s.acIcao = "";                     // from the sim
         s.host = "127.0.0.1";
-        s.port = "1";                      // deliberately useless
+        // Nothing is listening here yet, so the plugin cannot connect until
+        // hosting is switched on and repoints it -- which is what the early
+        // sections want. The last section binds a fake dedicated server to
+        // this port and switches hosting off again, and the plugin finds it.
+        s.port = std::to_string(g_port + 1);
         s.hostPort = std::to_string(g_port);
         s.hostEnabled = false;
         s.hostUpnp = false;                // no router in CI, and no waiting
@@ -289,6 +451,10 @@ int main(int argc, char** argv) {
     harness::set("sim/cockpit2/radios/actuators/com1_power", 1);
     harness::set("sim/cockpit2/radios/actuators/com2_power", 1);
     harness::set("sim/cockpit2/electrical/bus_volts", 24.0);
+    // Transponder on and squawking mode C: without one, TCAS has nothing to
+    // interrogate with and the traffic list is empty by design.
+    harness::set("sim/cockpit2/radios/actuators/transponder_mode", xr::XPDR_ALT);
+    harness::set("sim/cockpit2/radios/actuators/transponder_code", 4321);
     harness::set("sim/cockpit2/radios/actuators/audio_com_selection", 6);
     harness::set("sim/flightmodel/position/elevation", 914.0);
     // What the sim says we are flying. The config leaves the type blank, so
@@ -418,16 +584,31 @@ int main(int argc, char** argv) {
         harness::drawnAt("Hosting", &tx, &ty);
         harness::click(kWin, tx + 10, ty);
         for (int i = 0; i < 6; ++i) { peer.position(); fly(0.1); }
-        int h0 = 0, t0 = 0, l0 = 0, r0 = 0;
-        harness::windowRect(kWin, &l0, &t0, &r0, &h0);
+
+        // Squash the window down to where nothing could possibly fit, then
+        // come back to this tab: a pilot who has dragged the window small
+        // must not be left with the join code and the buttons drawn over the
+        // cockpit below it. Going away and returning is what a pilot does,
+        // and it is also what tells the window its content changed size.
+        int l0 = 0, t0 = 0, r0 = 0, b0 = 0;
+        harness::windowRect(kWin, &l0, &t0, &r0, &b0);
+        harness::setWindowRect(kWin, l0, t0, r0, t0 - 200);
+        // fly() draws the main window, so the recorded positions are its
+        // rows, not this window's: draw the settings window before asking it
+        // where its tabs are.
+        drawSettings();
+        harness::drawnAt("Audio", &tx, &ty);
+        harness::click(kWin, tx + 10, ty);
+        drawSettings();
+        harness::drawnAt("Hosting", &tx, &ty);
+        harness::click(kWin, tx + 10, ty);
         auto v = drawSettings();
-        // This tab says far more than the others; the window grows to fit it
-        // on the next frame, which is what a pilot sees.
         v = drawSettings();
         int l1 = 0, t1 = 0, r1 = 0, b1 = 0;
         harness::windowRect(kWin, &l1, &t1, &r1, &b1);
-        check("the window grew to fit the hosting tab", (t1 - b1) > (t0 - h0),
-              std::to_string(t0 - h0) + " -> " + std::to_string(t1 - b1) + " px");
+        check("a squashed window grows back to fit the hosting tab",
+              (t1 - b1) > 200,
+              "200 -> " + std::to_string(t1 - b1) + " px");
 
         check("it says the server is running", shows(v, "Running on port"));
         check("it shows an address to give out", shows(v, "Friends type:"));
@@ -499,6 +680,105 @@ int main(int argc, char** argv) {
         check("so does hearing", shows(harness::draw(), "reading you now"));
     }
 
+    printf("\nthe transponder decides who is on TCAS\n");
+    {
+        // TCAS works by interrogating transponders. An aircraft whose
+        // transponder is off or in standby does not answer, so it is not a
+        // contact -- and neither is anybody, if it is our own transponder
+        // that is off, because the interrogation comes from us. None of this
+        // touches the radio or the model: you can see and talk to an
+        // aircraft that is squawking nothing at all.
+        Peer sqk("SQK001", 57.858, 27.028);
+        check("a pilot joins", sqk.login());
+
+        sqk.transponder(4671, xr::XPDR_ALT);
+        for (int i = 0; i < 6; ++i) { sqk.position(); fly(0.1); }
+        auto w = harness::draw();
+        std::string row = trafficRow(w, "SQK001");
+        check("squawking mode C, they are a contact", !row.empty());
+        check("their squawk is on their own row",
+              row.find("4671") != std::string::npos, row);
+        check("with their altitude", row.find("2999 ft") != std::string::npos, row);
+        check("and our own transponder is on the traffic line",
+              shows(w, "XPDR 4321 ALT"));
+        if (!shows(w, "4671")) dump(w);
+
+        // Mode A answers with an identity and no altitude at all.
+        sqk.transponder(4671, xr::XPDR_ON);
+        for (int i = 0; i < 6; ++i) { sqk.position(); fly(0.1); }
+        w = harness::draw();
+        row = trafficRow(w, "SQK001");
+        check("on mode A they are still a contact", !row.empty());
+        check("but with no altitude to report",
+              row.find("no alt") != std::string::npos, row);
+        check("and no invented one", row.find(" ft") == std::string::npos, row);
+        if (row.find("no alt") == std::string::npos) dump(w);
+
+        // IDENT, the button a pilot presses when ATC asks them to.
+        sqk.transponder(4671, xr::XPDR_ALT, 1);
+        for (int i = 0; i < 6; ++i) { sqk.position(); fly(0.1); }
+        check("squawking ident is visible",
+              trafficRow(harness::draw(), "SQK001").find(" ID") != std::string::npos,
+              trafficRow(harness::draw(), "SQK001"));
+
+        // Standby: no answer, so no contact.
+        sqk.transponder(4671, xr::XPDR_STANDBY);
+        for (int i = 0; i < 8; ++i) { sqk.position(); fly(0.1); }
+        w = harness::draw();
+        check("in standby they are off TCAS", !onTrafficList(w, "SQK001"));
+        if (onTrafficList(w, "SQK001")) dump(w);
+
+        // ...but they are still on the radio. A transponder is not a radio.
+        sqk.text("standby but still talking");
+        fly(0.8);
+        check("a transponder has nothing to do with the radio",
+              shows(harness::draw(), "standby but still talking"));
+
+        // Our own transponder off: TCAS is inoperative, so nobody shows.
+        sqk.transponder(4671, xr::XPDR_ALT);
+        for (int i = 0; i < 6; ++i) { sqk.position(); fly(0.1); }
+        check("back on mode C they return", onTrafficList(harness::draw(), "SQK001"));
+
+        harness::set("sim/cockpit2/radios/actuators/transponder_mode", xr::XPDR_STANDBY);
+        for (int i = 0; i < 6; ++i) { sqk.position(); fly(0.1); }
+        w = harness::draw();
+        check("with our own transponder in standby, TCAS is blank",
+              !onTrafficList(w, "SQK001"));
+        check("and it says why, rather than looking broken",
+              shows(w, "TCAS off -- XPDR STBY"));
+        if (!shows(w, "TCAS off -- XPDR STBY")) dump(w);
+
+        harness::set("sim/cockpit2/radios/actuators/transponder_mode", xr::XPDR_ALT);
+        for (int i = 0; i < 6; ++i) { sqk.position(); fly(0.1); }
+        check("switching it back brings the traffic back",
+              onTrafficList(harness::draw(), "SQK001"));
+
+        // A cold and dark aircraft is not squawking either: the transponder
+        // is on the same bus as the radios.
+        harness::set("sim/cockpit2/switches/avionics_power_on", 0);
+        harness::set("sim/cockpit2/electrical/bus_volts", 0.0);
+        for (int i = 0; i < 6; ++i) { sqk.position(); fly(0.1); }
+        check("with no power our transponder is off, whatever the knob says",
+              shows(harness::draw(), "XPDR OFF"));
+        harness::set("sim/cockpit2/switches/avionics_power_on", 1);
+        harness::set("sim/cockpit2/electrical/bus_volts", 24.0);
+        fly(0.4);
+
+        // A squawk is four octal digits. 7788 is not one.
+        sqk.transponder(7788, xr::XPDR_ALT);
+        for (int i = 0; i < 6; ++i) { sqk.position(); fly(0.1); }
+        check("an impossible squawk is not relayed as if it were real",
+              trafficRow(harness::draw(), "SQK001").find("7788") == std::string::npos,
+              trafficRow(harness::draw(), "SQK001"));
+
+        // An emergency squawk should catch the eye, not hide in the list.
+        sqk.transponder(7700, xr::XPDR_ALT);
+        for (int i = 0; i < 6; ++i) { sqk.position(); fly(0.1); }
+        check("an emergency squawk is shown",
+              trafficRow(harness::draw(), "SQK001").find("7700") != std::string::npos,
+              trafficRow(harness::draw(), "SQK001"));
+    }
+
     printf("\nthe window is narrowed\n");
     {
         // X-Plane lets a pilot drag this window down to 320 px. Text drawn
@@ -524,6 +804,64 @@ int main(int argc, char** argv) {
               std::to_string(over) + " lines overflow");
         check("and the window still shows its content", shows(w, "XRadio"));
         harness::setWindowRect(1, l, t, r, b);
+    }
+
+    printf("\non the ground we report the ground, not our own gear height\n");
+    {
+        // XPMP2 stands a CSL model on its wheels by adding that model's
+        // VERT_OFFSET to whatever altitude it is handed. X-Plane's
+        // `elevation` is the aircraft's datum point, which on the ground is
+        // already a couple of metres up, on top of its own gear -- so
+        // sending that has the gear counted twice, and a pilot watching the
+        // apron sees everybody hovering. What the receiver needs while we
+        // are down is the ground.
+        Peer obs("GNDOBS", 57.858, 27.028);
+        check("an observer joins", obs.login());
+
+        // Some altitude bookkeeping that has to survive the round trip: a
+        // stand at 100 m, with our datum 2.4 m above it.
+        harness::set("sim/flightmodel/position/elevation", 100.0);
+        harness::set("sim/flightmodel/position/y_agl", 2.4);
+        harness::set("sim/flightmodel/failures/onground_any", 1);
+        for (int i = 0; i < 8; ++i) { obs.position(); fly(0.1); }
+        auto bag = obs.drain(400);
+        const xr::TrafficEntry* me = entryFor(bag, "HOSTER");
+        check("the observer sees us", me != nullptr);
+        if (me) {
+            check("parked, we are reported at ground level",
+                  std::fabs(me->altMslM - 97.6f) < 0.05f,
+                  std::to_string(me->altMslM) + " m, wanted 97.6");
+            check("and still flagged as on the ground", me->onGround == 1);
+        }
+
+        // Airborne, the datum is the aircraft, so it goes out untouched and
+        // the receiver drops the offset instead (see xpmp_bridge.cpp).
+        harness::set("sim/flightmodel/position/elevation", 900.0);
+        harness::set("sim/flightmodel/position/y_agl", 800.0);
+        harness::set("sim/flightmodel/failures/onground_any", 0);
+        for (int i = 0; i < 8; ++i) { obs.position(); fly(0.1); }
+        bag = obs.drain(400);
+        me = entryFor(bag, "HOSTER");
+        check("in the air, our real altitude is sent", me != nullptr &&
+              std::fabs(me->altMslM - 900.f) < 0.05f,
+              me ? std::to_string(me->altMslM) + " m, wanted 900" : "no entry");
+
+        // A nonsense reading must not bury the model: that would look far
+        // worse than the hover it replaces.
+        harness::set("sim/flightmodel/position/elevation", 100.0);
+        harness::set("sim/flightmodel/position/y_agl", 4000.0);
+        harness::set("sim/flightmodel/failures/onground_any", 1);
+        for (int i = 0; i < 8; ++i) { obs.position(); fly(0.1); }
+        bag = obs.drain(400);
+        me = entryFor(bag, "HOSTER");
+        check("an absurd AGL reading is ignored rather than applied",
+              me != nullptr && std::fabs(me->altMslM - 100.f) < 0.05f,
+              me ? std::to_string(me->altMslM) + " m, wanted 100" : "no entry");
+
+        harness::set("sim/flightmodel/position/elevation", 914.0);
+        harness::set("sim/flightmodel/position/y_agl", 0.0);
+        harness::set("sim/flightmodel/failures/onground_any", 0);
+        fly(0.4);
     }
 
     printf("\nthe host's sky reaches everyone else\n");
@@ -588,11 +926,11 @@ int main(int argc, char** argv) {
         drawSettings();
         int tx = 0, ty = 0, top = 0, left = 0;
         harness::windowTop(kWin, &top, &left);
-        harness::drawnAt("Hosting", &tx, &ty);
+        harness::drawnAt("Traffic", &tx, &ty);
         harness::click(kWin, tx + 10, ty);
         drawSettings();
         int lx = 0, ly = 0;
-        check("there is a share toggle", harness::drawnAt("Share my weather", &lx, &ly));
+        check("there is a share toggle", harness::drawnAt("Offer my weather", &lx, &ly));
         harness::click(kWin, left + xr::ui::Ctx::kValueX + 10, ly);
         drawSettings();
         int bx = 0, by = 0;
@@ -669,7 +1007,7 @@ int main(int argc, char** argv) {
         harness::drawnAt("Traffic", &tx, &ty);
         harness::click(kWin, tx + 10, ty);
         drawSettings();
-        check("there is a follow toggle", harness::drawnAt("Follow the host", &lx, &ly));
+        check("there is a follow toggle", harness::drawnAt("Fly the flight's", &lx, &ly));
         harness::click(kWin, left + xr::ui::Ctx::kValueX + 10, ly);
         drawSettings();
         harness::drawnAt("Save & apply", &bx, &by);
@@ -805,6 +1143,84 @@ int main(int argc, char** argv) {
 
         Peer late("TOOLATE", 57.86, 27.03);
         check("nobody can join any more", !late.login());
+    }
+
+    printf("\nweather still has a source on a dedicated server\n");
+    {
+        // The bug: the offer to be the flight's weather source used to be
+        // made only while this plugin was itself hosting. Join a server on a
+        // VPS instead and nobody ever claimed it, so the server let nobody
+        // send, and every pilot flew their own sky while the setting sat
+        // there saying they were sharing.
+        FakeServer srv((uint16_t)(g_port + 1));
+        check("the dedicated server is listening", srv.ok());
+
+        // Sharing was switched off earlier in this file, so start by
+        // confirming the offer is not made when it should not be.
+        fly(3.0);
+        check("we reach the dedicated server", srv.logins() > 0,
+              std::to_string(srv.logins()) + " logins");
+        check("with sharing off, no claim is made", srv.claims() == 0,
+              std::to_string(srv.claims()) + " claims");
+        check("and no weather goes out", srv.weathers() == 0,
+              std::to_string(srv.weathers()) + " packets");
+
+        // Now switch it on, the way a pilot would.
+        harness::menu(1);
+        drawSettings();
+        int tx = 0, ty = 0, top = 0, left = 0;
+        harness::windowTop(kWin, &top, &left);
+        harness::drawnAt("Traffic", &tx, &ty);
+        harness::click(kWin, tx + 10, ty);
+        drawSettings();
+        int lx = 0, ly = 0;
+        check("the share toggle is on the Traffic tab, not Hosting",
+              harness::drawnAt("Offer my weather", &lx, &ly));
+        harness::click(kWin, left + xr::ui::Ctx::kValueX + 10, ly);
+        drawSettings();
+        drawSettings();
+        int bx = 0, by = 0;
+        harness::drawnAt("Save & apply", &bx, &by);
+        harness::click(kWin, bx + 20, by);
+        drawSettings();
+
+        {
+            xr::Settings saved;
+            xr::loadSettings(saved, kCfgPath);
+            check("sharing is on in the saved settings", saved.shareWeather);
+        }
+
+        srv.reset();
+        fly(3.0);
+        check("the login now offers to be the weather source", srv.claims() > 0,
+              std::to_string(srv.claims()) + " claims of " +
+              std::to_string(srv.logins()) + " logins");
+        check("and the sky actually goes out", srv.weathers() > 0,
+              std::to_string(srv.weathers()) + " packets");
+
+        auto w = harness::draw();
+        check("the window says whose sky we are flying",
+              shows(w, "Weather and time: mine"));
+        if (!shows(w, "Weather and time: mine")) dump(w);
+
+        // The other half: the server awards the claim to whoever asked
+        // first, and does not tell the losers. A loser finds out by being
+        // sent somebody else's sky -- and must then stop sending its own,
+        // whether or not it is following.
+        xr::WeatherPayload other{};
+        other.zuluTimeSec = 36000.f;
+        other.seaLevelPressurePa = 100500.f;
+        other.visibilitySm = 6.f;
+        srv.pushWeather(other);
+        fly(1.0);
+        srv.reset();
+        fly(3.0);
+        check("somebody else's sky arriving stops us sending ours",
+              srv.weathers() == 0, std::to_string(srv.weathers()) + " packets");
+
+        w = harness::draw();
+        check("and the window says so", shows(w, "Weather and time: the flight's"));
+        if (!shows(w, "Weather and time: the flight's")) dump(w);
     }
 
     XPluginDisable();

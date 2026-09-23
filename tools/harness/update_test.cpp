@@ -61,7 +61,15 @@ int main(int argc, char** argv) {
             check("with its version number", i.latest == "9.9.9", i.latest);
             check("and a link to the release, not to the author",
                   i.url.find("/releases/") != std::string::npos, i.url);
-        } else if (mode == "same" || mode == "older") {
+        } else if (mode == "same") {
+            // Assert what the site actually said, not only the verdict: if
+            // the stand-in and this test ever disagree about what "the same
+            // version" is, the case quietly becomes the "older" one and goes
+            // on passing while testing nothing.
+            check("the site really did offer the version we are running",
+                  i.latest == "0.5.2", i.latest);
+            check("no update is claimed", !i.newer, i.latest);
+        } else if (mode == "older") {
             check("no update is claimed", !i.newer, i.latest);
         } else if (mode == "garbage" || mode == "error" || mode == "offline") {
             check("nothing is claimed when the answer is useless", !i.newer);
