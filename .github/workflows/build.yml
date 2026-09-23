@@ -51,22 +51,14 @@ jobs:
       - name: Server protocol and routing tests
         run: python3 tools/test_server.py
 
+      # The comparison lives in check_sizes.py, not in a shell pipeline here:
+      # a list of names kept in a YAML heredoc cannot be run anywhere else, so
+      # a constant added to one side and not to the heredoc passes on the
+      # developer's machine and fails here ten minutes later.
       - name: C++ and Python wire structs agree
         run: |
           g++ -std=c++17 -Iplugin/src tools/check_sizes.cpp -o /tmp/check_sizes
-          /tmp/check_sizes > /tmp/cpp_sizes.txt
-          python3 - <<'PY' > /tmp/py_sizes.txt
-          import sys; sys.path.insert(0, 'server')
-          import protocol as P
-          for n in ("HEADER", "LOGIN", "LOGIN_ACK", "LOGIN_REJECT", "POSITION",
-                    "TRAFFIC_HDR", "TRAFFIC_ENTRY", "TEXT_HDR", "VOICE_HDR",
-                    "WEATHER"):
-              print(n, getattr(P, n).size)
-          print("MAX_PACKET", P.MAX_PACKET)
-          print("MAX_TRAFFIC_ENTRIES", P.MAX_TRAFFIC_ENTRIES)
-          PY
-          diff /tmp/cpp_sizes.txt /tmp/py_sizes.txt
-          echo "struct layouts match"
+          python3 tools/check_sizes.py --compare /tmp/check_sizes
 
       - name: Build the test executables
         run: |
