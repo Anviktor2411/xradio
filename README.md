@@ -486,7 +486,7 @@ talking and where, not only who typed. Guard and direct messages are amber,
 voice is green, ordinary chatter white. The notice takes no clicks, so it can
 never swallow one meant for the panel underneath, and it disappears the moment
 the window is opened, because the log is then right there. Switch it off in
-**Settings → Audio → Pop up messages when this window is closed**.
+**Settings → Audio → Show messages when the window is closed**.
 
 ## Protocol versions
 

@@ -6,6 +6,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 namespace xr {
 namespace ui {
@@ -41,6 +42,27 @@ void draw(const Ctx& c, int x, const char* s, int col) {
 constexpr int kBarCells = 16;      // characters in a slider track
 constexpr int kCellPx   = 7;       // approximate width of one character
 constexpr int kBarX     = Ctx::kValueX;
+
+// A label, cut short if it would reach the value column. kValueX is wide
+// enough for every label there is today; this is what keeps a longer one
+// added later from being drawn over the top of its own value, which looks
+// like a rendering fault rather than like text that did not fit.
+void drawLabel(const Ctx& c, const char* s, int col) {
+    const int avail = Ctx::kValueX - 10 - kCellPx;     // a space before the value
+    std::string t(s);
+    if (XPLMMeasureString(xplmFont_Proportional, (char*)t.c_str(), (int)t.size())
+        <= (float)avail) {
+        draw(c, 10, t.c_str(), col);
+        return;
+    }
+    while (!t.empty() &&
+           XPLMMeasureString(xplmFont_Proportional, (t + "..").c_str(),
+                             (int)t.size() + 2) > (float)avail) {
+        t.pop_back();
+    }
+    t += "..";
+    draw(c, 10, t.c_str(), col);
+}
 
 }  // namespace
 
@@ -89,7 +111,7 @@ bool textField(Ctx& c, const char* label, std::string& value,
         c.keys.clear();
     }
 
-    draw(c, 10, label, focused ? 0 : 1);
+    drawLabel(c, label, focused ? 0 : 1);
     std::string shown = value;
     if (focused && c.blink) shown += "_";
     char buf[128];
@@ -108,14 +130,14 @@ bool toggle(Ctx& c, const char* label, bool& value) {
         c.focus = self;
         c.clicked = false;
     }
-    draw(c, 10, label, 1);
+    drawLabel(c, label, 1);
     draw(c, kBarX, value ? "[x]  on" : "[ ]  off", value ? 2 : 1);
     c.nextRow();
     return changed;
 }
 
 bool slider(Ctx& c, const char* label, float& value, float lo, float hi,
-            const char* unit, bool percent) {
+            const char* unit, bool percent, int decimals) {
     const int self = c.index++;
     bool changed = false;
 
@@ -124,7 +146,19 @@ bool slider(Ctx& c, const char* label, float& value, float lo, float hi,
     if (c.rowHit() && c.clickX >= barLeft - kCellPx && c.clickX <= barRight + kCellPx) {
         float f = (float)(c.clickX - barLeft) / (float)(barRight - barLeft);
         f = f < 0.f ? 0.f : (f > 1.f ? 1.f : f);
-        const float nv = lo + f * (hi - lo);
+        // Rounded to the precision the row shows. A click on "Label range"
+        // used to store 46.9643 and print every digit of it; nobody chose
+        // 46.9643 nautical miles, they chose 47.
+        float nv = lo + f * (hi - lo);
+        if (decimals <= 0) {
+            nv = (float)(long)(nv + (nv < 0.f ? -0.5f : 0.5f));
+        } else {
+            float scale = 1.f;
+            for (int i = 0; i < decimals && i < 6; ++i) scale *= 10.f;
+            nv = (float)(long)(nv * scale + (nv < 0.f ? -0.5f : 0.5f)) / scale;
+        }
+        if (nv < lo) nv = lo;
+        if (nv > hi) nv = hi;
         if (nv != value) { value = nv; changed = true; }
         c.focus = self;
         c.clicked = false;
@@ -145,9 +179,11 @@ bool slider(Ctx& c, const char* label, float& value, float lo, float hi,
     if (percent) {
         snprintf(buf, sizeof(buf), "%s  %3d%%", bar, (int)(frac * 100.f + 0.5f));
     } else {
-        snprintf(buf, sizeof(buf), "%s  %g%s", bar, (double)value, unit);
+        snprintf(buf, sizeof(buf), "%s  %.*f%s", bar,
+                 decimals < 0 ? 0 : (decimals > 6 ? 6 : decimals),
+                 (double)value, unit);
     }
-    draw(c, 10, label, 1);
+    drawLabel(c, label, 1);
     draw(c, kBarX, buf, 0);
     c.nextRow();
     return changed;
@@ -183,7 +219,7 @@ bool choice(Ctx& c, const char* label, std::string& value,
     char buf[160];
     const char* shown = value.empty() ? empty : value.c_str();
     snprintf(buf, sizeof(buf), "< > %s", shown);
-    draw(c, 10, label, 1);
+    drawLabel(c, label, 1);
     draw(c, kBarX, buf, value.empty() ? 1 : 0);
     c.nextRow();
     return changed;
@@ -198,7 +234,7 @@ bool keybind(Ctx& c, const char* label, const std::string& keyName, bool& captur
         c.focus = self;
         c.clicked = false;
     }
-    draw(c, 10, label, 1);
+    drawLabel(c, label, 1);
     char buf[96];
     if (capturing) {
         snprintf(buf, sizeof(buf), "press a key...   (Escape: none)");

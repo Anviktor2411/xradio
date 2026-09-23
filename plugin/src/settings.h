@@ -126,7 +126,7 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"hiss",      "Radio noise",    Kind::Slider, 1, &s.hiss,       0.f, 1.f, "%", 0},
         {"radiofilter", "Radio sound (limiter, squelch, filter)", Kind::Bool, 1, &s.radioFilter},
         {"pttkey",    "Push-to-talk key", Kind::KeyBind, 1, &s.pttKey},
-        {"popups",    "Pop up messages when this window is closed", Kind::Bool, 1,
+        {"popups",    "Show messages when the window is closed", Kind::Bool, 1,
                       &s.popUps},
 
         {"showtraffic", "Draw other aircraft", Kind::Bool, 2, &s.showTraffic},

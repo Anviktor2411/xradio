@@ -46,7 +46,11 @@ struct Ctx {
     bool clipped = false;     // a row did not fit: the window wants to be taller
 
     static constexpr int kRowH   = 22;
-    static constexpr int kValueX = 190;   // where values start, from `left`
+    // Where values start, from `left`. Wide enough for the longest label in
+    // the settings table -- at 190 they ran straight into the value beside
+    // them, which read as two overlapping words rather than as a label that
+    // was too long.
+    static constexpr int kValueX = 300;
 
     void begin(int l, int t, int r, int b, int firstRowOffset) {
         left = l; top = t; right = r; bottom = b;
@@ -83,8 +87,10 @@ bool textField(Ctx& c, const char* label, std::string& value,
 bool toggle(Ctx& c, const char* label, bool& value);
 
 // `Label  [#####-----]  42 unit`. Click anywhere on the bar to set.
+// `decimals` is both how the value is shown and what a click rounds it to,
+// so the number stored is the one the pilot can see they chose.
 bool slider(Ctx& c, const char* label, float& value, float lo, float hi,
-            const char* unit, bool percent);
+            const char* unit, bool percent, int decimals = 0);
 
 // `Label  < current >`, arrows cycle. `empty` is shown when options is empty.
 bool choice(Ctx& c, const char* label, std::string& value,

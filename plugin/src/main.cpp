@@ -1822,7 +1822,7 @@ void drawSettings(XPLMWindowID win, void*) {
                 break;
             case xr::Kind::Slider:
                 xr::ui::slider(g_ui, f.label, *(float*)f.ptr, f.lo, f.hi, f.unit,
-                               std::string(f.unit) == "%");
+                               std::string(f.unit) == "%", f.decimals);
                 break;
             case xr::Kind::Choice: {
                 const bool isMic = std::string(f.key) == "mic";
