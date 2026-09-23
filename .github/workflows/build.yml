@@ -62,6 +62,8 @@ jobs:
                     "TRAFFIC_HDR", "TRAFFIC_ENTRY", "TEXT_HDR", "VOICE_HDR",
                     "WEATHER"):
               print(n, getattr(P, n).size)
+          print("MAX_PACKET", P.MAX_PACKET)
+          print("MAX_TRAFFIC_ENTRIES", P.MAX_TRAFFIC_ENTRIES)
           PY
           diff /tmp/cpp_sizes.txt /tmp/py_sizes.txt
           echo "struct layouts match"
