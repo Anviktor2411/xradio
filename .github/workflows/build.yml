@@ -116,6 +116,9 @@ jobs:
 
       - name: Update check against a fake release site
         run: |
+          # The offline case points itself at a dead port, so it tests what it
+          # says rather than depending on this runner being unable to reach
+          # GitHub -- which is how it passed for weeks and then did not.
           ASAN_OPTIONS=detect_leaks=0 ./build-tests/update_test offline
           for mode in newer same older garbage error huge; do
             python3 tools/harness/fake_release.py --mode $mode > /tmp/rel.log 2>&1 &
