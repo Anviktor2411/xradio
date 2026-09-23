@@ -168,6 +168,25 @@ def checks(skipped):
 
     ok &= run("server protocol and routing", [PY, "tools/test_server.py"])
 
+    # Cheap, and the one check that catches the two protocol files describing
+    # different bytes -- which every other test would then agree about, because
+    # they all use one side or the other.
+    cxx = "g++" if have("g++") else ("clang++" if have("clang++") else None)
+    if cxx:
+        build = ROOT / "build-tests"
+        build.mkdir(exist_ok=True)
+        exe = build / ("check_sizes.exe" if os.name == "nt" else "check_sizes")
+        if run("building the wire-format check",
+               [cxx, "-std=c++17", "-Iplugin/src", "tools/check_sizes.cpp",
+                "-o", str(exe)]):
+            ok &= run("C++ and Python wire structs agree",
+                      [PY, "tools/check_sizes.py", "--compare", str(exe)])
+        else:
+            ok = False
+    else:
+        say("  C++ and Python wire structs agree ... skipped (no compiler here)")
+        skipped.append("the wire-format comparison (no C++ compiler)")
+
     if not (have("cmake") and (have("g++") or have("clang++"))):
         say("  the C++ tests ... skipped (no cmake/compiler here)")
         skipped.append("every C++ test (no cmake or compiler)")
