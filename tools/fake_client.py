@@ -25,7 +25,8 @@ def run(args):
     sock.settimeout(0.2)
     dest = (args.server, args.port)
 
-    sock.sendto(P.pack(P.PT_LOGIN, 0, P.login(args.callsign, args.actype)), dest)
+    sock.sendto(P.pack(P.PT_LOGIN, 0,
+                       P.login(args.callsign, args.actype, password=args.password)), dest)
 
     sid = 0
     deadline = time.time() + 3.0
@@ -38,7 +39,8 @@ def run(args):
         if parsed and parsed[0] == P.PT_LOGIN_ACK:
             sid, _t = P.LOGIN_ACK.unpack_from(parsed[4], 0)
     if sid == 0:
-        print("no LOGIN_ACK -- is the server running?")
+        print("no LOGIN_ACK -- is the server running, on this port, and does "
+              "it want a password (--password)?")
         return
     print(f"logged in as {args.callsign}, sid={sid}")
 
@@ -139,6 +141,8 @@ if __name__ == "__main__":
     ap.add_argument("--server", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=49100)
     ap.add_argument("--callsign", default="TEST01")
+    ap.add_argument("--password", default="",
+                    help="the flight password, if the server wants one")
     ap.add_argument("--actype", default="C172")
     ap.add_argument("--lat", type=float, default=57.85)
     ap.add_argument("--lon", type=float, default=27.02)

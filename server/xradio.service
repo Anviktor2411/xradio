@@ -7,7 +7,18 @@ Wants=network-online.target
 Type=simple
 User=xradio
 WorkingDirectory=/opt/xradio/server
-ExecStart=/usr/bin/python3 /opt/xradio/server/server.py --host 0.0.0.0 --port 49100
+
+# Settings live here rather than on the command line, so a flight password is
+# not visible in `ps`, in `systemctl cat`, or to anyone who can read the unit.
+# The dash means "carry on if the file is not there".
+#
+#   /etc/xradio.conf, owned by root, chmod 600:
+#     XRADIO_PORT=49100
+#     XRADIO_PASSWORD=yourword
+#
+EnvironmentFile=-/etc/xradio.conf
+ExecStart=/usr/bin/python3 /opt/xradio/server/server.py --host 0.0.0.0
+
 Restart=always
 RestartSec=3
 

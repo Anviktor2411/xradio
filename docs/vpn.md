@@ -216,6 +216,10 @@ install Python:
 Then everyone puts the VPS's address in **Settings → Connection**. Nobody
 hosts; nobody's router is involved.
 
+**[Running a dedicated XRadio server](server.md)** covers this properly:
+which VPS and where to put it, both firewalls, the systemd unit, checking it
+works before you invite anyone, and keeping it updated.
+
 A dedicated server has no sim and therefore no weather of its own. XRadio
 handles that: the first pilot to connect with **Offer my weather and time to
 the flight** switched on becomes the flight's sky, and everyone else follows

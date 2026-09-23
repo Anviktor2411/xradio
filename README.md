@@ -123,15 +123,26 @@ cd server
 python3 server.py --host 0.0.0.0 --port 49100 -v
 ```
 
-No dependencies beyond Python 3.10+. Open **UDP** port 49100 in your firewall.
-A systemd unit is provided in `server/xradio.service`.
+No dependencies beyond Python 3.10+. Open **UDP** port 49100 — in the
+machine's firewall *and* in the provider's, which is where most of the wasted
+evenings happen. A systemd unit is provided in `server/xradio.service`.
 
 The release package also carries the same server as a compiled binary, for a
-machine without Python:
+machine without Python. It takes its arguments positionally:
 
 ```bash
-./server/lin_x64/xradio_server 49100        # or win_x64\ , mac_x64/
+./server/lin_x64/xradio_server 49100              # or win_x64\ , mac_x64/
+./server/lin_x64/xradio_server 49100 yourword     # port, then flight password
 ```
+
+**[Running a dedicated XRadio server](docs/server.md)** is the full version:
+picking and sizing a VPS (the cheapest one is enough — measured, eight pilots
+is 21 MB of RAM and half a megabit), choosing where to put it so the latency
+lands in the middle of the group, the systemd unit with the password kept out
+of it, proving it works with `tools/fake_client.py` before anyone is invited,
+how weather and time work with no sim to take them from, and the update
+routine — **the server has to be updated whenever the protocol changes, or
+every pilot is refused at login**.
 
 ## Telling pilots about a new version
 
