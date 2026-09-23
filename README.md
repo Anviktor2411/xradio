@@ -465,6 +465,29 @@ it as what it is:
 A callsign nobody in the flight is using comes back with an answer rather than
 silence. An `@` anywhere but the start of the line is just an `@`.
 
+## With the window closed
+
+Most pilots fly with the XRadio window shut — it is a large grey rectangle over
+the scenery. Shut, a call on the radio used to leave no trace at all: the radio
+log is inside the very window nobody is looking at.
+
+So while the window is closed, anything that arrives appears for ten seconds in
+the top-left corner, where X-Plane puts its own messages:
+
+```
+  ESNB34 is calling on 122.800
+  [GUARD 121.500] ESNA12: anyone out there, come to 118.100
+  [direct] ESNB34: on my way
+```
+
+Radio calls, guard calls and `@CALLSIGN` messages, plus a line when somebody
+keys up on a frequency you monitor — so a closed window still tells you who is
+talking and where, not only who typed. Guard and direct messages are amber,
+voice is green, ordinary chatter white. The notice takes no clicks, so it can
+never swallow one meant for the panel underneath, and it disappears the moment
+the window is opened, because the log is then right there. Switch it off in
+**Settings → Audio → Pop up messages when this window is closed**.
+
 ## Protocol versions
 
 The header carries a version and the server rejects anything that does not

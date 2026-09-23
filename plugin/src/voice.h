@@ -108,6 +108,10 @@ void  setRadioFilter(bool on);   // the whole radio sound: limiter, overdrive,
 void  setSignalQuality(uint32_t sid, float quality);
 float micLevel();                // 0..1, peak of the most recent capture block
 std::vector<uint32_t> activeSpeakers();
+// Which frequency that pilot's voice is arriving on, 0 if they are not
+// currently coming in. The window uses it to say where somebody is calling
+// from when the pilot cannot see the radio log.
+uint32_t speakerFreq(uint32_t sid);
 std::string status();            // one line for the window
 Stats stats();
 

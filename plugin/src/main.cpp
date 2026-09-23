@@ -425,6 +425,43 @@ void addChat(const std::string& s) {
 }
 
 // ---------------------------------------------------------------------------
+// notices: what a pilot still sees with the XRadio window closed
+// ---------------------------------------------------------------------------
+// Most pilots fly with the window shut -- it is a big grey rectangle over the
+// scenery. Shut, though, it used to mean a call on the radio left no trace at
+// all: nothing in the cockpit, nothing on screen, and the radio log only
+// visible to somebody who happened to open the window afterwards. These are
+// the few seconds of text that fix that, in the corner X-Plane puts its own
+// messages in, and they appear only while the window is closed.
+struct Notice {
+    std::string text;
+    float       at = 0.f;
+    int         colour = 0;          // 0 white, 1 amber, 2 green
+};
+std::vector<Notice> g_notices;
+static const size_t kMaxNotices  = 5;
+
+// Ten seconds is long enough to read a line and short enough not to become
+// clutter. The tests would otherwise have to sit through it for real, so it
+// is readable from the environment -- the same seam the update check uses.
+float noticeHoldS() {
+    static const float v = [] {
+        const char* e = getenv("XRADIO_NOTICE_HOLD");
+        const float f = e ? (float)atof(e) : 0.f;
+        return (f > 0.1f && f < 120.f) ? f : 10.f;
+    }();
+    return v;
+}
+
+void updateNotices();          // defined with the window, below
+
+void pushNotice(const std::string& text, int colour) {
+    if (!g_cfg.popUps || text.empty()) return;
+    g_notices.push_back({text, g_elapsed, colour});
+    if (g_notices.size() > kMaxNotices) g_notices.erase(g_notices.begin());
+}
+
+// ---------------------------------------------------------------------------
 // networking
 // ---------------------------------------------------------------------------
 int writeHeader(uint8_t* buf, uint8_t type, uint16_t payloadLen) {
@@ -752,6 +789,9 @@ void handleText(const uint8_t* payload, int len) {
                  from.c_str(), msg.c_str());
     }
     addChat(line);
+    // Amber for the two that were aimed at getting your attention, white for
+    // ordinary chatter on a frequency you are already listening to.
+    pushNotice(line, (!to.empty() || xr::isGuard(th.freqKhz)) ? 1 : 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -970,6 +1010,29 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
 
     pumpNetwork();
     xr::voice::tick();
+
+    // Somebody keying up is the other half of "I cannot see the window": you
+    // can hear them, but not who they are or where they are calling from.
+    // One notice per transmission, when they start -- not per frame.
+    {
+        static std::vector<uint32_t> wasSpeaking;
+        const std::vector<uint32_t> now = xr::voice::activeSpeakers();
+        for (uint32_t sid : now) {
+            if (std::find(wasSpeaking.begin(), wasSpeaking.end(), sid) != wasSpeaking.end())
+                continue;
+            auto it = g_remote.find(sid);
+            const std::string who = it != g_remote.end() ? it->second.callsign
+                                                         : std::to_string(sid);
+            const uint32_t f = xr::voice::speakerFreq(sid);
+            char line[160];
+            if (f) snprintf(line, sizeof(line), "%s is calling on %s", who.c_str(),
+                            freqLabel(f).c_str());
+            else   snprintf(line, sizeof(line), "%s is calling", who.c_str());
+            pushNotice(line, xr::isGuard(f) ? 1 : 2);
+        }
+        wasSpeaking = now;
+    }
+    updateNotices();
 
     // Tell the voice mixer how far away everyone is, so they sound like it.
     {
@@ -1308,10 +1371,19 @@ void drawWindow(XPLMWindowID win, void*) {
     drawFit(white, x, y, r, "Radio", xplmFont_Proportional);
     y -= 16;
     // Newest messages win the space; the input row at the bottom is reserved.
+    //
+    // Which means working out how many rows fit and starting that far from
+    // the end. Walking the log from the beginning and stopping when the room
+    // runs out does the opposite -- it shows the oldest chatter and drops the
+    // call that just came in, which is the one the pilot is waiting for.
     const int inputY = b + 12;
-    for (auto& msg : g_chatLog) {
+    const int room = y - (inputY + 22);
+    const int fits = room < 0 ? 0 : room / 14 + 1;
+    size_t first = 0;
+    if (g_chatLog.size() > (size_t)fits) first = g_chatLog.size() - (size_t)fits;
+    for (size_t i = first; i < g_chatLog.size(); ++i) {
         if (y < inputY + 22) break;
-        drawFit(white, x, y, r, msg, xplmFont_Basic);
+        drawFit(white, x, y, r, g_chatLog[i], xplmFont_Basic);
         y -= 14;
     }
 
@@ -1998,6 +2070,81 @@ void settingsKey(XPLMWindowID, char key, XPLMKeyFlags flags, char vk, void*, int
     if (g_keyQueue.size() < 256) g_keyQueue.push_back({key, (unsigned char)vk});
 }
 
+// The notice window. No title bar, no background of its own beyond what
+// X-Plane draws, and it takes no clicks: a pilot flying with the XRadio window
+// shut wants to read it, not to have something else on screen to catch the
+// mouse.
+XPLMWindowID g_noticeWin = nullptr;
+
+void drawNotices(XPLMWindowID win, void*) {
+    int l, t, r, b;
+    XPLMGetWindowGeometry(win, &l, &t, &r, &b);
+
+    float white[] = {1.f, 1.f, 1.f};
+    float amber[] = {1.f, 0.8f, 0.3f};
+    float green[] = {0.4f, 1.f, 0.4f};
+
+    int y = t - 14;
+    for (const auto& n : g_notices) {
+        float* col = n.colour == 1 ? amber : (n.colour == 2 ? green : white);
+        XPLMDrawString(col, l + 6, y, (char*)n.text.c_str(), nullptr,
+                       xplmFont_Proportional);
+        y -= 16;
+    }
+}
+
+// Expire what has had its seconds, and put the window where the notices are
+// -- which is nowhere at all when there are none, or when the main window is
+// open and already showing the same thing in its radio log.
+void updateNotices() {
+    for (size_t i = 0; i < g_notices.size();) {
+        if (g_elapsed - g_notices[i].at > noticeHoldS()) g_notices.erase(g_notices.begin() + (long)i);
+        else ++i;
+    }
+    if (!g_noticeWin) return;
+
+    const bool want = !g_notices.empty() && !XPLMGetWindowIsVisible(g_window);
+    if (!want) {
+        if (XPLMGetWindowIsVisible(g_noticeWin)) XPLMSetWindowIsVisible(g_noticeWin, 0);
+        return;
+    }
+
+    int widest = 0;
+    for (const auto& n : g_notices) {
+        const int w = (int)XPLMMeasureString(xplmFont_Proportional, (char*)n.text.c_str(),
+                                             (int)n.text.size());
+        if (w > widest) widest = w;
+    }
+    int sl, st, sr, sb;
+    XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);
+    const int w = std::min(std::max(widest + 16, 200), std::max(240, sr - sl - 60));
+    const int h = (int)g_notices.size() * 16 + 12;
+    const int left = sl + 20;
+    const int top  = st - 45;            // clear of the menu bar
+    XPLMSetWindowGeometry(g_noticeWin, left, top, left + w, top - h);
+    if (!XPLMGetWindowIsVisible(g_noticeWin)) XPLMSetWindowIsVisible(g_noticeWin, 1);
+}
+
+void createNoticeWindow() {
+    XPLMCreateWindow_t p{};
+    p.structSize           = sizeof(p);
+    p.left = 0; p.top = 0; p.right = 0; p.bottom = 0;   // placed by updateNotices
+    p.visible              = 0;
+    p.drawWindowFunc       = drawNotices;
+    // Everything below returns 0: not handled, so the click goes through to
+    // whatever is underneath. A notice must never eat a click on the panel.
+    p.handleMouseClickFunc = [](XPLMWindowID, int, int, XPLMMouseStatus, void*) { return 0; };
+    p.handleRightClickFunc = [](XPLMWindowID, int, int, XPLMMouseStatus, void*) { return 0; };
+    p.handleMouseWheelFunc = [](XPLMWindowID, int, int, int, int, void*) { return 0; };
+    p.handleKeyFunc        = [](XPLMWindowID, char, XPLMKeyFlags, char, void*, int) {};
+    p.handleCursorFunc     = [](XPLMWindowID, int, int, void*) -> XPLMCursorStatus {
+        return xplm_CursorDefault;
+    };
+    p.layer                = xplm_WindowLayerFloatingWindows;
+    p.decorateAsFloatingWindow = xplm_WindowDecorationNone;
+    g_noticeWin = XPLMCreateWindowEx(&p);
+}
+
 void createSettingsWindow() {
     int wl, wt, wr, wb;
     safeWindowRect(560, 330, 520, &wl, &wt, &wr, &wb);
@@ -2077,6 +2224,9 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     xr::weather::init();
     createWindow();
     createSettingsWindow();
+    // Third, deliberately: the test harness numbers windows in creation order
+    // and two suites already know the settings window as number two.
+    createNoticeWindow();
 
     std::string cslErr;
     if (!xr::csl::init(pluginRootDir(), effectiveIcao(), g_cfg.cslPath, &cslErr)) {

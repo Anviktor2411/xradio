@@ -437,6 +437,7 @@ static void turnHostingOn() {
 int main(int argc, char** argv) {
     if (argc > 1) g_port = (uint16_t)atoi(argv[1]);
     if (system("mkdir -p /tmp/xradio-harness") != 0) return 1;
+    setenv("XRADIO_NOTICE_HOLD", "1", 1);   // see the notice section below
 
     // Start from a config that hosts on our test port but is switched off,
     // so the test can turn it on through the window and watch what happens.
@@ -667,6 +668,82 @@ int main(int argc, char** argv) {
               shows(harness::draw(), "[122.800] HOSTER: meet me @ the hold short"));
 
         harness::click(1, sx + 40, sy + 200);   // hand the keyboard back
+    }
+
+    printf("\nwith the window closed, a call still shows\n");
+    {
+        // Most pilots fly with the XRadio window shut. Shut, a call on the
+        // radio used to leave no trace at all -- and the radio log is inside
+        // the very window they are not looking at.
+        constexpr int kNotice = 3;               // created after main and settings
+        Peer caller("POPUP1", 57.858, 27.028);
+        check("a pilot joins", caller.login());
+        for (int i = 0; i < 6; ++i) { caller.position(); fly(0.1); }
+
+        // Open, the notice stays out of the way: the log is right there.
+        caller.text("first call, window open");
+        fly(0.8);
+        check("with the window open, nothing pops up",
+              !harness::windowVisible(kNotice));
+        check("the radio log has it though",
+              shows(harness::draw(), "first call, window open"));
+
+        // Closed is the case this exists for.
+        harness::menu(0);                        // Plugins > XRadio > Show/hide
+        fly(0.2);
+        check("the window can be closed", !harness::windowVisible(1));
+
+        caller.text("second call, window closed");
+        fly(0.8);
+        check("a call with the window closed pops up",
+              harness::windowVisible(kNotice));
+        auto n = harness::drawWindow(kNotice);
+        check("and says who called and what they said",
+              shows(n, "POPUP1: second call, window closed"), n.empty() ? "empty" : n[0]);
+        if (!shows(n, "POPUP1")) dump(n);
+
+        // A message meant for us, and a call on guard, both while closed.
+        caller.text("only for you", 0, "HOSTER");
+        fly(0.6);
+        n = harness::drawWindow(kNotice);
+        check("so does a message addressed to us", shows(n, "[direct] POPUP1: only for you"));
+
+        // It goes away on its own. XRADIO_NOTICE_HOLD, set below, shortens
+        // the ten seconds a pilot gets to one, because waiting out the real
+        // thing here would let the server time out the other sections' pilots.
+        fly(1.6);
+        check("notices fade rather than piling up for ever",
+              !harness::windowVisible(kNotice));
+
+        // Opening the window again hides it, log or no log.
+        caller.text("third call");
+        fly(0.6);
+        check("a fresh call brings it back", harness::windowVisible(kNotice));
+        harness::menu(0);                        // show the window again
+        fly(0.3);
+        check("the window is back", harness::windowVisible(1));
+        check("and the notice steps aside", !harness::windowVisible(kNotice));
+        auto back = harness::draw();
+        check("the call is in the radio log where it belongs",
+              shows(back, "third call"));
+        if (!shows(back, "third call")) dump(back);
+
+        // A busy frequency must not push the newest call off the bottom. The
+        // log used to be drawn from the oldest line down until the room ran
+        // out, which showed stale chatter and dropped the call the pilot was
+        // actually waiting for.
+        for (int i = 0; i < 5; ++i) {
+            char msg[64];
+            snprintf(msg, sizeof(msg), "filler %d", i);
+            caller.text(msg);
+            fly(0.15);
+        }
+        caller.text("the newest call of all");
+        fly(0.5);
+        back = harness::draw();
+        check("the newest call is on screen, however busy the frequency",
+              shows(back, "the newest call of all"));
+        if (!shows(back, "the newest call of all")) dump(back);
     }
 
     printf("\nthe hosting tab reports what is going on\n");

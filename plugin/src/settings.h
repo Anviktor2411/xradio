@@ -36,6 +36,10 @@ struct Settings {
     bool        sidetone   = false;        // hear yourself while keyed
     float       hiss       = 0.35f;        // every bit of noise the radio makes
     bool        radioFilter = true;        // the whole radio sound; off = clean audio
+    // With the window closed a pilot sees nothing at all: no radio log, no
+    // sign that anybody called. A small notice in the corner is the whole of
+    // what they get, so it is on by default.
+    bool        popUps = true;
     int         pttKey     = 0;            // keyboard key that keys the radio; 0 = none
 
     // --- hosting ---
@@ -122,6 +126,8 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"hiss",      "Radio noise",    Kind::Slider, 1, &s.hiss,       0.f, 1.f, "%", 0},
         {"radiofilter", "Radio sound (limiter, squelch, filter)", Kind::Bool, 1, &s.radioFilter},
         {"pttkey",    "Push-to-talk key", Kind::KeyBind, 1, &s.pttKey},
+        {"popups",    "Pop up messages when this window is closed", Kind::Bool, 1,
+                      &s.popUps},
 
         {"showtraffic", "Draw other aircraft", Kind::Bool, 2, &s.showTraffic},
         {"showlabels",  "Callsign labels",     Kind::Bool, 2, &s.showLabels},

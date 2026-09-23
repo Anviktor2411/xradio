@@ -49,6 +49,7 @@ void tick() {}
 void setVolume(float) {}
 float micLevel() { return 0.f; }
 std::vector<uint32_t> activeSpeakers() { return {}; }
+uint32_t speakerFreq(uint32_t) { return 0; }
 std::string status() { return "not built in"; }
 Stats stats() { return {}; }
 void testCapture(const int16_t*, int) {}
@@ -755,6 +756,12 @@ std::vector<uint32_t> activeSpeakers() {
         if (kv.second->playing || !kv.second->packets.empty()) out.push_back(kv.first);
     }
     return out;
+}
+
+uint32_t speakerFreq(uint32_t sid) {
+    std::lock_guard<std::mutex> lk(g_mx);
+    auto it = g_speakers.find(sid);
+    return it == g_speakers.end() ? 0u : it->second->freqKhz;
 }
 
 std::string status() { return g_status; }
