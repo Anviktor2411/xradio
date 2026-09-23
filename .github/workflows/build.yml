@@ -42,6 +42,12 @@ jobs:
           sudo apt-get update -qq && sudo apt-get install -y -qq mingw-w64
           bash tools/check_windows_build.sh
 
+      # The tests build with XPMP2 switched off, so the code that actually
+      # draws other aircraft is in none of them. Compile it the way the
+      # shipped plugin does, for both platforms.
+      - name: The CSL bridge compiles against real XPMP2
+        run: bash tools/check_xpmp2_build.sh
+
       - name: Server protocol and routing tests
         run: python3 tools/test_server.py
 
@@ -111,16 +117,26 @@ jobs:
 
       # The update check: the version comparison, and the whole path against
       # a stand-in for GitHub in each of its moods, including down and lying.
+      - name: Clipboard (what it copies, and what it refuses)
+        run: ASAN_OPTIONS=detect_leaks=0 UBSAN_OPTIONS=halt_on_error=1 ./build-tests/clipboard_test
+
       - name: Update check against a fake release site
         run: |
           ASAN_OPTIONS=detect_leaks=0 ./build-tests/update_test offline
           for mode in newer same older garbage error huge; do
             python3 tools/harness/fake_release.py --mode $mode > /tmp/rel.log 2>&1 &
-            sleep 1
+            rel=$!
+            # Wait for the port rather than sleeping and hoping: a runner slow
+            # to start Python used to leave the test measuring an absent
+            # server, which fails as if the plugin were at fault.
+            bash tools/harness/wait_port.sh 5399 20 "$rel" || { cat /tmp/rel.log; exit 1; }
             XRADIO_UPDATE_URL=http://127.0.0.1:5399/latest ASAN_OPTIONS=detect_leaks=0 \
               UBSAN_OPTIONS=halt_on_error=1 ./build-tests/update_test $mode
-            kill %1 2>/dev/null || true
-            wait 2>/dev/null || true
+            # And wait for it to actually go: the next mode binds this port,
+            # and if the old server is still on it the new one never starts,
+            # leaving the next test talking to the previous mood.
+            kill "$rel" 2>/dev/null || true
+            wait "$rel" 2>/dev/null || true
           done
 
       # Two relay servers, one protocol. This drives the same scenarios at
@@ -132,16 +148,21 @@ jobs:
       - name: Plugin talks to a real server, voice round trip via a peer
         run: |
           python3 tools/harness/fake_release.py --mode newer > /tmp/rel.log 2>&1 &
+          rel=$!
           python3 server/server.py --port 49400 > /tmp/srv.log 2>&1 &
+          srv=$!
+          bash tools/harness/wait_port.sh 5399 20 "$rel" || { cat /tmp/rel.log; exit 1; }
           sleep 1
           python3 tools/fake_client.py --port 49400 --callsign PEER01 \
             --lat 57.86 --lon 27.03 --talk --parrot > /tmp/peer.log 2>&1 &
+          peer=$!
           sleep 1
           XRADIO_UPDATE_URL=http://127.0.0.1:5399/latest \
             ASAN_OPTIONS=detect_leaks=0 ./build-tests/plugin_harness 127.0.0.1 49400 CIRUN
           echo "--- server ---"; grep -E "login|voice|text" /tmp/srv.log || true
           echo "--- peer ---";   grep -E "voice" /tmp/peer.log || true
-          kill %1 %2 2>/dev/null || true
+          kill "$rel" "$srv" "$peer" 2>/dev/null || true
+          wait "$rel" "$srv" "$peer" 2>/dev/null || true
 
       # Hosting puts this server on a pilot's home connection, so it gets the
       # same treatment the client gets: malformed packets under ASan/UBSan.
