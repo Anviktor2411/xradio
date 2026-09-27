@@ -2,6 +2,7 @@
 #include "protocol.h"
 #include "mathconst.h"
 #include "smoothing.h"
+#include "terrain.h"
 
 #include "XPLMUtilities.h"
 
@@ -163,7 +164,19 @@ public:
             const float step = elapsedSinceLastCall / 0.35f;
             vertOfsRatio += (want - vertOfsRatio) * (step < 1.0f ? step : 1.0f);
         }
-        SetLocation(p.lat, p.lon, p.altFt, st.onGround);
+        // On the ground, stand it on *our* terrain rather than on the number
+        // the sender worked out from theirs. Two pilots at one airport rarely
+        // have the same scenery, and XPMP2's clamp only ever lifts a model
+        // that came out too low -- one that came out too high just hovers.
+        // Probing here makes the altitude exactly what the clamp would insist
+        // on anyway, so the two cannot disagree.
+        float altFt = p.altFt;
+        if (st.onGround) {
+            double ground = 0.0;
+            if (xr::groundElevM(p.lat, p.lon, p.altFt * 0.3048, &ground))
+                altFt = (float)(ground / 0.3048);
+        }
+        SetLocation(p.lat, p.lon, altFt, st.onGround);
         drawInfo.pitch   = p.pitch;
         drawInfo.roll    = p.roll;
         drawInfo.heading = p.heading;

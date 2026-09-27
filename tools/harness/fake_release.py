@@ -4,6 +4,7 @@
     python3 tools/harness/fake_release.py --mode newer     # a later version exists
     python3 tools/harness/fake_release.py --mode same      # you are up to date
     python3 tools/harness/fake_release.py --mode older     # the site is behind
+    python3 tools/harness/fake_release.py --mode typo      # tagged v05.4, not v0.5.4
     python3 tools/harness/fake_release.py --mode garbage   # not JSON at all
     python3 tools/harness/fake_release.py --mode error     # HTTP 500
     python3 tools/harness/fake_release.py --mode huge      # megabytes of nothing
@@ -51,6 +52,12 @@ class Handler(BaseHTTPRequestHandler):
                 r["tag_name"] = "v0.5.2"
             elif MODE == "older":
                 r["tag_name"] = "v0.1.3"
+            elif MODE == "typo":
+                # The v0.5.4 release really went out tagged like this. The
+                # missing dot used to read as version 5.4 and beat everything,
+                # so every pilot already on the newest build was told to go
+                # and install it.
+                r["tag_name"] = "v05.4"
             body = json.dumps(r).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -62,7 +69,8 @@ class Handler(BaseHTTPRequestHandler):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", default="newer",
-                    choices=["newer", "same", "older", "garbage", "error", "huge"])
+                    choices=["newer", "same", "older", "typo",
+                             "garbage", "error", "huge"])
     ap.add_argument("--port", type=int, default=5399)
     args = ap.parse_args()
     MODE = args.mode

@@ -52,13 +52,19 @@ int main(int argc, char** argv) {
         check("nonsense is never newer",
               !isNewer("0.5.2", "banana") && !isNewer("0.5.2", "") &&
               !isNewer("", "0.6.0") && !isNewer("0.5.2", "0.6.0-beta"));
-        // A tag with a dot missing parses as a much larger version and beats
-        // everything. This is not a bug in the comparison -- 05.4 really does
-        // read as 5.4 -- it is why a release tag has to be exactly vX.Y.Z,
-        // and it once told every pilot on 0.5.4 that "v05.4" was newer.
-        check("a tag with a missing dot reads as a far higher version",
-              isNewer("0.5.4", "05.4"));
-        check("which the well-formed tag does not",
+        // A release once went out tagged v05.4 instead of v0.5.4. The dot is
+        // missing, so it used to parse as 5.4, beat every real version, and
+        // tell every pilot on 0.5.4 to go and install the build they were
+        // already running. A leading zero is not a version component, so a
+        // tag like that is now refused outright: nothing is offered, which
+        // is wrong quietly rather than wrong in the window every flight.
+        check("a tag with a missing dot is refused, not read as 5.4",
+              !isNewer("0.5.4", "05.4"));
+        check("every leading zero is caught, not just the first component",
+              !isNewer("0.5.4", "1.05") && !isNewer("0.5.4", "1.0.05"));
+        check("a component that is genuinely zero still parses",
+              isNewer("0.5.4", "1.0.0") && isNewer("0.9.0", "1.0"));
+        check("the well-formed tag is not newer than itself",
               !isNewer("0.5.4", "0.5.4"));
         check("absurd input is refused rather than parsed",
               !isNewer("0.5.2", "99999999.0.0"));
@@ -93,6 +99,14 @@ int main(int argc, char** argv) {
             check("no update is claimed", !i.newer, i.latest);
         } else if (mode == "older") {
             check("no update is claimed", !i.newer, i.latest);
+        } else if (mode == "typo") {
+            // The comparison is unit-tested above; this drives the whole
+            // path, because what a pilot sees is the window, and the window
+            // is what was wrong. A malformed tag must reach the end of the
+            // check and change nothing.
+            check("the site really did serve the malformed tag",
+                  i.latest == "05.4", i.latest);
+            check("and no update is claimed from it", !i.newer, i.latest);
         } else if (mode == "garbage" || mode == "error" || mode == "offline") {
             check("nothing is claimed when the answer is useless", !i.newer);
             check("and the reason is recorded", !i.error.empty(), i.error);

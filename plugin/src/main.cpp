@@ -15,6 +15,7 @@
 #include "settings.h"
 #include "joincode.h"
 #include "smoothing.h"
+#include "terrain.h"
 #include "ui.h"
 #include "clipboard.h"
 #include "update.h"
@@ -504,20 +505,33 @@ void sendPosition() {
     p.lon         = dd(g_ref.lon);
     // Altitude is the one field the receiver cannot simply draw as sent.
     // `elevation` is where our *datum point* is, which on the ground is a
-    // metre or three up in the air, on top of the gear. The receiver then
-    // hands it to XPMP2, which adds the CSL model's own VERT_OFFSET to stand
-    // it on its wheels -- so the gear height gets counted twice and the model
-    // hovers. What the receiver actually needs while we are on the ground is
-    // the ground: send the terrain elevation and let each model's own offset
-    // put its own wheels on it. In the air the datum is right and the
-    // receiver drops the offset instead (see xpmp_bridge.cpp).
-    // A missing y_agl reads 0, which leaves the old behaviour rather than a
-    // new kind of wrong; the cap keeps a nonsense reading from burying the
-    // model, which would look far worse than the hover it replaces.
-    const bool  onGnd  = id(g_ref.onGround) != 0;
-    float       gearUp = onGnd ? fd(g_ref.yAgl) : 0.f;
-    if (!(gearUp > 0.f) || gearUp > 12.f) gearUp = 0.f;     // also catches NaN
-    p.altMslM     = (float)(dd(g_ref.elev) - gearUp);
+    // metre or three up in the air, on top of the gear. The receiver hands it
+    // to XPMP2, which adds the CSL model's own VERT_OFFSET to stand it on its
+    // wheels -- so the gear height would be counted twice and the model
+    // hovers. What the receiver needs while we are on the ground is the
+    // ground itself, so each model's own offset can put its own wheels on it.
+    //
+    // Ask the sim where that is. The first version of this subtracted y_agl
+    // from the datum altitude, which is the same thing only if y_agl is
+    // measured to the datum -- and on some aircraft it is not, so the
+    // subtraction took off nothing and the model went on hovering. The probe
+    // has no such assumption in it. y_agl stays as the fallback for the rare
+    // frame where the probe misses.
+    const bool onGnd = id(g_ref.onGround) != 0;
+    double     altM  = dd(g_ref.elev);
+    if (onGnd) {
+        double ground = 0.0;
+        if (xr::groundElevM(p.lat, p.lon, altM, &ground) &&
+            ground <= altM + 1.0 &&                       // the ground is below us
+            ground >= altM - xr::kMaxDatumAboveGroundM) { // and not absurdly so
+            altM = ground;
+        } else {
+            float gearUp = fd(g_ref.yAgl);
+            if (!(gearUp > 0.f) || gearUp > 12.f) gearUp = 0.f;   // also catches NaN
+            altM -= gearUp;
+        }
+    }
+    p.altMslM     = (float)altM;
     p.headingTrue = fd(g_ref.psi);
     p.pitch       = fd(g_ref.theta);
     p.roll        = fd(g_ref.phi);

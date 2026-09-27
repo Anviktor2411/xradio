@@ -151,6 +151,7 @@ std::vector<int> parts(const std::string& v) {
             if (cur.size() > 6) return {};        // not a version, a novel
         } else if (c == '.') {
             if (cur.empty()) return {};
+            if (cur.size() > 1 && cur[0] == '0') return {};   // 05 is not 5
             out.push_back(atoi(cur.c_str()));
             cur.clear();
         } else {
@@ -158,6 +159,7 @@ std::vector<int> parts(const std::string& v) {
         }
     }
     if (cur.empty()) return {};
+    if (cur.size() > 1 && cur[0] == '0') return {};
     out.push_back(atoi(cur.c_str()));
     return out.size() >= 2 && out.size() <= 4 ? out : std::vector<int>();
 }
