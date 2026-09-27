@@ -120,7 +120,7 @@ jobs:
           # says rather than depending on this runner being unable to reach
           # GitHub -- which is how it passed for weeks and then did not.
           ASAN_OPTIONS=detect_leaks=0 ./build-tests/update_test offline
-          for mode in newer same older garbage error huge; do
+          for mode in newer same older typo garbage error huge; do
             python3 tools/harness/fake_release.py --mode $mode > /tmp/rel.log 2>&1 &
             rel=$!
             # Wait for the port rather than sleeping and hoping: a runner slow
