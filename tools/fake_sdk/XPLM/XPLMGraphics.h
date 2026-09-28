@@ -1,5 +1,0 @@
-// COMPILE-CHECK STUB ONLY -- see XPLMDefs.h
-#pragma once
-#include "XPLMDefs.h"
-void XPLMDrawString(float* inColorRGB, int inXOffset, int inYOffset,
-                    char* inChar, int* inWordWrapWidth, XPLMFontID inFontID);
