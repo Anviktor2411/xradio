@@ -1,349 +1,725 @@
-# ISO Package Manager
+# XRadio
 
-A simple GUI app for finding, managing, and downloading `.iso` files.
+A multiplayer and radio plugin for X-Plane 12. Pilots see each other in the sky
+as real aircraft (CSL models) and talk to each other by voice on the COM
+frequencies they have tuned, push-to-talk, like the real thing.
 
-**Theme Shop:** https://anviktor2411.github.io/iso-package-manager/ - browse, edit and share themes for the app.
+Supported: **Windows, macOS (Intel + Apple Silicon), Linux**.
 
-## Features
+## Flying together
 
-- **Local** tab
-  - Scan folders for `.iso` files
-  - Filter by distro and search by name
-  - Best-effort filename metadata parsing (distro / version / arch) shown in the list
-  - Find duplicates by SHA-256
-  - Copy path, extract, and mount + open / eject (Windows, Linux, macOS)
-- **Internet** tab
-  - Browse curated sources and list available ISO downloads
-  - **Windows** category: Microsoft Windows 11, 10, 8.1, 8, 7, Vista and XP install media, plus the LTSC editions (Windows 11 / 10 Enterprise LTSC and their IoT Enterprise LTSC variants), from the Internet Archive catalogues
-  - Download queue with a job list showing progress, transferred size, speed and ETA
-  - Pause / resume, retry a failed job, open the target folder, remove or clear finished
-    jobs - all of it works on several selected jobs at once
-  - **Unfinished downloads are remembered.** Close the app mid-download, reopen it and
-    press **Resume**: it continues from where it stopped instead of starting over
-  - Optional auto-verify (SHA-256) when a checksum is known
-  - Open official source pages
-  - Multi-select ISOs in the list and download multiple files in one operation
-  - Web search for direct `.iso` links (best-effort)
-    - Deterministic-first option (try known mirrors/archives first)
-    - Archive level control
-    - Provider profiles (save/apply search provider settings)
-    - Search history + favorites (right-click in the Web Search box)
-  - Change how many web results are shown at a time (page size)
-  - **Load more**
-    - First reveals more already-fetched rows
-    - Then (when all fetched items are already shown) fetches older/archived versions from official archives
-- **Settings** tab
-  - Theme, language, startup tab, scan folders and search provider settings, grouped into
-    cards with a short explanation under each field
-  - Everything is saved to your user profile and applied immediately
-- **Logs** tab
-  - In-app log viewer for errors and status updates
-- **Themes**
-  - Switch between `Default`, `Modern Dark`, `Windows XP`, and `Graphical` from the **Theme** menu
-  - **Theme -> Get more themes...** opens the community shop *inside the app*: search,
-    preview the palette, install and switch to a theme without touching the website
-  - **Theme packs** - drop any `*.ipmtheme.json` file into a `themes` folder and it shows up
-    in the same menu, after a separator. No rebuild, no code: a set of packs ships with the
-    download (Catppuccin Mocha, Dracula, Gruvbox Dark, Nord, Solarized Light, plus whatever
-    has been accepted into the shop since) and a fresh `.pyz` already carries them *inside*
-    the archive, so even the single downloaded file has themes to pick from
-  - Packs are looked for in `IPM_THEMES_DIR`, then the `themes` folder next to the app,
-    then `~/.ipm/themes`, then `themes/` inside the running `.pyz` / PyInstaller bundle -
-    the first folder that has a given id wins, so your own copy always overrides the packed-in one
-  - Command line: `ipm_cli.py themes [--preview]`, and for authors
-    `python tools/ipmtheme.py list | validate | new | install | preview | bundle`
-  - Visual editor: `python tools/theme_editor.py` - live preview of every tab, WCAG contrast
-    checks, colour-vision simulation (protanopia, deuteranopia, tritanopia, greyscale),
-    palette import from a list of hex codes, presets and drafts
-  - Docs: [`docs/THEME_FORMAT.md`](docs/THEME_FORMAT.md) (every field),
-    [`docs/THEME_EDITOR.md`](docs/THEME_EDITOR.md) (the editor),
-    [`docs/SHARING.md`](docs/SHARING.md) (publishing a pack),
-    [`docs/THEME_PACKS.md`](docs/THEME_PACKS.md) (overview of the theme system)
-  - **Theme Shop website** - browse, edit and upload community themes in the browser,
-    see [Theme Shop](#theme-shop-website)
-- **Languages**
-  - Switch UI language from the **Language** menu (English, German, Spanish, French, Russian, Portuguese, Chinese)
+Nobody has to set a server up.
 
-See also: [Search Guide](SEARCH_GUIDE.md)
+One of you opens **Plugins → XRadio → Settings → Hosting**, ticks *Host a
+flight here* and saves. The plugin starts the relay server itself, connects
+to it, asks the router to open the port, and then shows the address to pass
+on:
 
-## Theme Shop (website)
+```
+  Running on port 49100  ·  1 connected
+  Friends type:  81.90.144.12:49100
+  Router opened the port (Livebox)
+  Here now: ESNA12
+```
 
-**https://anviktor2411.github.io/iso-package-manager/**
+Everyone else puts that address into **Settings → Connection** and saves.
+That is the whole procedure — no VPS, no Python, no terminal, and nothing to
+configure on anyone's router.
 
-A community gallery and theme editor for ISO Package Manager, served by GitHub Pages
-from the [`docs/`](docs/) folder. No account is needed to browse or download.
+If the router will not open the port, the window says so instead of leaving
+you guessing — and says what to do: friends on the same network use the local
+address it shows, and for friends over the internet it spells out which UDP
+port to forward to which machine, and looks up your public address so you
+have something to send them once that is done. A router that is itself behind
+a carrier's NAT (mobile internet, some fibre providers) is recognised and the
+window says hosting over the internet cannot work from there, rather than
+handing out an address that goes nowhere.
 
-The same shop is reachable from inside the app under **Theme -> Get more themes...**,
-which is the quickest way to install one. The website is where you *make* and *upload* themes.
+If UPnP is switched off, XRadio asks again over **NAT-PMP** before giving up.
+It is a different, much simpler protocol that plenty of routers answer while
+UPnP is disabled -- Apple's, a lot of OpenWrt and Fritz!Box firmware, and
+anything running miniupnpd. When it is NAT-PMP that opens the port, the
+window says so. `python3 tools/upnp_probe.py` asks the router the same way
+XRadio does, from outside the sim, and says whether the silence is the
+router's or a bug here.
 
-- **Shop** - every approved theme with a screenshot or a live mock-up, search, sorting
-  and filters (dark / light / base theme). Open a theme to see its full palette and
-  download it as `.ipmtheme.json` or `.ipmtheme.zip` (pack + screenshot)
-- **Editor** - change the name, all 17 colours, font and style options with a live preview
-  of every app tab, a random palette button and the same checks the app runs. It also has
-  WCAG contrast rows with per-row fixes, colour-vision simulation, harmony generators,
-  paste-a-palette import, undo/redo, drafts saved in the browser and a share link that
-  carries the whole theme. Start from scratch or open any shop theme and remix it
-- **Upload** - drop your `.ipmtheme.json` / `.zip` and a screenshot (PNG, JPG or WebP,
-  up to 3 MB) and press **Continue on GitHub**. Needs a free GitHub account
+The UPnP search goes out of the network interface that carries the internet
+route and is also sent straight to the gateway, because on a PC with
+VirtualBox, VMware, Hyper-V or a VPN adapter installed the operating system's
+default multicast interface is usually the wrong one and the router never
+hears the question. A dedicated server is still the better answer for a
+group that wants to fly without waiting for one particular person to be
+online — see [Running a dedicated server](#running-a-dedicated-server).
 
-### Installing a theme from the shop
+**If the port will not open at all** — a router you cannot get into, or mobile
+internet where forwarding cannot work however you configure it — see
+**[Flying together when the router says no](docs/vpn.md)**.
+It walks through putting everyone on Tailscale (five minutes each, free for a
+group of six), the ZeroTier alternative, forwarding by hand, and renting a
+small VPS, with a table at the top for picking between them.
 
-The easy way: **Theme -> Get more themes...** in the app, pick a theme, press
-**Install and use**. Nothing to download or copy by hand.
+## Architecture
 
-By hand, if you prefer:
+```
+  the host's X-Plane                          everyone else
+  ┌──────────────────────────┐                ┌──────────────────────────┐
+  │  XRadio plugin (C++)     │                │  XRadio plugin           │
+  │  · reads datarefs        │                │                          │
+  │  · sends its position    │                │                          │
+  │  · XPMP2 → CSL models    │                │                          │
+  │  · PTT → Opus voice      │                │                          │
+  │  ─────────────────────   │   UDP :49100   │                          │
+  │  relay server (thread)   │ ◄───────────── │                          │
+  │  · sessions              │ ─────────────► │                          │
+  │  · traffic at 10 Hz      │                │                          │
+  │  · frequency routing     │                │                          │
+  └──────────────────────────┘                └──────────────────────────┘
+```
 
-1. Download the `.ipmtheme.json` or `.ipmtheme.zip`
-2. `python tools/ipmtheme.py install <file>` - or copy the `.json` into the `themes`
-   folder next to the app (or `~/.ipm/themes`)
-3. Restart the app and pick the theme from the **Theme** menu
+The relay server exists twice, on purpose: `plugin/src/server.cpp` is the one
+built into the plugin, and `server/server.py` is the same thing for a machine
+that should stay up without X-Plane running. They speak one protocol, so a
+difference between them is a bug — `tools/test_server_parity.py` drives the
+same scenarios at both over real UDP and fails if the transcripts differ.
 
-### How uploads are published
+Voice is **[Opus](https://opus-codec.org/)** at 24 kbit/s — the codec behind
+Discord and WhatsApp calls — captured and played through
+**[miniaudio](https://miniaud.io/)**, which talks to WASAPI, CoreAudio, ALSA or
+PulseAudio at run time so the plugin has no audio library dependencies.
 
-The site is static, so uploads go through GitHub instead of a server:
+Rendering other aircraft is handled by
+**[XPMP2](https://github.com/TwinFan/XPMP2)** — the same library LiveTraffic and
+xPilot use. It takes care of loading CSL models, the X-Plane instancing API,
+the TCAS override and the map layer, and it already runs on all three
+platforms.
 
-1. **Continue on GitHub** opens a *Share a theme* issue with the pack already filled in
-   (label `theme`)
-2. A maintainer reviews it and adds the `approved` label
-3. The [`import-theme.yml`](.github/workflows/import-theme.yml) workflow validates the pack
-   with `tools/ipmtheme.py validate --strict`, re-encodes the screenshot to PNG, commits
-   `themes/<id>.ipmtheme.json` + `themes/<id>.png`, rebuilds `docs/shop/index.json`,
-   comments on the issue and closes it
-4. The shop reads the index straight from the repository, so the theme appears within a
-   few minutes. If the pack fails validation, the bot removes `approved` and explains what to fix
+Other aircraft are **interpolated in the sender's own timeline** rather than
+drawn as reports arrive — see `plugin/src/smoothing.h`. Each position report
+carries the sender's timestamp, and receivers render a fixed 350 ms behind the
+newest one. Network and relay timing then cannot affect the motion at all.
 
-Maintainer setup (once): **Settings -> Pages** = branch `main`, folder `/docs`;
-**Settings -> Actions -> Workflow permissions** = *Read and write*; labels `theme` and `approved`.
+The wire protocol is packed binary UDP, little-endian. It is defined in two
+places and the two **must stay in sync**:
 
-`docs/shop/index.json` is generated by `python scripts/build_theme_index.py` - it lives
-outside `themes/` because the app loads every `*.json` in that folder as a theme pack.
+- `plugin/src/protocol.h` (C++)
+- `server/protocol.py` (Python)
 
-## Requirements
+`tools/check_sizes.cpp` verifies that the struct sizes match, and the same
+check covers the packet budget: every datagram stays under **1200 bytes**, not
+the 1400 an ethernet MTU allows, because a group whose router will not forward
+a port puts everyone on Tailscale or another WireGuard-based VPN and those
+hand you a 1280-byte link. More aircraft in range than fit in one traffic
+packet are sent in several, so the packet size never decides how many
+aeroplanes a pilot can see.
 
-All platforms:
+## Running a dedicated server
 
-- Python 3.10 or newer
-- Tkinter (included with the official installers on Windows/macOS; on Linux it is a separate distro package)
-
-Linux extras (used by **Mount + Open** / **Eject ISO**; the app degrades gracefully without them):
-
-- `udisks2` — provides `udisksctl`, which mounts loop devices without root
-- `xdg-utils` — provides `xdg-open`, used to reveal a folder in your file manager
-- `p7zip-full` — provides the `7z` binary used by **Extract**
+Only worth it if you want a server that is up whether or not any particular
+person is flying. For an evening with friends, hosting from inside the sim is
+simpler and does the same job.
 
 ```bash
-sudo apt install python3-tk udisks2 xdg-utils p7zip-full     # Debian/Ubuntu/Mint
-sudo dnf install python3-tkinter udisks2 xdg-utils p7zip     # Fedora
-sudo pacman -S tk udisks2 xdg-utils p7zip                    # Arch/Manjaro
-sudo zypper install python3-tk udisks2 xdg-utils p7zip       # openSUSE
+cd server
+python3 server.py --host 0.0.0.0 --port 49100 -v
 ```
 
-Optional dependencies (from `requirements.txt`):
+No dependencies beyond Python 3.10+. Open **UDP** port 49100 — in the
+machine's firewall *and* in the provider's, which is where most of the wasted
+evenings happen. A systemd unit is provided in `server/xradio.service`.
 
-- `pywebview` (in-app browser window for “Open Source Page”)
-- `certifi` (improves SSL certificate validation for some HTTPS downloads/searches on certain systems)
-
-## Setup (recommended: virtual environment)
-
-On many Linux distros, system Python is **externally managed** (PEP 668), so installing with `pip` globally is blocked. Use a virtual environment.
+The release package also carries the same server as a compiled binary, for a
+machine without Python. It takes its arguments positionally:
 
 ```bash
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -U pip
-python -m pip install -r requirements.txt
+./server/lin_x64/xradio_server 49100              # or win_x64\ , mac_x64/
+./server/lin_x64/xradio_server 49100 yourword     # port, then flight password
 ```
 
-If you already have a `.venv` but it behaves strangely, delete it and recreate it:
+**[Running a dedicated XRadio server](docs/server.md)** is the full version:
+picking and sizing a VPS (the cheapest one is enough — measured, eight pilots
+is 21 MB of RAM and half a megabit), choosing where to put it so the latency
+lands in the middle of the group, the systemd unit with the password kept out
+of it, proving it works with `tools/fake_client.py` before anyone is invited,
+how weather and time work with no sim to take them from, and the update
+routine — **the server has to be updated whenever the protocol changes, or
+every pilot is refused at login**.
+
+## Telling pilots about a new version
+
+Everyone in a flight has to be on the same build, so a pilot on an old one
+does not merely miss features -- they cannot join at all. Once per sim
+session, twenty seconds after startup, the plugin asks GitHub's releases
+endpoint what the newest version is; if it is newer than the one running,
+the main window says so and prints the address:
+
+```
+  XRadio v0.6.0 is out -- you are on v0.5.2
+    github.com/Anviktor2411/xradio/releases
+```
+
+Nothing is downloaded and nothing is installed -- the pilot decides. The
+check is one request and can be switched off entirely in **Settings >
+Connection > Tell me about new versions**, after which nothing is sent
+anywhere. It uses the HTTP stack the operating system already has (WinHTTP
+on Windows, curl elsewhere) rather than carrying a TLS library into the sim,
+and a site that is down, slow or talking nonsense is simply ignored.
+
+## Cutting a release
+
+    bash release.sh          # or double-click release.bat on Windows
+
+It asks for the version number, suggesting the next patch:
+
+    current version : v0.5.2
+    new version [v0.5.3]: v0.6.0
+
+Then it runs every check this machine is equipped for -- the portability
+scan, the Windows cross-compile, the C++ tests, the differential server
+test -- and only if they all pass does it set the version in
+`plugin/src/brand.h` (the one place it lives; the window and the tests both
+read it from there), write `dist/xradio-v0.6.0-source.zip`, and leave a
+release-notes skeleton beside it with the compare link filled in. A failed
+check leaves the tree untouched, so a broken build cannot become a release.
+
+Machines missing a tool skip that check and say so rather than failing, so
+it is usable from Windows without mingw-w64 installed. What it deliberately
+does not do is upload anything or tag anything: the binaries pilots install
+come from the CI run's `XRadio-all-platforms` artifact, not from this zip.
+
+## Tests
 
 ```bash
-rm -rf .venv
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -r requirements.txt
+bash tools/check_portability.sh       # instant: MSVC-only pitfalls
+bash tools/check_windows_build.sh     # ~20s: compile everything for Windows
+python3 tools/test_server.py          # server: protocol and routing
 ```
 
-## Run
+`check_portability.sh` catches the mistakes that pass on Linux and macOS and
+fail on Windows ten minutes later — `M_PI` (POSIX, not standard C++, and MSVC
+only defines it when `_USE_MATH_DEFINES` precedes `<cmath>`), unguarded POSIX
+headers, variable-length arrays, `std::min` without `<algorithm>`, and a
+Win32 symbol used without the header that declares it. Use `xr::kPi` from
+`plugin/src/mathconst.h` rather than `M_PI`.
+
+`check_windows_build.sh` goes further and actually compiles every source file
+for Windows with MinGW, from Linux, in about twenty seconds. Code inside
+`#ifdef _WIN32` is invisible to the Linux and macOS compilers, so a missing
+header there passes two of the three CI jobs and fails the third ten minutes
+in — `SIO_UDP_CONNRESET` is declared in `<mstcpip.h>`, not `<winsock2.h>`,
+and that is exactly how it was found. MinGW is not MSVC and will not catch
+everything, but it compiles the Windows branches against real Windows
+headers, which is where that whole class of mistake lives.
+
+Starts a real server on a spare port and drives it over real UDP, covering the
+wire format, login, traffic filtering, frequency and range routing, hostile
+input, the length cap and session timeouts.
+
+The plugin is tested too, without needing X-Plane. `tools/harness/` implements
+just enough of the XPLM API for the real plugin code to run as an ordinary
+executable, so CI can point it at a real server and check what its window
+would display:
 
 ```bash
-python3 ipm_launcher.py
+cmake -B build-tests -DXRADIO_BUILD_TESTS=ON -DXRADIO_USE_XPMP2=OFF \
+      -DXPLANE_SDK=$PWD/tools/fake_sdk
+cmake --build build-tests -j
+
+./build-tests/voice_test
+./build-tests/placement_test
+./build-tests/settings_test
+./build-tests/hosting_test
+python3 tools/test_server_parity.py
+
+./build-tests/xradio_server 49700 &
+python3 tools/harness/fuzz_client.py --port 49700
+
+python3 server/server.py --port 49400 &
+python3 tools/fake_client.py --port 49400 --callsign PEER01 --lat 57.86 --lon 27.03 --talk --parrot &
+./build-tests/plugin_harness 127.0.0.1 49400 CIRUN
 ```
 
-The launcher asks whether to start the **UI** or the **Terminal** interface. Passing
-any argument skips the question:
+The harness keys the PTT for two seconds; `--parrot` makes the peer send every
+voice frame it hears straight back, so the run proves the whole loop —
+microphone, encoder, server, decoder, mixer — end to end. It exits non-zero
+if fewer than the expected frames make it round.
+
+`tools/harness/smoothing_test.cpp` flies a simulated aircraft through a turn,
+pushes its reports through a relay that samples on its own clock (duplicating
+and skipping some) and a jittery network, renders at 60 fps, and asserts the
+motion never runs backwards or jumps. It runs the previous dead-reckoning
+approach through the same scenario first, to prove the test catches the bug.
+
+`tools/harness/voice_test.cpp` pushes a tone through the microphone path,
+Opus, a simulated network and the playback mixer with no audio hardware, and
+checks half-duplex muting, packet-loss concealment, sequence wrap-around and
+garbage frames.
+
+`tools/harness/settings_test.cpp` covers the settings window the way a pilot
+uses it: it reads back the strings the window draws, clicks the rows those
+strings were actually drawn on, switches tabs, drags sliders, flips toggles,
+types into fields, and checks what lands in `xradio.cfg`. It also asserts the
+things that are easy to get wrong and impossible to see — that a burst of
+keystrokes arriving in one frame all land in the field that was focused when
+each was typed, and that Enter saves the character typed just before it.
+
+`tools/harness/hosting_test.cpp` is the hosting feature end to end: it ticks
+*Host a flight here* in the settings window, waits for the plugin's own client
+to connect to its own server, then opens a real UDP socket and joins as a
+second pilot. It checks that each sees the other's aircraft, that text
+reaches both ways through the hosted server, that the Hosting tab reports the
+truth, and that unticking the box really does stop the server and refuse new
+joins.
+
+`tools/test_server_parity.py` is a differential test between the two server
+implementations. It starts a fresh Python server and a fresh C++ server for
+each of eight scenarios, drives identical traffic at them over real UDP, and
+compares what the clients receive. Every position-validation rule is probed
+with its own timestamped report, so dropping one rule from one server shows
+up as a state the watching client should never have seen.
+
+`tools/harness/fake_igd.py` is a fake home router — SSDP, the device
+description, the SOAP control endpoint — that deliberately does the awkward
+things real firmware does: a chunked description, a relative control URL
+resolved through `<URLBase>`, and in `lease` mode a refusal of permanent
+mappings with error 725 until asked for a timed one. `upnp_test.cpp` drives
+the real client against it in each mood (`ok`, `lease`, `refuse`,
+`private-wan`, `deaf`) and checks the mapping, its removal, the public
+address, the double-NAT detection and the plain-words errors.
+
+`tools/harness/placement_test.cpp` drives `XPluginStart` under several monitor
+layouts — including a second monitor to the *left* of the main one, which makes
+X-Plane's global desktop start at a negative x — and asserts both windows land
+fully on screen.
+
+`tools/harness/fuzz_client.py` is the mirror image, and it matters more now
+that hosting puts the server on a pilot's home connection: it throws ~11,000
+malformed, truncated, length-lying and outright random datagrams at the
+server while a real session runs alongside, then checks the server is still
+answering and still accepting new pilots. Run against the ASan build, one
+out-of-bounds read stops it with a stack trace.
+
+`tools/harness/fuzz_server.py` is the same harness pointed at a deliberately
+hostile server that answers with truncated, inconsistent and random packets.
+Run under AddressSanitizer it proves the packet parser cannot be pushed out of
+bounds. CI runs all of this on every push, plus a check that the C++ and
+Python struct layouts still agree byte for byte.
+
+## Testing without X-Plane
+
+In two terminals:
 
 ```bash
-python3 ipm_launcher.py --gui                       # UI, no question
-python3 ipm_launcher.py --cli search ubuntu -n 5    # Terminal, one shot
-python3 ipm_launcher.py --version
+python3 tools/fake_client.py --callsign ESNA12 --lat 57.85 --lon 27.02 --talk
+python3 tools/fake_client.py --callsign ESNB34 --lat 57.88 --lon 27.05 --heading 250
 ```
 
-You can still start the Tk window directly with `python3 main.py`.
+Both should list each other on the `traffic:` line, and ESNB34 should receive
+ESNA12's text message.
 
-If you are using a venv:
+## Building the plugin
+
+Requirements: git, CMake 3.16+, and a C++17 compiler
+(Windows: Visual Studio 2022 C++ tools; macOS: Xcode command line tools;
+Linux: gcc or clang).
+
+**1. Fetch dependencies.** XPMP2 (which bundles a complete X-Plane SDK), Opus
+and miniaudio, all into `lib/`:
 
 ```bash
-. .venv/bin/activate
-python ipm_launcher.py
+./tools/fetch_deps.sh                                           # macOS / Linux
+powershell -ExecutionPolicy Bypass -File tools\fetch_deps.ps1   # Windows
 ```
 
-## Mounting an ISO
-
-**Mount + Open** attaches the selected image and reveals it in your file manager;
-**Eject ISO** detaches it again. Both report the backend they used in the status bar.
-
-| Platform | Backend | Notes |
-| --- | --- | --- |
-| Windows | PowerShell `Mount-DiskImage` / `Dismount-DiskImage` | Drive letter is resolved automatically. |
-| Linux | `udisksctl loop-setup` + `loop-mount` / `loop-delete` | No root needed; requires `udisks2` and a running desktop polkit agent. |
-| Linux (fallback) | `mount -o loop,ro` + `umount` + `udisksctl loop-delete` | Used when `udisksctl` is missing; needs root or an `/etc/fstab` entry. |
-| macOS | `hdiutil attach` / `hdiutil detach` | Mount point is read from `/Volumes/...`. |
-
-On Linux and macOS the app detaches any image *it* attached when it exits, so no
-loop device or volume is left behind. Images you mounted yourself are never touched.
-
-If no mount backend is available, **Mount + Open** falls back to opening the `.iso`
-with the default desktop application, and **Eject ISO** tells you to unmount it with
-your OS tools instead of failing silently.
-
-**Extract** uses the 7-Zip CLI (`7z`, `7zz`, `7za`, `7zr` on Linux/macOS; `7z.exe`,
-`7za.exe`, `7zr.exe` on Windows) and works identically on all three platforms.
-
-## Build a standalone executable
-
-Windows:
-
-```bat
-build_exe.bat                 REM -> "dist\ISO Package Manager.exe"
-```
-
-### Linux
-
-Two different Linux executables can be produced:
-
-| Output | What it is | Can be built on |
-| --- | --- | --- |
-| `dist/iso-package-manager-<version>.pyz` | single-file Python zipapp with a `#!/usr/bin/env python3` shebang; needs `python3` + `tkinter` on the target | any OS, including Windows |
-| `dist/iso-package-manager` | native ELF onefile binary, no Python on the target at all | Linux only (PyInstaller cannot cross-compile) |
-
-**Portable `.pyz` — buildable from any machine, including Windows:**
+**2. Build:**
 
 ```bash
-python build_pyz.py                                # -> dist/iso-package-manager-0.10.1.pyz
-chmod +x dist/iso-package-manager-0.10.1.pyz
-./dist/iso-package-manager-0.10.1.pyz                 # asks: UI or Terminal
-./dist/iso-package-manager-0.10.1.pyz --cli search ubuntu -n 5
-./dist/iso-package-manager-0.10.1.pyz --gui
+# macOS / Linux
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+
+# Windows
+cmake -B build -G "Visual Studio 17 2022" -A x64
+cmake --build build --config Release
 ```
 
-On Windows the same archive runs as `python dist\iso-package-manager-0.10.1.pyz`.
+The result follows X-Plane's fat-plugin layout:
 
-**Native ELF — run this on Linux:**
+```
+build/XRadio/
+  win_x64/XRadio.xpl     # produced on Windows
+  mac_x64/XRadio.xpl     # produced on macOS
+  lin_x64/XRadio.xpl     # produced on Linux
+  Resources/             # XPMP2 data files (related.txt, Doc8643.txt, ...)
+```
+
+**3. Install:** copy the `build/XRadio` folder to
+`X-Plane 12/Resources/plugins/XRadio/`.
+
+For a single package that works on all three platforms, build all three and put
+`win_x64`, `mac_x64` and `lin_x64` in the same `XRadio/` folder. The GitHub
+Actions workflow (`.github/workflows/build.yml`) does this for you: every push
+builds all three and uploads the results as artifacts.
+
+The macOS build is a universal binary (arm64 + x86_64).
+
+The `.xpl` must be named after the plugin folder — `XRadio/win_x64/XRadio.xpl`,
+not `win_x64/win.xpl`. That is the SDK 3.0 rule; with the wrong name X-Plane
+skips the folder without writing anything to `Log.txt`, so it looks as though
+the plugin does not exist.
+
+### Building with parts switched off
 
 ```bash
-chmod +x build_linux.sh
-./build_linux.sh              # -> dist/iso-package-manager
-./build_linux.sh pyz          # -> the portable .pyz only (no compiler needed)
-./build_linux.sh all          # pyz + native binary (+ .deb when dpkg-deb exists)
-./build_linux.sh install      # build, then install to ~/.local/bin + a .desktop entry
-./build_linux.sh deb          # build, then package dist/iso-package-manager_*.deb
-./build_linux.sh clean        # remove build/ and dist/
+cmake -B build -DXRADIO_USE_XPMP2=OFF -DXPLANE_SDK=<path to SDK>   # no 3D models
+cmake -B build -DXRADIO_USE_VOICE=OFF                             # no voice
 ```
 
-Every target exits non-zero when something goes wrong, so `./build_linux.sh build || echo failed`
-is safe in a script. `dist/iso-package-manager` is smoke-tested with `--version` before the
-script reports success.
+Without XPMP2 other pilots only appear in the window's list; without voice the
+PTT still marks you as transmitting but nothing is sent.
 
-**No Linux machine at hand?** Either of these produces the native binary for you:
+## CSL models
+
+XPMP2 needs CSL models in OBJ8 format. Without them everything still works, but
+other aircraft are invisible (a warning appears in `Log.txt`).
+
+Put model packages here:
+
+```
+X-Plane 12/Resources/plugins/XRadio/Resources/CSL/<package>/
+```
+
+Each package root needs an `xsb_aircraft.txt`. A free, open set is
+**Bluebell** (`https://github.com/oktalist/BluebellCSL`), which covers most
+common types. When no model matches, XPMP2 falls back to the `actype` from
+`xradio.cfg`.
+
+## A radio needs electricity
+
+COM1 and COM2 only work when the avionics bus is on, the radio's own power
+switch is on, and there are volts behind them -- the same three things a
+pilot checks when a radio is dead. An aircraft sitting cold and dark is off
+the air: push-to-talk does nothing, nobody hears you, and you hear nobody.
+The window says `COM1 122.800 (no power)` rather than looking broken, and
+switching the avionics off mid-transmission unkeys you.
+
+An aircraft that models none of this -- no avionics or bus datarefs at all --
+is treated as powered, so an unusual add-on does not go silent.
+
+## One sky for the whole flight
+
+Two pilots flying together in different weather is worse than it sounds: one
+breaks out of cloud at 600 ft while the other is in sunshine, the winds
+disagree so the aircraft holding station drifts away, and the same approach
+happens in daylight for one and at night for the other.
+
+So the host's sim decides the sky. Their weather and clock are sent to
+everyone else every ten seconds -- X-Plane 12's region weather whole, not a
+summary of it: sea-level pressure and temperature, visibility, rain, the
+three cloud layers, and all thirteen altitude levels of wind, temperature,
+dewpoint and turbulence, plus zulu time and the date.
+
+Both halves are opt-out. The host can untick **Settings > Hosting > Share my
+weather and time**, and anyone who has set up their own conditions can untick
+**Settings > Traffic > Follow the host's weather and time** and keep them.
+
+The clock is only moved when it has really drifted (more than 30 s); nudging
+it on every packet fights the sim's own clock and shows up as a twitching
+sun. The server relays weather only from the pilot who claimed it when they
+logged in, so a joining pilot cannot quietly move everyone else's weather,
+and the whole feature is off on X-Plane 11, whose region datarefs do not
+exist.
+
+## Finding each other on the radio
+
+Two pilots who join the same server and do not already know what frequency the
+other is tuned to cannot reach each other: text and voice go only to people on
+that frequency, which is the point of modelling a radio at all. XRadio does not
+solve that by showing you everyone's frequency — you cannot tell what another
+aircraft is monitoring in real life either — but by giving you the two things
+aviation already uses for it.
+
+**121.500 is guard.** Anything transmitted on it is heard by every pilot within
+VHF range whatever they have tuned, and the window labels it `GUARD 121.500` so
+nobody mistakes it for an ordinary call. Tune a radio to 121.500 and ask.
+
+```
+  [GUARD 121.500] ESNA12: anyone out there, come to 118.100
+```
+
+You still have to be tuned to 121.500 to *transmit* on it — the rule that you
+cannot talk on a frequency your radio is not on is not relaxed, only the
+listening half is. And it is still a radio: the VHF horizon applies exactly as
+it does anywhere else, so guard does not reach across the country.
+
+**`@CALLSIGN` is a message for one pilot.** Typed in the Say row, it reaches
+that pilot wherever they are and whatever they have tuned, and nobody else sees
+it. It is not a transmission and it is not on a frequency, so the window labels
+it as what it is:
+
+```
+  Say:  @ESNB34 come to 118.100
+  [direct to ESNB34] ESNA12: come to 118.100
+  [direct] ESNB34: on my way
+```
+
+A callsign nobody in the flight is using comes back with an answer rather than
+silence. An `@` anywhere but the start of the line is just an `@`.
+
+## With the window closed
+
+Most pilots fly with the XRadio window shut — it is a large grey rectangle over
+the scenery. Shut, a call on the radio used to leave no trace at all: the radio
+log is inside the very window nobody is looking at.
+
+So while the window is closed, anything that arrives appears for ten seconds in
+the top-left corner, where X-Plane puts its own messages:
+
+```
+  ESNB34 is calling on 122.800
+  [GUARD 121.500] ESNA12: anyone out there, come to 118.100
+  [direct] ESNB34: on my way
+```
+
+Radio calls, guard calls and `@CALLSIGN` messages, plus a line when somebody
+keys up on a frequency you monitor — so a closed window still tells you who is
+talking and where, not only who typed. Guard and direct messages are amber,
+voice is green, ordinary chatter white. The notice takes no clicks, so it can
+never swallow one meant for the panel underneath, and it disappears the moment
+the window is opened, because the log is then right there. Switch it off in
+**Settings → Audio → Show messages when the window is closed**.
+
+## Protocol versions
+
+The header carries a version and the server rejects anything that does not
+match, so **all pilots and the server must run the same build**. v2 added the
+position timestamp, ground track and vertical speed that the smoothing needs;
+a v1 client gets no error beyond being ignored. Shared weather arrived
+without a version bump: it is a new packet type, which older builds ignore,
+so a flight with mixed builds simply does not share a sky. v4 put the
+transponder on the wire, v5 the addressee that makes `@CALLSIGN` possible --
+both are changes to existing packets, so both refuse an older build outright
+rather than letting it fly with half the behaviour.
+
+## Configuration
+
+Easiest way: **Plugins → XRadio → Settings...** in the sim. The window has
+three tabs; click a field and type, click a toggle to flip it, click anywhere
+on a slider's bar to set it, click the `< >` arrows to step through the audio
+devices. Tab moves to the next field, Enter saves, Escape or Cancel backs out
+without changing anything. Saving writes the config file and applies
+everything immediately — no restart, no text editor; only a change to the
+server, port, callsign or aircraft type causes a reconnect.
+
+**Connection**
+
+| setting | what it does |
+|---|---|
+| Server host / Port | where to connect |
+| Callsign | how you appear to everyone else; upper-cased on save |
+| Aircraft type | ICAO type code that picks the CSL model others see you as |
+| Connect on startup | off means you connect by hand from the menu |
+| Report rate | position reports per second, 1–10. Lower it on a weak uplink |
+| Smoothing delay | how far behind the newest report other aircraft are drawn, 100–1000 ms. Higher rides out worse jitter at the cost of lag |
+
+**Audio**
+
+| setting | what it does |
+|---|---|
+| Microphone / Output | pick a device, or leave empty for the system default |
+| Volume | incoming radio volume |
+| Hear own voice | sidetone: hear yourself while keyed, like a real headset |
+| Radio noise | scales every bit of noise the radio makes: the faint floor under a strong signal, the hiss that grows towards the horizon, the squelch bursts. 0 for none |
+| Radio sound | the whole VHF radio character — limiter, overdrive, squelch, 300–2700 Hz filter, distance fading, the blocked squeal. Off = clean audio |
+
+The audio tab also shows a live mic level meter and the voice status line, so
+you can hold the PTT and confirm the right microphone is being heard before
+you go looking for someone to talk to.
+
+**Hosting**
+
+| setting | what it does |
+|---|---|
+| Host a flight here | run the relay server inside the plugin. Your own aircraft connects to it, so the Connection tab is ignored while this is on |
+| Port to host on | the UDP port friends connect to. 49100 unless something else is using it |
+| Ask the router to open it | UPnP: opens the port automatically so nobody touches a router config page. Off if you have forwarded the port yourself, or if your router's UPnP is switched off |
+
+**Traffic**
+
+| setting | what it does |
+|---|---|
+| Draw other aircraft | off removes the CSL models; the radio keeps working |
+| Callsign labels | the floating name tags |
+| Label range | how far away labels stay readable, 1–100 nm |
+| Traffic range | how far away aircraft are drawn, 5–200 nm |
+
+The same values live in `X-Plane 12/Output/preferences/xradio.cfg`, written on
+first run:
+
+```ini
+host = your.server.address
+port = 49100
+callsign = ESNA12
+actype = C172
+autoconnect = yes
+reporthz = 5
+smoothms = 350
+
+mic =
+speakers =
+volume = 0.8
+sidetone = no
+hiss = 0.35
+radiofilter = yes
+
+showtraffic = yes
+showlabels = yes
+labeldist = 20
+range = 80
+
+hosting = no
+hostport = 49100
+hostupnp = yes
+```
+
+Out-of-range numbers are clamped to the limits above rather than rejected, and
+unknown keys are ignored, so a hand-edited file cannot stop the plugin
+loading. If you edit it while X-Plane is running, pick up the changes with
+*Plugins → XRadio → Reconnect*.
+
+If a window ever ends up somewhere you cannot reach it — dragged off-screen,
+or the monitor layout changed while X-Plane was running — use
+*Plugins → XRadio → Reset window position*.
+
+**PTT key:** in X-Plane's *Keyboard* or *Joystick* settings, search for the
+command `xradio/ptt` and bind it to a key or joystick button. Hold it to talk
+on whichever COM the audio panel has selected for transmit; release it to
+listen. Like a real radio it is half-duplex — you do not hear others while you
+are keyed.
+
+## Voice
+
+The window's `Voice:` line tells you what is going on:
+
+| shows | meaning |
+|---|---|
+| `OK  mic: <device>` | microphone and speakers opened; you are set |
+| `no microphone (receive only)` | no input device found — you can hear but not talk |
+| `no speakers` / `no audio backend` | voice is off; see `Log.txt` |
+| `MIC [######....]` | live level while the PTT is held — if this stays at dots, X-Plane is not getting your microphone |
+| `RX: SU-CBB` | who you are hearing right now |
+
+Pick the microphone and output device on the settings window's *Audio* tab,
+or leave them empty for the system default. Windows: check
+*Settings → System → Sound → Input* is the headset you mean. macOS: the first
+key press may trigger the microphone permission prompt; grant it and press
+again.
+
+Each transmission is Opus at 24 kbit/s — about 3 KB/s per person talking.
+
+### The radio sound
+
+A band-pass on its own sounds like a telephone. What makes a COM radio sound
+like one is the rest of the chain, so all of it is modelled on the receiving
+side, in the order the real signal goes through it (`plugin/src/voice.cpp`,
+`struct Radio`):
+
+| stage | what it does |
+|---|---|
+| transmitter | a modulation limiter squashes every syllable to the same level, then a soft overdrive adds the crunch that consonants get when a voice over-modulates |
+| channel | noise that rises as the other aircraft nears the VHF horizon; near it the audio breaks up, whole 20 ms frames going missing; two people keying at once produce the beating heterodyne squeal |
+| receiver | the squelch opens with a click and a burst of noise, closes with a longer burst and a click once the carrier drops; a 4th-order 300–2700 Hz audio filter; an output stage that cannot be driven past two thirds of full scale, whatever comes in |
+
+Distance comes from the same VHF horizon the server uses to route
+transmissions (`1.23 × (√h₁ + √h₂)` nm): a signal is clean to about half of
+it, then degrades to nothing at the horizon, where the server stops relaying
+it anyway. Someone the traffic list does not know about counts as strong.
+
+To hear it without X-Plane, `tools/harness/radio_demo.cpp` renders a WAV
+through the real pipeline — microphone path, Opus, the radio — and writes
+four versions: clean, a strong signal, one from the horizon, and two people
+transmitting at once:
 
 ```bash
-./build_linux_docker.sh all   # needs Docker; runs the whole build in ubuntu:22.04
+./build-tests/radio_demo call.wav out      # out_clean.wav, out_strong.wav, ...
 ```
 
-or push to GitHub: `.github/workflows/build-linux.yml` builds the `.pyz`, the native
-binary and a `.deb` on Ubuntu 22.04 (glibc 2.35) and 24.04 and uploads them as
-downloadable artifacts on every push, pull request or manual run. Take the 22.04
-("glibc-2.35") artifact for maximum compatibility — it also runs on Debian 12+, Mint,
-Pop!_OS and current Fedora; the 24.04 binary is x86-64-v3 tuned and wants a recent CPU.
+`tools/harness/voice_test.cpp` pins each of these down: the filter's cut-off,
+the limiter bringing 24 dB of input spread to under 8 dB, the squelch
+bursts and the silence after them, the noise rising with distance, the
+dropouts, the squeal, and the output ceiling.
 
-macOS can run `build_linux.sh` too (PyInstaller emits a Mach-O binary in `dist/`), but
-that path has not been verified on a Mac in this project.
+## What works today
 
-## Notes
+- Login, automatic reconnect, session timeouts
+- Own position sent at 5 Hz (location, attitude, speed, gear, flaps, lights)
+- **Other aircraft actually visible** — CSL models, TCAS, map layer, animated
+  gear/flaps/lights, callsign label
+- Whoever is transmitting on a frequency you monitor gets a green `[TX]` label
+- COM1/COM2 frequencies and audio panel read from the sim
+- Text messages routed by frequency and VHF line-of-sight range, without
+  needing the PTT held; the server rejects transmissions on a frequency you
+  are not actually tuned to
+- **Smooth motion** — positions are timestamped at the sender and interpolated
+  350 ms behind, so other aircraft move continuously regardless of network
+  jitter or relay timing; extrapolation covers a short dropout, then it holds
+- **Voice on the COM frequencies** — push-to-talk, Opus at 24 kbit/s, 20 ms
+  frames, packet-loss concealment, half-duplex, radio band-pass; runs on its
+  own network thread so audio never waits for a frame
+- **Hosting from inside the sim** — one pilot ticks a box and the plugin runs
+  the relay server itself, opens the router port over UPnP and shows the
+  address to share; no VPS, Python or terminal for anyone
+- **Tabbed in-sim settings window** — connection, audio (device pickers,
+  volume, sidetone, hiss, radio filter, live mic meter), traffic (models,
+  labels, ranges) and hosting — with validation and changes applied without a
+  restart
+- Windows placed against the monitor X-Plane is actually using, so they do not
+  spawn off-screen on multi-monitor setups
+- Builds on Windows, macOS and Linux; CI checks all three
 
-- **Mount + Open** / **Eject ISO** work on Windows, Linux and macOS — see [Mounting an ISO](#mounting-an-iso).
-- Current version: **V0.10.1**. It is set in one place (`ipm_launcher.py`) and changed
-  with `python scripts/bump_version.py <new version>` — see
-  [docs/RELEASING.md](docs/RELEASING.md).
-- If `pywebview` is not installed, source pages open in your default browser.
+### Two ranges, on purpose
 
-### Archive / "older versions" settings
+Traffic is sent within 80 nm, but the radio reaches as far as the VHF horizon
+(`1.23 × (√h₁ + √h₂)` in feet and nautical miles — about 135 nm for two
+aircraft at 3000 ft). So you can hear someone you cannot see, exactly as in
+real life.
 
-The app can fetch older versions from official distro archives when you use **Web Search** and click **Load more**.
+### Untrusted input
 
-Environment variables (optional):
+Both ends treat the wire as hostile. The server drops position reports with
+NaN, infinite or out-of-range values instead of relaying them onward, and
+strips control characters from callsigns. The plugin does the same on the way
+in: implausible traffic entries are skipped rather than handed to the
+renderer, text is clamped and scrubbed before it reaches the window, and
+strings that arrive without a null terminator are handled as fixed-width.
 
-- `IPM_MAX_ARCHIVE_ITEMS`
-  - Caps how many archive ISO links can be collected per search.
-  - Set to `0` or `-1` for unlimited (can be slow).
-- `IPM_MAX_KALI_VERSIONS`
-  - Caps how many Kali versions are scanned when searching without an explicit version.
-- `IPM_MAX_MINT_VERSIONS`
-  - Caps how many Linux Mint versions are scanned when searching without an explicit version.
-- `IPM_MAX_ARCH_DATED_DIRS`
-  - Caps how many dated directories are scanned for Arch/Artix when searching without an explicit date.
+### Security
 
-## Security / GitHub hygiene
+Hosting opens a UDP port on your machine to the internet, and the relay
+server behind it is the same code either way -- it validates every field of
+every packet before relaying it, and the fuzzing below is run against it. It
+is still a port, though: host when you want to fly with people, and untick
+the box when you are done, which also asks the router to close it again.
 
-- This repo includes a `.gitignore` to avoid committing virtual environments, caches, and downloaded ISO files.
-- See `SECURITY.md` for vulnerability reporting guidance.
-- If you enable Dependabot on GitHub, `.github/dependabot.yml` will check `requirements.txt` for dependency updates.
+The server has no authentication: anyone who knows the address can join under
+any callsign. Packets after login must carry the session id the server issued,
+which stops blind off-path spoofing, but this is a flying-with-friends server,
+not a hardened public service. Run it on a port you are willing to expose, and
+do not reuse it for anything sensitive.
 
-### Internet tab tips
+## Roadmap
 
-- **Windows sources**
-  - Pick **Category: Windows** and choose a release (`Windows 11`, `Windows 11 Enterprise LTSC`, `Windows 11 IoT Enterprise LTSC`, `Windows 10`, `Windows 10 Enterprise LTSC`, `Windows 10 IoT Enterprise LTSC`, `Windows 8.1`, `Windows 8`, `Windows 7`, `Windows Vista`, `Windows XP`) or `Windows (all versions)`.
-  - The LTSC editions have their own sources, and typing `windows 11 ltsc`, `win 11 ltsc` or just `ltsc` in **Web Search** reaches them too (`ltsc`/`ltsb` on its own lists every LTSC edition). LTSC rows are tagged `[Win 11 LTSC]`, `[Win 11 IoT LTSC]`, `[Win 10 LTSC]` or `[Win 10 IoT LTSC]`.
-  - **Refresh** lists genuine Microsoft install media found in the Internet Archive, with the file size next to each name.
-  - Items are filtered: repacks/"lite" editions, cracked/activated builds and files under 300 MB are dropped, and results are matched to the requested release so e.g. XP discs do not show up under Windows 8. LTSC media is matched through the archive item title (Microsoft's LTSC file names never say "LTSC") and is kept out of the retail `Windows 11` / `Windows 10` lists, which also drops language-pack ISOs such as `CLIENT_LOF_PACKAGES_OEM.iso`.
-  - **Open Source Page** goes to Microsoft's official download page for 10/11, the Windows 8 hub page for 8/8.1, and the Internet Archive search for 7/Vista/XP and the LTSC editions (Microsoft does not publish LTSC media on its consumer download pages).
-  - **Load more** widens the catalogue search for more (older) builds.
-  - The archive copies are user-contributed. Verify the SHA-256 of a downloaded ISO against Microsoft's official hash list before installing, and note that installing Windows still requires a valid licence key.
+1. **Finding each other without swapping addresses** — a small list of public
+   servers, or a code you can read out over the phone instead of an IP.
+2. **Radio effects** — signal fading towards the edge of range, a "blocked"
+   squeal when two people transmit at once.
+3. **Text chat input field** in the window (receive-only for now).
+4. **Key binding from the settings window** — the PTT is bound through
+   X-Plane's own keyboard settings for now.
+5. **Bandwidth** — traffic is relayed at 10 Hz to every client in range;
+   scaling past a couple of dozen pilots wants per-client rate limiting by
+   distance.
 
-- **Windows Server sources**
-  - Pick **Category: Windows Server** and choose a release (`Windows Server 2025`, `Windows Server 2022`, `Windows Server 2019`, `Windows Server 2016`, `Windows Server 2012 R2`, `Windows Server 2012`, `Windows Server 2008 R2`) or `Windows Server (all versions)` for the whole line, newest first.
-  - Server releases are also reachable from **Category: Windows** (and **All**); typing `windows server`, `win server` or a specific build such as `windows server 2012 r2` in **Web Search** lists them too. Rows are tagged `[Srv 2025]`, `[Srv 2022]`, `[Srv 2019]`, `[Srv 2016]`, `[Srv 2012 R2]`, `[Srv 2012]` or `[Srv 2008 R2]`.
-  - Current releases (2016 and newer) resolve from Microsoft's Evaluation Center media and the Internet Archive; retired releases (2012 R2 and older) come from archive copies, which is why 2008 R2 returns evaluation (GRMSX*) and volume-licence kits rather than retail discs.
-  - Server results are filtered the same way as client media, plus two server-specific guards: desktop client discs are kept out of Server lists (a Windows 7 disc that shares an archive item with a 2008 R2 disc no longer shows up under `Windows Server 2008 R2`), and non-OS server products are excluded (`SQL Server`, `MSSQL`, `Exchange Server`, `SharePoint`, `Lync Server`, `System Center`, `BizTalk`, `MultiPoint Server`). Hyper-V Server is still listed, since it is a Windows Server install image.
-  - Server 2012 and 2012 R2 share one base title, so R2 media is reported under `Windows Server 2012 R2` and never under `Windows Server 2012`.
-  - **Open Source Page** goes to Microsoft's Evaluation Center for current Server releases and to the Internet Archive search for retired ones.
-  - Server media is for learning and lab use. Install only in environments you are licensed and authorised to run, and verify hashes before use.
+## License
 
-- **Multi-download**
-  - Select multiple rows in the ISO list (Ctrl/Shift) and click **Download**.
-  - If multiple items are selected, the app will ask for a **target folder** and download all selected ISOs into it.
-  - **Copy URL** copies all selected URLs (one per line).
-
-- **Downloads (queue)**
-  - Downloads are queued and shown in the **Downloads** list.
-  - Select a job and use **Pause** / **Resume**.
-  - **Auto-verify (SHA-256)** checks downloaded files when a checksum is available.
-
-- **Web Search (best-effort)**
-  - The **Web Search** box tries to find direct `.iso` URLs and may crawl a few top result pages.
-  - You can switch **Provider** between:
-    - `DuckDuckGo`
-    - `SearxNG` (more “Google-like” results; requires a SearxNG instance URL)
-    - `Google API` (requires a Google API key + Custom Search Engine ID)
-  - If Web Search returns 0 direct ISO links, try curated **Source** listings first.
-  - For `Google API`:
-    - Create an API key and enable the **Custom Search API**
-    - Create a **Programmable Search Engine** (CSE) and copy its `cx` ID
-    - Paste both into the app (do not commit keys to GitHub)
-  - This can return 0 results if search engines rate-limit/block scraping or if pages hide links behind scripts.
-  - Try more specific queries like:
-    - `site:releases.ubuntu.com ubuntu iso`
-    - `site:cdimage.debian.org debian live iso`
-    - `site:download.opensuse.org tumbleweed iso`
-
+MIT — see `LICENSE`. XPMP2 is MIT, Opus is BSD-3 and miniaudio is public
+domain / MIT-0, so all are compatible.
