@@ -11,7 +11,7 @@ namespace xr {
 
 // "XRC1" as little-endian bytes.
 static const uint32_t kMagic       = 0x31435258u;
-static const uint16_t kProtoVersion = 5;   // v5: the roster, and 121.500 as guard
+static const uint16_t kProtoVersion = 5;   // v5: transponders, 121.500 as guard, direct messages
 
 enum PacketType : uint8_t {
     PT_LOGIN     = 1,  // client -> server
@@ -25,6 +25,11 @@ enum PacketType : uint8_t {
     PT_LOGOUT    = 9,  // client -> server
     PT_LOGIN_REJECT = 10,  // server -> client: why the login was refused
     PT_WEATHER   = 11,  // weather source -> server -> everyone else
+    // server -> client: everyone in the flight, for the @ list in the Say
+    // field. Added without a protocol bump: a client that predates it drops
+    // an unknown type, and one talking to an older server simply never
+    // gets one and lists the aircraft it can see instead.
+    PT_ROSTER    = 12,
 };
 
 // The international emergency frequency, and in XRadio the one place everybody
@@ -238,6 +243,29 @@ struct VoiceHeader {         // 12 bytes, followed by `opusLen` bytes of Opus
     uint16_t opusLen;
 };
 
+// Everyone in the flight. Traffic only carries aircraft within 80 nm, but a
+// message to @CALLSIGN reaches a pilot anywhere in the flight, so the list
+// that offers callsigns to address has to come from somewhere that knows
+// them all. The server sends it whenever somebody joins or leaves, and every
+// few seconds besides so one lost packet does not leave a stale list.
+//
+// More pilots than fit in one packet go out in several, all with the same
+// `epoch` and `parts`. A client replaces its list once it holds every part
+// of one epoch, so a pilot who left disappears instead of lingering.
+struct RosterHeader {        // 8 bytes, followed by `count` RosterEntry
+    uint16_t epoch;
+    uint8_t  part;           // 0-based
+    uint8_t  parts;          // how many packets this roster was split into
+    uint16_t count;          // entries in this packet
+    uint16_t reserved;
+};
+
+struct RosterEntry {         // 28 bytes
+    uint32_t sessionId;
+    char     callsign[16];
+    char     acIcao[8];
+};
+
 #pragma pack(pop)
 
 // The whole datagram, header included.
@@ -257,5 +285,10 @@ static const int kMaxPacket = 1200;
 static const int kMaxTrafficEntries =
     (kMaxPacket - (int)sizeof(Header) - (int)sizeof(TrafficHeader)) /
     (int)sizeof(TrafficEntry);
+
+// And how many pilots fit in one roster packet, the same way.
+static const int kMaxRosterEntries =
+    (kMaxPacket - (int)sizeof(Header) - (int)sizeof(RosterHeader)) /
+    (int)sizeof(RosterEntry);
 
 }  // namespace xr

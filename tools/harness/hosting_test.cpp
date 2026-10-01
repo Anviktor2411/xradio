@@ -236,6 +236,8 @@ public:
         send(xr::PT_WEATHER, sid_, &w, (int)sizeof(w));
     }
 
+    void logout() { send(xr::PT_LOGOUT, sid_, nullptr, 0); }
+
     uint32_t sid() const { return sid_; }
 
 private:
@@ -248,7 +250,7 @@ private:
         h.payloadLen = (uint16_t)len;
         h.sessionId = sid;
         memcpy(buf, &h, sizeof(h));
-        memcpy(buf + sizeof(h), payload, (size_t)len);
+        if (payload && len > 0) memcpy(buf + sizeof(h), payload, (size_t)len);
         sendto(fd_, (const char*)buf, sizeof(h) + (size_t)len, 0,
                (const sockaddr*)&dst_, sizeof(dst_));
     }
@@ -726,6 +728,112 @@ int main(int argc, char** argv) {
               shows(harness::draw(), "[122.800] HOSTER: meet me @ the hold short"));
 
         harness::click(1, sx + 40, sy + 200);   // hand the keyboard back
+    }
+
+    printf("\n@ offers the pilots in the flight\n");
+    {
+        // FRIEND, from the start, keeps flying through this section: later
+        // ones expect them still logged in, and sessions time out after 15 s.
+        // A message to @CALLSIGN reaches a pilot anywhere in the flight, so
+        // typing "@" lists everyone in it -- from the server's roster, not
+        // the traffic list, which stops at 80 nm. Never ourselves.
+        Peer near("ATNEAR", 57.857, 27.027);
+        Peer far("ATFAR9", 59.94, 30.31);           // St Petersburg, ~190 nm away
+        check("two more pilots join", near.login() && far.login());
+        for (int i = 0; i < 8; ++i) { near.position(); far.position(); peer.position(); fly(0.1); }
+        fly(0.4);
+
+        auto lineWith = [](const std::vector<std::string>& w, const std::string& s) {
+            for (const auto& l : w) if (l.find(s) != std::string::npos) return l;
+            return std::string();
+        };
+        int sx = 0, sy = 0;
+        check("the Say row is there", harness::drawnAt("Say:", &sx, &sy));
+        check("its hint says how to reach one pilot",
+              shows(harness::draw(), "@ to message one pilot"));
+
+        harness::click(1, sx + 40, sy);
+        harness::typeText(1, "@");
+        auto w = harness::draw();
+        check("typing @ lists a pilot nearby", shows(w, "@ATNEAR"));
+        check("and one far beyond the traffic list", shows(w, "@ATFAR9"));
+        check("but never ourselves", !shows(w, "@HOSTER"));
+        check("the nearby one says how far away it is",
+              lineWith(w, "@ATNEAR").find(" nm") != std::string::npos, lineWith(w, "@ATNEAR"));
+        // Whoever is nearest -- other pilots from earlier sections are still
+        // about -- is at the top and highlighted.
+        {
+            double best = 1e9, picked = -1;
+            for (const auto& l : w) {
+                const size_t at = l.find(" @"), nm = l.find(" nm");
+                if (at == std::string::npos || nm == std::string::npos) continue;
+                const size_t sp = l.rfind(' ', nm - 1);
+                const double d = atof(l.substr(sp + 1, nm - sp - 1).c_str());
+                if (d < best) best = d;
+                if (l.rfind("> @", 0) == 0) picked = d;
+            }
+            check("the nearest is first and highlighted", picked >= 0 && picked == best,
+                  lineWith(w, "> @"));
+        }
+        check("and the list says how to use it", shows(w, "Tab or Enter picks"));
+        if (!shows(w, "@ATFAR9")) dump(w);
+
+        harness::typeText(1, "atf");                  // case does not matter
+        w = harness::draw();
+        check("typing narrows it", shows(w, "@ATFAR9") && !shows(w, "@ATNEAR"));
+        harness::pressVk(1, 0x09);                    // Tab
+        w = harness::draw();
+        check("Tab fills the callsign in", shows(w, "Say: > @ATFAR9 "), lineWith(w, "Say:"));
+        check("and the list goes away", !shows(w, "Tab or Enter picks"));
+        harness::typeText(1, "hello from afar");
+        harness::pressVk(1, 0x0D);
+        for (int i = 0; i < 6; ++i) { near.position(); far.position(); peer.position(); fly(0.1); }
+        far.drain(400);
+        check("the message reaches a pilot the traffic list never showed",
+              far.lastText.body == "hello from afar" && far.lastText.to == "ATFAR9",
+              far.lastText.to + ": " + far.lastText.body);
+
+        // The arrows move the highlight, and Enter takes it rather than
+        // sending a callsign with nothing after it.
+        harness::click(1, sx + 40, sy);
+        harness::typeText(1, "@AT");
+        check("ATNEAR is first", shows(harness::draw(), "> @ATNEAR"));
+        harness::pressVk(1, 0x28);                    // down
+        check("down moves to the next", shows(harness::draw(), "> @ATFAR9"));
+        harness::pressVk(1, 0x26);                    // up
+        check("up moves back", shows(harness::draw(), "> @ATNEAR"));
+        harness::pressVk(1, 0x28);
+        harness::pressVk(1, 0x0D);
+        check("Enter takes the highlighted name", shows(harness::draw(), "Say: > @ATFAR9 "));
+        harness::pressVk(1, 0x1B);                    // escape: clear
+
+        // Clicking a name does the same.
+        harness::click(1, sx + 40, sy);
+        harness::typeText(1, "@");
+        harness::draw();
+        int nx = 0, ny = 0;
+        check("the names are on screen", harness::drawnAt("@ATNEAR", &nx, &ny));
+        harness::click(1, nx + 20, ny);
+        check("clicking one fills it in", shows(harness::draw(), "Say: > @ATNEAR "));
+        harness::pressVk(1, 0x1B);
+
+        // Nobody by that name.
+        harness::click(1, sx + 40, sy);
+        harness::typeText(1, "@ZZQ");
+        check("a name nobody has says so", shows(harness::draw(), "nobody in this flight is called ZZQ"));
+        harness::pressVk(1, 0x1B);
+
+        // A pilot who leaves drops off the list.
+        near.logout();
+        for (int i = 0; i < 6; ++i) { far.position(); peer.position(); fly(0.1); }
+        harness::click(1, sx + 40, sy);
+        harness::typeText(1, "@");
+        w = harness::draw();
+        check("a pilot who logged out is gone from it", !shows(w, "@ATNEAR") && shows(w, "@ATFAR9"));
+        if (shows(w, "@ATNEAR")) dump(w);
+        harness::pressVk(1, 0x1B);
+        far.logout();
+        fly(0.3);
     }
 
     printf("\nwith the window closed, a call still shows\n");

@@ -462,6 +462,23 @@ it as what it is:
   [direct] ESNB34: on my way
 ```
 
+You do not have to know the callsign. Type `@` and the window lists everyone
+in the flight except you — nearest first, with how far away they are when they
+are in your traffic, and the rest after them, however far away. Keep typing to
+narrow it, then Tab, Enter or a click to fill the name in:
+
+```
+  > @ESNB34   A20N   4.2 nm
+    @DLH441   B738   46.1 nm
+    @RYR77K   B738
+    Tab or Enter picks, arrows move, or click a name
+  Say: > @_
+```
+
+The list comes from the server, so a pilot on the other side of the country is
+in it even though they are nowhere near your traffic. Against a server older
+than v0.5.6 it lists the aircraft in your traffic instead.
+
 A callsign nobody in the flight is using comes back with an answer rather than
 silence. An `@` anywhere but the start of the line is just an `@`.
 

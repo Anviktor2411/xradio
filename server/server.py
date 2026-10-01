@@ -37,6 +37,7 @@ MAX_ENTRIES_PER_PACKET = P.MAX_TRAFFIC_ENTRIES
 # lot, nearest first: a bound on the work one crowded client can ask for.
 MAX_ENTRIES_TOTAL = 60
 MAX_TEXT_BYTES = 200        # cap relayed text so one client cannot spam huge frames
+ROSTER_INTERVAL_S = 5.0     # everyone in the flight, to everyone, this often and on every join/leave
 MAX_VOICE_BYTES = 512       # one 20 ms Opus frame at 24 kbit/s is ~60 bytes
 
 
@@ -137,6 +138,10 @@ class XRadioServer(asyncio.DatagramProtocol):
         # it until they leave; a second claimant would mean the weather
         # flickered between two sims.
         self._weather_sid = 0
+        # The roster: who is in the flight, for the @ list in the Say field.
+        self._roster_dirty = False
+        self._last_roster = 0.0
+        self._roster_epoch = 0
 
     # -- asyncio plumbing ---------------------------------------------------
     def connection_made(self, transport):
@@ -237,6 +242,7 @@ class XRadioServer(asyncio.DatagramProtocol):
             LOG.info("weather and time now come from %s", s.callsign)
         LOG.info("login: %s (%s) sid=%d from %s", s.callsign, s.ac_icao, sid, addr)
         self._send(addr, P.PT_LOGIN_ACK, sid, P.LOGIN_ACK.pack(sid, self._now_ms()))
+        self._roster_dirty = True
 
     def _on_position(self, s: Session, payload):
         if len(payload) < P.POSITION.size:
@@ -380,6 +386,9 @@ class XRadioServer(asyncio.DatagramProtocol):
             try:
                 self._reap()
                 self._broadcast_traffic()
+                now = time.monotonic()
+                if self._roster_dirty or now - self._last_roster >= ROSTER_INTERVAL_S:
+                    self._broadcast_roster(now)
             except Exception:
                 LOG.exception("traffic loop error")
 
@@ -404,11 +413,36 @@ class XRadioServer(asyncio.DatagramProtocol):
                 self._send(other.addr, P.PT_WEATHER, other.sid, payload)
 
     def _drop(self, s: Session, why: str):
-        self.sessions.pop(s.addr, None)
+        if self.sessions.pop(s.addr, None) is None:
+            return
         self.by_sid.pop(s.sid, None)
         if self._weather_sid == s.sid:
             self._weather_sid = 0      # the next claimant may have it
+        self._roster_dirty = True
         LOG.info("drop %s (sid=%d): %s", s.callsign, s.sid, why)
+
+    def _broadcast_roster(self, now: float):
+        """Everyone in the flight, to everyone in the flight.
+
+        The receiver is in its own copy and leaves itself out. Ordered by
+        session so both servers produce the same bytes, and split like
+        traffic when it does not fit in one packet."""
+        self._last_roster = now
+        self._roster_dirty = False
+        if not self.sessions:
+            return
+        everyone = sorted(self.sessions.values(), key=lambda s: s.sid)[:MAX_ENTRIES_TOTAL]
+        self._roster_epoch = (self._roster_epoch + 1) & 0xFFFF
+        per = P.MAX_ROSTER_ENTRIES
+        parts = (len(everyone) + per - 1) // per
+        for to in list(self.sessions.values()):
+            for part in range(parts):
+                chunk = everyone[part * per:(part + 1) * per]
+                body = [P.ROSTER_HDR.pack(self._roster_epoch, part, parts, len(chunk), 0)]
+                for o in chunk:
+                    body.append(P.ROSTER_ENTRY.pack(o.sid, P.pad(o.callsign, 16),
+                                                    P.pad(o.ac_icao, 8)))
+                self._send(to.addr, P.PT_ROSTER, to.sid, b"".join(body))
 
     def _broadcast_traffic(self):
         now = time.monotonic()

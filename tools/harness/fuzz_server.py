@@ -103,6 +103,27 @@ def nasty_packets(sid, rnd):
         yield f"voice: session id {1000 + k}", \
             raw(P.PT_VOICE, sid, P.VOICE_HDR.pack(122800, 1000 + k + rnd.randrange(100000), 1, 3)
                 + b"\xfc\xff\xfe")
+    # The roster: everyone in the flight, which the client keeps and draws.
+    re = P.ROSTER_ENTRY.pack(7, P.pad("FUZZR1", 16), P.pad("C172", 8))
+    yield "roster: count larger than the packet", \
+        raw(P.PT_ROSTER, sid, P.ROSTER_HDR.pack(1, 0, 1, 0xFFFF, 0) + re)
+    yield "roster: part beyond parts", \
+        raw(P.PT_ROSTER, sid, P.ROSTER_HDR.pack(2, 9, 2, 1, 0) + re)
+    yield "roster: zero parts", raw(P.PT_ROSTER, sid, P.ROSTER_HDR.pack(3, 0, 0, 1, 0) + re)
+    yield "roster: 255 parts, to make us allocate", \
+        raw(P.PT_ROSTER, sid, P.ROSTER_HDR.pack(4, 0, 255, 1, 0) + re)
+    yield "roster: header cut short", raw(P.PT_ROSTER, sid, P.ROSTER_HDR.pack(5, 0, 1, 1, 0)[:5])
+    yield "roster: half an entry", raw(P.PT_ROSTER, sid, P.ROSTER_HDR.pack(6, 0, 1, 1, 0) + re[:13])
+    yield "roster: callsign with no terminator and control bytes", \
+        raw(P.PT_ROSTER, sid, P.ROSTER_HDR.pack(7, 0, 1, 1, 0) +
+            P.ROSTER_ENTRY.pack(8, b"\x1b[2J\x07" + b"A" * 12, b"\xff" * 8))
+    yield "roster: forty-two entries, the most one packet holds", \
+        raw(P.PT_ROSTER, sid, P.ROSTER_HDR.pack(8, 0, 1, P.MAX_ROSTER_ENTRIES, 0) +
+            b"".join(P.ROSTER_ENTRY.pack(100 + i, P.pad("FZ%03d" % i, 16), P.pad("B738", 8))
+                     for i in range(P.MAX_ROSTER_ENTRIES)))
+    yield "roster: our own session id, which must not be offered back to us", \
+        raw(P.PT_ROSTER, sid, P.ROSTER_HDR.pack(9, 0, 1, 1, 0) +
+            P.ROSTER_ENTRY.pack(sid, P.pad("FUZZCL", 16), P.pad("C172", 8)))
     yield "unknown packet type 200", raw(200, sid, b"junk")
     yield "header only, zero payload", raw(P.PT_TRAFFIC, sid, b"")
     yield "single byte", b"\x58"

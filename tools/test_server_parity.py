@@ -701,6 +701,98 @@ def scenario_crowded_sky(port):
     return out
 
 
+def roster_of(packets, keep=None):
+    """The callsigns in the newest complete roster among `packets`.
+
+    Returns (names, honest, parts): `honest` is whether every packet's header
+    described exactly what that packet carried, and `parts` how many packets
+    the newest complete roster came in. A roster split over several packets
+    only counts once every part of one epoch has arrived."""
+    epochs, order, honest = {}, [], True
+    for raw in packets:
+        if len(raw) < P.ROSTER_HDR.size:
+            honest = False
+            continue
+        epoch, part, parts, count, _ = P.ROSTER_HDR.unpack_from(raw, 0)
+        if (P.ROSTER_HDR.size + count * P.ROSTER_ENTRY.size != len(raw)
+                or part >= parts or count > P.MAX_ROSTER_ENTRIES):
+            honest = False
+            continue
+        names, off = [], P.ROSTER_HDR.size
+        for _ in range(count):
+            _sid, cs, ac = P.ROSTER_ENTRY.unpack_from(raw, off)
+            off += P.ROSTER_ENTRY.size
+            names.append((norm(P.cstr(cs)), P.cstr(ac)))
+        e = epochs.setdefault(epoch, {"parts": parts, "got": {}})
+        e["got"][part] = names
+        if len(e["got"]) == e["parts"]:
+            order.append(epoch)
+    if not order:
+        return None, honest, 0
+    newest = epochs[order[-1]]
+    names = sorted(n for part in newest["got"].values() for n in part
+                   if keep is None or n[0].startswith(tuple(keep)))
+    return names, honest, newest["parts"]
+
+
+def scenario_roster(port):
+    """Everyone in the flight reaches everyone, for the @ list.
+
+    Traffic stops at 80 nm, but a message to @CALLSIGN reaches a pilot
+    anywhere in the flight, so the roster has to include the pilot nobody can
+    see. It follows logins and logouts within a tick, and comes again by
+    itself so one lost packet does not leave a stale list."""
+    out = {}
+    a = Client(port, "RSTA01", 57.85, 27.02, ac="C172")
+    b = Client(port, "RSTB02", 57.86, 27.03, ac="B738")
+    far = Client(port, "RSTF03", 59.94, 30.31, ac="A20N")     # ~190 nm away
+    a.login(); b.login(); far.login()
+    for c in (a, b, far):
+        c.position()
+    time.sleep(0.4)
+    names, honest, _ = roster_of(a.drain(0.4)[P.PT_ROSTER], ("RST",))
+    out["everyone"] = names
+    out["honest"] = honest
+
+    b.send(P.PT_LOGOUT)
+    time.sleep(0.35)
+    names, honest, _ = roster_of(a.drain(0.4)[P.PT_ROSTER], ("RST",))
+    out["after_logout"] = names
+    out["honest_after_logout"] = honest
+
+    # Nobody joins or leaves: the roster still comes, on its own clock.
+    a.drain(0.2)
+    far.position()
+    a.position()
+    waited = far.drain(5.6)[P.PT_ROSTER]
+    names, _, _ = roster_of(waited, ("RST",))
+    out["refreshed_unprompted"] = names
+    a.close(); b.close(); far.close()
+    return out
+
+
+def scenario_big_roster(port):
+    """More pilots than fit in one roster packet arrive in parts."""
+    out = {}
+    n = P.MAX_ROSTER_ENTRIES + 4
+    watcher = Client(port, "RSBWAT", 57.85, 27.02)
+    watcher.login()
+    others = []
+    for i in range(n):
+        c = Client(port, f"RB{i:03d}", 57.85, 27.02)
+        c.login()
+        others.append(c)
+    time.sleep(0.4)
+    names, honest, parts = roster_of(watcher.drain(0.6)[P.PT_ROSTER], ("RB", "RSB"))
+    out["count"] = len(names or [])
+    out["honest"] = honest
+    out["parts"] = parts
+    watcher.close()
+    for c in others:
+        c.close()
+    return out
+
+
 SCENARIOS = [
     ("login and traffic", scenario_login_and_traffic),
     ("login validation", scenario_bad_login),
@@ -716,6 +808,8 @@ SCENARIOS = [
     ("a crowded sky", scenario_crowded_sky),
     ("guard", scenario_guard),
     ("direct messages", scenario_direct_message),
+    ("roster", scenario_roster),
+    ("a big roster", scenario_big_roster),
 ]
 # scenarios whose server runs with a flight password
 PASSWORDED = {"flight password": "sky"}
@@ -816,6 +910,25 @@ def main():
     check("its ICAO type comes through",
           any(t[0] == "ESNB34" and t[1] == "A20N" for t in r["a_sees"]))
     check("an aircraft 130 nm away is not", not any(t[0] == "ESFAR1" for t in r["a_sees"]))
+
+    r = cpp["roster"]
+    check("the roster lists everyone in the flight",
+          [n for n, _ in (r["everyone"] or [])] == ["RSTA01", "RSTB02", "RSTF03"],
+          str(r["everyone"]))
+    check("including a pilot far outside traffic range",
+          any(n == "RSTF03" for n, _ in (r["everyone"] or [])))
+    check("with their aircraft type", ("RSTB02", "B738") in (r["everyone"] or []))
+    check("every roster header tells the truth", r["honest"] and r["honest_after_logout"])
+    check("a pilot who logs out leaves it",
+          [n for n, _ in (r["after_logout"] or [])] == ["RSTA01", "RSTF03"],
+          str(r["after_logout"]))
+    check("it comes again unprompted",
+          [n for n, _ in (r["refreshed_unprompted"] or [])] == ["RSTA01", "RSTF03"],
+          str(r["refreshed_unprompted"]))
+    r = cpp["a big roster"]
+    check("a roster too big for one packet comes in two", r["parts"] == 2, str(r["parts"]))
+    check("and loses nobody", r["count"] == P.MAX_ROSTER_ENTRIES + 5, str(r["count"]))
+    check("with honest headers", r["honest"])
 
     r = cpp["shared weather"]
     check("the weather source's sky is relayed", r["relayed"])

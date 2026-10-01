@@ -31,6 +31,10 @@ constexpr int    kMaxEntriesPerPacket = kMaxTrafficEntries;   // from protocol.h
 // cap on the whole lot, nearest first -- a bound on the work one crowded
 // client can make the server do, not a limit anyone will meet in a flight.
 constexpr int    kMaxEntriesTotal  = 60;
+// Everyone in the flight goes to everyone whenever somebody joins or leaves,
+// and this often besides, so a roster lost on the way heals by itself. It is
+// the list the Say field offers when a pilot types "@".
+constexpr double kRosterIntervalS  = 5.0;
 constexpr int    kMaxTextBytes     = 200;
 constexpr int    kMaxVoiceBytes    = 512;
 

@@ -21,6 +21,7 @@ PT_PONG = 8
 PT_LOGOUT = 9
 PT_LOGIN_REJECT = 10
 PT_WEATHER = 11
+PT_ROSTER = 12     # server -> client: everyone in the flight; see protocol.h
 
 # The international emergency frequency, and in XRadio the one place everybody
 # can be reached: a transmission on it goes to every pilot within VHF range
@@ -60,6 +61,9 @@ MAX_PACKET = 1200
 # down. Must equal xr::kMaxTrafficEntries.
 MAX_TRAFFIC_ENTRIES = (MAX_PACKET - 12 - 4) // 108
 
+# And how many pilots fit in one roster packet. Must equal xr::kMaxRosterEntries.
+MAX_ROSTER_ENTRIES = (MAX_PACKET - 12 - 8) // 28
+
 HEADER = struct.Struct("<IBBHI")          # magic, type, version, payloadLen, sessionId
 LOGIN = struct.Struct("<16s8sHH16s32s")   # callsign, acIcao, protoVer, flags, livery, password
 LOGIN_ACK = struct.Struct("<II")          # sessionId, serverTimeMs
@@ -69,6 +73,8 @@ TRAFFIC_HDR = struct.Struct("<HH")        # count, reserved
 TRAFFIC_ENTRY = struct.Struct("<I16s8s2d7f4BI2f16sHBB")  # ... + livery, squawk
 TEXT_HDR = struct.Struct("<II16sH16s")    # freqKhz, fromSession, from, textLen, to
 VOICE_HDR = struct.Struct("<IIHH")        # freqKhz, fromSession, seq, opusLen
+ROSTER_HDR = struct.Struct("<HBBHH")      # epoch, part, parts, count, reserved
+ROSTER_ENTRY = struct.Struct("<I16s8s")   # sessionId, callsign, acIcao
 
 # The flight's shared sky: time, then X-Plane 12's region weather whole --
 # three cloud layers and thirteen altitude levels, the sim's own counts.

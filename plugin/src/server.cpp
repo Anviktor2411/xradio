@@ -154,6 +154,7 @@ private:
     void reap(double now);
     void broadcastTraffic(double now);
     void sendTraffic(Session& me, const std::vector<Session*>& others, double now);
+    void broadcastRoster(double now);
     void drop(const Peer& peer);
 
     Sink     sink_;
@@ -166,6 +167,10 @@ private:
     // two sims.
     uint32_t weatherSid_ = 0;
     double   lastTraffic_ = 0;
+    // Somebody joined or left since the roster last went out.
+    bool     rosterDirty_ = false;
+    double   lastRoster_ = 0;
+    uint16_t rosterEpoch_ = 0;
     uint64_t sent_ = 0;
     double   t0_ = 0;
 };
@@ -276,6 +281,7 @@ void Core::onLogin(const Peer& from, const uint8_t* p, int len, double now) {
     ack.sessionId    = sid;
     ack.serverTimeMs = (uint32_t)((now - t0_) * 1000.0);
     send(from, PT_LOGIN_ACK, sid, &ack, (int)sizeof(ack));
+    rosterDirty_ = true;
 }
 
 void Core::onPosition(Session& s, const uint8_t* p, int len) {
@@ -457,8 +463,10 @@ void Core::onWeather(Session& s, const uint8_t* p, int len) {
 
 void Core::drop(const Peer& peer) {
     auto it = sessions_.find(peer);
-    if (it != sessions_.end() && it->second.sid == weatherSid_) weatherSid_ = 0;
-    sessions_.erase(peer);
+    if (it == sessions_.end()) return;
+    if (it->second.sid == weatherSid_) weatherSid_ = 0;
+    sessions_.erase(it);
+    rosterDirty_ = true;
 }
 
 void Core::reap(double now) {
@@ -466,6 +474,7 @@ void Core::reap(double now) {
         if (now - it->second.lastSeen > kSessionTimeoutS) {
             if (it->second.sid == weatherSid_) weatherSid_ = 0;
             it = sessions_.erase(it);
+            rosterDirty_ = true;
         }
         else ++it;
     }
@@ -478,6 +487,51 @@ void Core::tick(double now) {
     lastTraffic_ = now;
     reap(now);
     broadcastTraffic(now);
+    if (rosterDirty_ || now - lastRoster_ >= kRosterIntervalS) broadcastRoster(now);
+}
+
+// Everyone in the flight, to everyone in the flight -- the receiver included,
+// which it leaves out of its own list. Ordered by session so both servers
+// produce the same bytes, and split like traffic when it does not fit.
+void Core::broadcastRoster(double now) {
+    lastRoster_  = now;
+    rosterDirty_ = false;
+    if (sessions_.empty()) return;
+
+    std::vector<const Session*> all;
+    for (const auto& kv : sessions_) all.push_back(&kv.second);
+    std::sort(all.begin(), all.end(),
+              [](const Session* a, const Session* b) { return a->sid < b->sid; });
+    if ((int)all.size() > kMaxEntriesTotal) all.resize((size_t)kMaxEntriesTotal);
+
+    rosterEpoch_ = (uint16_t)(rosterEpoch_ + 1);
+    const size_t per   = (size_t)kMaxRosterEntries;
+    const size_t parts = (all.size() + per - 1) / per;
+
+    for (const auto& kv : sessions_) {
+        const Session& to = kv.second;
+        for (size_t part = 0; part < parts; ++part) {
+            const size_t first = part * per;
+            const size_t n = std::min(per, all.size() - first);
+            uint8_t payload[kMaxPacket];
+            RosterHeader rh{};
+            rh.epoch = rosterEpoch_;
+            rh.part  = (uint8_t)part;
+            rh.parts = (uint8_t)parts;
+            rh.count = (uint16_t)n;
+            memcpy(payload, &rh, sizeof(rh));
+            size_t off = sizeof(rh);
+            for (size_t i = first; i < first + n; ++i) {
+                RosterEntry e{};
+                e.sessionId = all[i]->sid;
+                padInto(e.callsign, sizeof(e.callsign), all[i]->callsign);
+                padInto(e.acIcao,   sizeof(e.acIcao),   all[i]->acIcao);
+                memcpy(payload + off, &e, sizeof(e));
+                off += sizeof(e);
+            }
+            send(to.peer, PT_ROSTER, to.sid, payload, (int)off);
+        }
+    }
 }
 
 void Core::broadcastTraffic(double now) {

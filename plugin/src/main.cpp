@@ -415,6 +415,14 @@ std::string g_chatInput;
 bool        g_chatFocus = false;
 int         g_chatInputY = 0;          // where the draw put the row, for the click test
 
+// The @ list: who can be addressed, offered while the Say field holds "@" and
+// no space yet. g_atPick is the highlighted row; the draw records where it
+// put each row and whose callsign is on it, for the click test.
+int                      g_atPick = 0;
+std::vector<int>         g_atRowsY;
+std::vector<std::string> g_atShown;
+constexpr int            kAtRows = 6;   // more than this and "keep typing"
+
 XPLMWindowID     g_window       = nullptr;
 XPLMFlightLoopID g_loop         = nullptr;
 XPLMCommandRef   g_cmdPtt       = nullptr;
@@ -809,6 +817,146 @@ void handleText(const uint8_t* payload, int len) {
 }
 
 // ---------------------------------------------------------------------------
+// the roster: everyone in the flight, for the @ list
+// ---------------------------------------------------------------------------
+struct RosterPilot {
+    uint32_t    sid = 0;
+    std::string callsign, acIcao;
+};
+std::vector<RosterPilot> g_roster;              // the last complete roster
+float                    g_rosterAt = -1000.f;  // g_elapsed when it completed
+// A roster too big for one packet arrives in parts; this is the one being put
+// together. See RosterHeader in protocol.h.
+uint16_t                              g_rosterEpoch = 0;
+std::vector<std::vector<RosterPilot>> g_rosterParts;
+std::vector<bool>                     g_rosterHave;
+
+// The server re-sends the roster every five seconds. One that has gone quiet
+// for three times that is a server that does not send one at all -- an older
+// build -- and then the @ list offers the aircraft in the traffic list.
+constexpr float kRosterFreshS = 15.f;
+bool rosterFresh() { return g_elapsed - g_rosterAt < kRosterFreshS; }
+
+// What comes after "@" has to be something splitDirect() will accept, so a
+// name that could not be typed back is not offered.
+std::string asCallsign(const std::string& raw) {
+    if (raw.empty() || raw.size() > 15) return "";
+    std::string out;
+    for (char c : raw) {
+        const unsigned char u = (unsigned char)c;
+        if (!isalnum(u) && c != '-' && c != '_') return "";
+        out += (char)toupper(u);
+    }
+    return out;
+}
+
+void handleRoster(const uint8_t* payload, int len) {
+    if (len < (int)sizeof(xr::RosterHeader)) return;
+    xr::RosterHeader rh{};
+    memcpy(&rh, payload, sizeof(rh));
+    // Sixty pilots is two packets. Anything claiming far more is not a
+    // roster, and a hostile server does not get to make us allocate for it.
+    if (rh.parts == 0 || rh.parts > 8 || rh.part >= rh.parts) return;
+    if (rh.count > xr::kMaxRosterEntries) return;
+    if (len != (int)(sizeof(rh) + rh.count * sizeof(xr::RosterEntry))) return;
+
+    std::vector<RosterPilot> part;
+    int off = (int)sizeof(rh);
+    for (int i = 0; i < rh.count; ++i) {
+        xr::RosterEntry e{};
+        memcpy(&e, payload + off, sizeof(e));
+        off += (int)sizeof(e);
+        RosterPilot rp;
+        rp.sid      = e.sessionId;
+        rp.callsign = asCallsign(sanitizeText(e.callsign, sizeof(e.callsign)));
+        rp.acIcao   = sanitizeText(e.acIcao, sizeof(e.acIcao));
+        if (rp.sid != 0 && !rp.callsign.empty()) part.push_back(rp);
+    }
+
+    if (rh.epoch != g_rosterEpoch || g_rosterParts.size() != rh.parts) {
+        g_rosterEpoch = rh.epoch;
+        g_rosterParts.assign(rh.parts, std::vector<RosterPilot>());
+        g_rosterHave.assign(rh.parts, false);
+    }
+    g_rosterParts[rh.part] = std::move(part);
+    g_rosterHave[rh.part] = true;
+    for (bool have : g_rosterHave) if (!have) return;
+
+    g_roster.clear();
+    for (const auto& p : g_rosterParts)
+        for (const auto& e : p)
+            if (g_roster.size() < 60) g_roster.push_back(e);
+    g_rosterAt = g_elapsed;
+}
+
+struct AtCandidate {
+    std::string callsign, acIcao;
+    double      distNm = -1.0;     // -1: not in our traffic, so not known
+};
+
+// Who "@" can reach, best first. The roster is everyone in the flight, which
+// is who a direct message can actually reach; without one the list is the
+// aircraft we can see. Never ourselves. Names that start with what has been
+// typed come before names that only contain it; among those, the aircraft we
+// can see, nearest first, and then the rest alphabetically.
+std::vector<AtCandidate> atCandidates(const std::string& typed) {
+    std::string want;
+    for (char c : typed) want += (char)toupper((unsigned char)c);
+    const std::string me = asCallsign(g_cfg.callsign);
+    const uint32_t mySid = g_sessionId.load();
+    const double myLat = dd(g_ref.lat), myLon = dd(g_ref.lon);
+    auto distTo = [&](uint32_t sid) {
+        auto it = g_remote.find(sid);
+        return it == g_remote.end() ? -1.0
+                                    : distanceNm(myLat, myLon, it->second.lat, it->second.lon);
+    };
+
+    std::vector<AtCandidate> all;
+    if (rosterFresh()) {
+        for (const auto& p : g_roster) {
+            if (p.sid == mySid || p.callsign == me) continue;
+            all.push_back({p.callsign, p.acIcao, distTo(p.sid)});
+        }
+    } else {
+        for (const auto& kv : g_remote) {
+            const std::string cs = asCallsign(kv.second.callsign);
+            if (cs.empty() || cs == me) continue;
+            all.push_back({cs, kv.second.acIcao, distTo(kv.first)});
+        }
+    }
+
+    std::vector<AtCandidate> out;
+    for (const auto& c : all) {
+        if (c.callsign.find(want) == std::string::npos) continue;
+        bool dup = false;                         // one callsign, two sessions
+        for (const auto& o : out) dup = dup || o.callsign == c.callsign;
+        if (!dup) out.push_back(c);
+    }
+    std::sort(out.begin(), out.end(), [&](const AtCandidate& a, const AtCandidate& b) {
+        const bool pa = a.callsign.compare(0, want.size(), want) == 0;
+        const bool pb = b.callsign.compare(0, want.size(), want) == 0;
+        if (pa != pb) return pa;
+        const bool ka = a.distNm >= 0, kb = b.distNm >= 0;
+        if (ka != kb) return ka;
+        if (ka && a.distNm != b.distNm) return a.distNm < b.distNm;
+        return a.callsign < b.callsign;
+    });
+    return out;
+}
+
+// The list is up while a callsign is still being chosen: the Say field has
+// the keyboard, starts with "@", and has no space in it yet.
+bool atActive() {
+    return g_chatFocus && !g_chatInput.empty() && g_chatInput[0] == '@' &&
+           g_chatInput.find(' ') == std::string::npos;
+}
+
+void atComplete(const std::string& callsign) {
+    g_chatInput = "@" + callsign + " ";
+    g_atPick = 0;
+}
+
+// ---------------------------------------------------------------------------
 // network thread
 // ---------------------------------------------------------------------------
 // Voice cannot wait for the 5 Hz flight loop, and must not depend on the frame
@@ -909,6 +1057,10 @@ void netStart() {
     g_firstLogin = -1.f;
     g_loginProblem.clear();
     g_lastLogin = -99.f;
+    g_roster.clear();                  // another server, another flight
+    g_rosterAt = -1000.f;
+    g_rosterParts.clear();
+    g_rosterHave.clear();
     g_status = "connecting to " + g_netHost + ":" + std::to_string(g_netPort) + "...";
     g_netRun.store(true);
     g_netThread = std::thread(netLoop);
@@ -967,6 +1119,7 @@ void pumpNetwork() {
             case xr::PT_TRAFFIC: handleTraffic(payload, h.payloadLen); break;
             case xr::PT_TEXT:    handleText(payload, h.payloadLen);    break;
             case xr::PT_WEATHER: handleWeather(payload, h.payloadLen); break;
+            case xr::PT_ROSTER:  handleRoster(payload, h.payloadLen);  break;
             case xr::PT_PONG:    break;
             default:             break;
         }
@@ -1396,14 +1549,65 @@ void drawWindow(XPLMWindowID win, void*) {
     // runs out does the opposite -- it shows the oldest chatter and drops the
     // call that just came in, which is the one the pilot is waiting for.
     const int inputY = b + 12;
-    const int room = y - (inputY + 22);
+
+    // The @ list, when a callsign is being chosen. It sits directly above the
+    // Say line and borrows its rows from the log for as long as it is up.
+    struct AtRow { std::string text; std::string callsign; int colour; };
+    std::vector<AtRow> atRows;
+    g_atRowsY.clear();
+    g_atShown.clear();
+    if (atActive()) {
+        const std::string typed = g_chatInput.substr(1);
+        const auto cands = atCandidates(typed);
+        const int shown = std::min<int>((int)cands.size(), kAtRows);
+        if (g_atPick >= shown) g_atPick = shown > 0 ? shown - 1 : 0;
+        for (int i = 0; i < shown; ++i) {
+            const AtCandidate& c = cands[(size_t)i];
+            char row[96], dist[24] = "";
+            if (c.distNm >= 0) snprintf(dist, sizeof(dist), "%.1f nm", c.distNm);
+            snprintf(row, sizeof(row), "%s @%-8s %-5s %s", i == g_atPick ? ">" : " ",
+                     c.callsign.c_str(), c.acIcao.c_str(), dist);
+            atRows.push_back({row, c.callsign, i == g_atPick ? 2 : 0});
+        }
+        if ((int)cands.size() > shown) {
+            char more[64];
+            snprintf(more, sizeof(more), "  ...and %d more -- keep typing",
+                     (int)cands.size() - shown);
+            atRows.push_back({more, "", 1});
+        }
+        if (cands.empty()) {
+            std::string why;
+            if (!g_connected)       why = "  (not connected)";
+            else if (typed.empty()) why = "  (nobody else is in this flight)";
+            else                    why = "  (nobody in this flight is called " + typed + "...)";
+            atRows.push_back({why, "", 1});
+        } else {
+            atRows.push_back({"  Tab or Enter picks, arrows move, or click a name", "", 1});
+        }
+    }
+    const int atFloor = inputY + 16;        // the lowest @ row
+    const int logFloor = inputY + 22 + (int)atRows.size() * 14;
+
+    const int room = y - logFloor;
     const int fits = room < 0 ? 0 : room / 14 + 1;
     size_t first = 0;
     if (g_chatLog.size() > (size_t)fits) first = g_chatLog.size() - (size_t)fits;
     for (size_t i = first; i < g_chatLog.size(); ++i) {
-        if (y < inputY + 22) break;
+        if (y < logFloor) break;
         drawFit(white, x, y, r, g_chatLog[i], xplmFont_Basic);
         y -= 14;
+    }
+
+    // Top to bottom, first choice at the top, the hint nearest the Say line.
+    for (size_t i = 0; i < atRows.size(); ++i) {
+        const int ry = atFloor + (int)(atRows.size() - 1 - i) * 14;
+        const AtRow& a = atRows[i];
+        float* col = a.colour == 2 ? green : (a.colour == 1 ? grey : white);
+        drawFit(col, x, ry, r, a.text, xplmFont_Basic);
+        if (!a.callsign.empty()) {
+            g_atRowsY.push_back(ry);
+            g_atShown.push_back(a.callsign);
+        }
     }
 
     // Type here, Enter sends on the radio the audio panel has selected.
@@ -1419,7 +1623,7 @@ void drawWindow(XPLMWindowID win, void*) {
         // worth naming next to it: between them they are the answer to "I do
         // not know what frequency anyone is on".
         snprintf(prompt, sizeof(prompt),
-                 "Say:   (click to type, Enter to send  ·  @CALLSIGN for one pilot"
+                 "Say:   (click to type, Enter to send  ·  @ to message one pilot"
                  "  ·  121.500 is heard by all)");
     }
     drawFit(g_chatFocus ? green : (g_chatInput.empty() ? amber : white), x, inputY, r,
@@ -1430,6 +1634,15 @@ void drawWindow(XPLMWindowID win, void*) {
 // window gives it back, so the sim's own key bindings keep working.
 int mainWindowClick(XPLMWindowID win, int, int y, XPLMMouseStatus status, void*) {
     if (status != xplm_MouseDown) return 1;
+    // A name in the @ list: fill it in and keep typing.
+    for (size_t i = 0; i < g_atRowsY.size() && i < g_atShown.size(); ++i) {
+        if (y >= g_atRowsY[i] - 4 && y <= g_atRowsY[i] + 11) {
+            atComplete(g_atShown[i]);
+            g_chatFocus = true;
+            XPLMTakeKeyboardFocus(win);
+            return 1;
+        }
+    }
     if (y >= g_chatInputY - 6 && y <= g_chatInputY + 15) {
         g_chatFocus = true;
         XPLMTakeKeyboardFocus(win);
@@ -1445,6 +1658,24 @@ void mainWindowKey(XPLMWindowID, char key, XPLMKeyFlags flags, char vk, void*, i
     if (!(flags & xplm_DownFlag) || !g_chatFocus) return;
     const unsigned char uvk = (unsigned char)vk;
     const unsigned char ch  = (unsigned char)key;
+
+    // While a callsign is being chosen, Tab and Enter take the highlighted
+    // name and the arrows move the highlight. Enter cannot mean "send" here
+    // anyway: "@ESN" with nothing after it is not a message.
+    if (atActive()) {
+        const int shown = std::min<int>((int)atCandidates(g_chatInput.substr(1)).size(), kAtRows);
+        const bool pick = uvk == XPLM_VK_TAB || ch == '\t' || uvk == XPLM_VK_RETURN ||
+                          uvk == XPLM_VK_ENTER || ch == '\r' || ch == '\n';
+        if (shown > 0 && pick) {
+            const auto cands = atCandidates(g_chatInput.substr(1));
+            atComplete(cands[(size_t)std::min(std::max(g_atPick, 0), shown - 1)].callsign);
+            return;
+        }
+        if (shown > 0 && uvk == XPLM_VK_DOWN) { g_atPick = (g_atPick + 1) % shown; return; }
+        if (shown > 0 && uvk == XPLM_VK_UP)   { g_atPick = (g_atPick + shown - 1) % shown; return; }
+        if (uvk == XPLM_VK_TAB || ch == '\t') return;     // nothing to complete
+    }
+
     if (uvk == XPLM_VK_RETURN || uvk == XPLM_VK_ENTER || ch == '\r' || ch == '\n') {
         if (!g_chatInput.empty()) {
             if (g_connected) {
@@ -1464,9 +1695,13 @@ void mainWindowKey(XPLMWindowID, char key, XPLMKeyFlags flags, char vk, void*, i
     }
     if (uvk == XPLM_VK_BACK || ch == 8) {
         if (!g_chatInput.empty()) g_chatInput.pop_back();
+        g_atPick = 0;
         return;
     }
-    if (ch >= 32 && ch < 127 && g_chatInput.size() < 200) g_chatInput += (char)ch;
+    if (ch >= 32 && ch < 127 && g_chatInput.size() < 200) {
+        g_chatInput += (char)ch;
+        g_atPick = 0;                      // the list changed; start at its top
+    }
 }
 
 // ---------------------------------------------------------------------------

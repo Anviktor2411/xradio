@@ -14,11 +14,15 @@ int main() {
     printf("TEXT_HDR %zu\n",      sizeof(xr::TextHeader));
     printf("VOICE_HDR %zu\n",     sizeof(xr::VoiceHeader));
     printf("WEATHER %zu\n",       sizeof(xr::WeatherPayload));
+    printf("ROSTER_HDR %zu\n",    sizeof(xr::RosterHeader));
+    printf("ROSTER_ENTRY %zu\n",  sizeof(xr::RosterEntry));
     // Not a struct, but the same class of mistake: a packet budget or an
     // entry cap that drifts apart between the two servers shows up as
     // traffic that thins out for clients of one of them.
     printf("MAX_PACKET %d\n",      xr::kMaxPacket);
     printf("MAX_TRAFFIC_ENTRIES %d\n", xr::kMaxTrafficEntries);
+    printf("MAX_ROSTER_ENTRIES %d\n",  xr::kMaxRosterEntries);
+    printf("PT_ROSTER %d\n",      (int)xr::PT_ROSTER);
     printf("GUARD_KHZ %u\n",      (unsigned)xr::kGuardKhz);
     return 0;
 }
