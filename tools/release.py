@@ -168,6 +168,25 @@ def checks(skipped):
 
     ok &= run("server protocol and routing", [PY, "tools/test_server.py"])
 
+    # Cheap, and the one check that catches the two protocol files describing
+    # different bytes -- which every other test would then agree about, because
+    # they all use one side or the other.
+    cxx = "g++" if have("g++") else ("clang++" if have("clang++") else None)
+    if cxx:
+        build = ROOT / "build-tests"
+        build.mkdir(exist_ok=True)
+        exe = build / ("check_sizes.exe" if os.name == "nt" else "check_sizes")
+        if run("building the wire-format check",
+               [cxx, "-std=c++17", "-Iplugin/src", "tools/check_sizes.cpp",
+                "-o", str(exe)]):
+            ok &= run("C++ and Python wire structs agree",
+                      [PY, "tools/check_sizes.py", "--compare", str(exe)])
+        else:
+            ok = False
+    else:
+        say("  C++ and Python wire structs agree ... skipped (no compiler here)")
+        skipped.append("the wire-format comparison (no C++ compiler)")
+
     if not (have("cmake") and (have("g++") or have("clang++"))):
         say("  the C++ tests ... skipped (no cmake/compiler here)")
         skipped.append("every C++ test (no cmake or compiler)")
@@ -328,8 +347,16 @@ def main():
     say(f"  1. Upload the source to GitHub (the zip above), or commit it.")
     say(f"  2. Wait for the build to go green, then download the")
     say(f"     XRadio-all-platforms artifact from that run.")
-    say(f"  3. Draft a release tagged v{new}, paste the notes, attach that")
-    say(f"     artifact -- the source zip is not what pilots install.")
+    say(f"  3. Draft a release, paste the notes, attach that artifact --")
+    say(f"     the source zip is not what pilots install.")
+    say()
+    # On its own line, because this is the one string that is typed by hand
+    # into GitHub and a dot in the wrong place is not obvious. "v05.4" reads
+    # as version 5.4, beats every real version, and tells every pilot already
+    # running the release that an update is waiting for them.
+    say("     The tag must be exactly, character for character:")
+    say()
+    say(f"         v{new}")
     say()
     return 0
 

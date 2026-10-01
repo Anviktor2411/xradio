@@ -1227,8 +1227,13 @@ void drawWindow(XPLMWindowID win, void*) {
     drawFit(g_connected ? green : amber, x, y, r, g_status, xplmFont_Proportional);
     y -= 16;
     char who[200];
+    // The network thread writes the endpoint while it opens the socket, so it
+    // is only read here once that thread has said it is done. Reading it
+    // earlier was a data race ThreadSanitizer found: a string read while
+    // another thread was halfway through assigning it.
+    const std::string ep = g_sockReady.load() ? g_sock.endpoint() : std::string();
     snprintf(who, sizeof(who), "%s as %s (%s%s%s)  ·  Plugins > XRadio > Settings",
-             g_sock.endpoint().empty() ? "no server" : g_sock.endpoint().c_str(),
+             ep.empty() ? "no server" : ep.c_str(),
              g_cfg.callsign.c_str(), effectiveIcao().c_str(),
              effectiveLivery().empty() ? "" : " ", effectiveLivery().c_str());
     drawFit(white, x, y, r, who, xplmFont_Basic);
@@ -2300,6 +2305,7 @@ PLUGIN_API int XPluginEnable(void) {
 
 PLUGIN_API void XPluginDisable(void) {
     xr::voice::setTransmitting(false);
+    xr::voice::releaseMicrophone();      // a disabled plugin holds nothing
     netStop();
     sendLogout();
     g_sock.close();

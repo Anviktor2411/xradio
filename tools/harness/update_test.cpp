@@ -10,6 +10,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <string>
 #include <thread>
 
@@ -23,6 +24,19 @@ static void check(const std::string& name, bool ok, const std::string& detail = 
 
 int main(int argc, char** argv) {
     const std::string mode = argc > 1 ? argv[1] : "offline";
+
+    // "offline" means the update site cannot be reached. Left to itself this
+    // test asked the real GitHub and then asserted that the answer was
+    // useless -- so it passed only while the runner happened to be blocked or
+    // rate-limited, and failed the day it got through. Point it at a port
+    // with nothing behind it and the case is the one it claims to be.
+    if (mode == "offline" && !getenv("XRADIO_UPDATE_URL")) {
+#ifdef _WIN32
+        _putenv_s("XRADIO_UPDATE_URL", "http://127.0.0.1:5398/nothing-here");
+#else
+        setenv("XRADIO_UPDATE_URL", "http://127.0.0.1:5398/nothing-here", 1);
+#endif
+    }
 
     printf("\ncomparing versions\n");
     {
@@ -38,6 +52,20 @@ int main(int argc, char** argv) {
         check("nonsense is never newer",
               !isNewer("0.5.2", "banana") && !isNewer("0.5.2", "") &&
               !isNewer("", "0.6.0") && !isNewer("0.5.2", "0.6.0-beta"));
+        // A release once went out tagged v05.4 instead of v0.5.4. The dot is
+        // missing, so it used to parse as 5.4, beat every real version, and
+        // tell every pilot on 0.5.4 to go and install the build they were
+        // already running. A leading zero is not a version component, so a
+        // tag like that is now refused outright: nothing is offered, which
+        // is wrong quietly rather than wrong in the window every flight.
+        check("a tag with a missing dot is refused, not read as 5.4",
+              !isNewer("0.5.4", "05.4"));
+        check("every leading zero is caught, not just the first component",
+              !isNewer("0.5.4", "1.05") && !isNewer("0.5.4", "1.0.05"));
+        check("a component that is genuinely zero still parses",
+              isNewer("0.5.4", "1.0.0") && isNewer("0.9.0", "1.0"));
+        check("the well-formed tag is not newer than itself",
+              !isNewer("0.5.4", "0.5.4"));
         check("absurd input is refused rather than parsed",
               !isNewer("0.5.2", "99999999.0.0"));
     }
@@ -71,6 +99,14 @@ int main(int argc, char** argv) {
             check("no update is claimed", !i.newer, i.latest);
         } else if (mode == "older") {
             check("no update is claimed", !i.newer, i.latest);
+        } else if (mode == "typo") {
+            // The comparison is unit-tested above; this drives the whole
+            // path, because what a pilot sees is the window, and the window
+            // is what was wrong. A malformed tag must reach the end of the
+            // check and change nothing.
+            check("the site really did serve the malformed tag",
+                  i.latest == "05.4", i.latest);
+            check("and no update is claimed from it", !i.newer, i.latest);
         } else if (mode == "garbage" || mode == "error" || mode == "offline") {
             check("nothing is claimed when the answer is useless", !i.newer);
             check("and the reason is recorded", !i.error.empty(), i.error);

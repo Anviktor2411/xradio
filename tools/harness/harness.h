@@ -17,6 +17,13 @@ std::string getString(const std::string& dataref);
 void   setArray(const std::string& dataref, const std::vector<float>& values);  // float[n] refs
 const std::vector<float>& getArray(const std::string& dataref);
 
+// The terrain the fake X-Plane's probe reports, in metres MSL, and whether
+// the probe answers at all. The plugin asks the sim where the ground is
+// rather than working it out from datarefs, so a test that cares about an
+// aircraft on the ground has to say where the ground is.
+void setTerrain(double metresMsl);
+void setProbeWorks(bool works);
+
 void tick(float dt);                      // run one flight-loop callback
 std::vector<std::string> draw();          // run the window draw, capture its text
 void ptt(bool down);                      // press / release the PTT command

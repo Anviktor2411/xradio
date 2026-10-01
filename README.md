@@ -602,11 +602,23 @@ The window's `Voice:` line tells you what is going on:
 
 | shows | meaning |
 |---|---|
-| `OK  mic: <device>` | microphone and speakers opened; you are set |
+| `OK  mic: <device> (opens when you talk)` | speakers open, microphone found and left alone until your first PTT |
+| `OK  mic: <device>` | microphone open; you are set |
 | `no microphone (receive only)` | no input device found — you can hear but not talk |
+| `microphone would not open (receive only)` | one was found but refused; the next PTT tries again |
 | `no speakers` / `no audio backend` | voice is off; see `Log.txt` |
 | `MIC [######....]` | live level while the PTT is held — if this stays at dots, X-Plane is not getting your microphone |
 | `RX: SU-CBB` | who you are hearing right now |
+
+XRadio does not open your microphone when X-Plane loads. It opens it the
+first time you press the PTT — the first fraction of a second of that one
+call is spent opening it — and gives it back after ten minutes without a
+transmission, or when the plugin is disabled. A microphone in use is not free:
+a **Bluetooth headset** whose microphone is open drops into its hands-free
+mode, and everything else you hear through it — the sim, other plugins'
+sounds, music — goes mono, narrow and hollow. If you fly with one and want to
+talk, pick a different microphone (a USB one, or the PC's own) on the *Audio*
+tab and the headset keeps its full sound.
 
 Pick the microphone and output device on the settings window's *Audio* tab,
 or leave them empty for the system default. Windows: check

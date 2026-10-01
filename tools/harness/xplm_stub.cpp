@@ -11,6 +11,7 @@
 #include "XPLMMenus.h"
 #include "XPLMPlugin.h"
 #include "XPLMProcessing.h"
+#include "XPLMScenery.h"
 #include "XPLMUtilities.h"
 
 #include "harness.h"
@@ -23,6 +24,13 @@
 #include <vector>
 
 namespace harness {
+
+// The ground, for the terrain probe. Sea level and a working probe unless a
+// test says otherwise.
+double g_terrainM  = 0.0;
+bool   g_probeWorks = true;
+void setTerrain(double m)   { g_terrainM = m; }
+void setProbeWorks(bool ok) { g_probeWorks = ok; }
 
 std::map<std::string, double> g_values;
 std::map<std::string, std::string> g_strings;
@@ -374,4 +382,40 @@ void XPLMUnregisterCommandHandler(XPLMCommandRef, XPLMCommandCallback_f, int, vo
 XPLMPluginID XPLMGetMyID(void) { return 1; }
 void XPLMGetPluginInfo(XPLMPluginID, char*, char* outFilePath, char*, char*) {
     if (outFilePath) strcpy(outFilePath, "/tmp/xradio-harness/XRadio/lin_x64/lin.xpl");
+}
+
+// ---------------------------------------------------------------------------
+// Scenery: a flat earth in metres, so the plugin's terrain probe has
+// something to answer with. Only the round trip matters to the caller --
+// world -> local -> probe -> local -> world -- so the projection can be as
+// crude as this as long as it is its own inverse.
+static const double kDegM = 111320.0;
+
+void XPLMWorldToLocal(double lat, double lon, double alt,
+                      double* x, double* y, double* z) {
+    if (x) *x =  lon * kDegM;
+    if (y) *y =  alt;
+    if (z) *z = -lat * kDegM;
+}
+
+void XPLMLocalToWorld(double x, double y, double z,
+                      double* lat, double* lon, double* alt) {
+    if (lat) *lat = -z / kDegM;
+    if (lon) *lon =  x / kDegM;
+    if (alt) *alt =  y;
+}
+
+XPLMProbeRef XPLMCreateProbe(XPLMProbeType) { return (XPLMProbeRef)1; }
+void XPLMDestroyProbe(XPLMProbeRef) {}
+
+XPLMProbeResult XPLMProbeTerrainXYZ(XPLMProbeRef probe, float x, float, float z,
+                                    XPLMProbeInfo_t* out) {
+    if (!probe || !out) return xplm_ProbeError;
+    if (!harness::g_probeWorks) return xplm_ProbeMissed;
+    out->locationX = x;
+    out->locationY = (float)harness::g_terrainM;
+    out->locationZ = z;
+    out->normalY   = 1.f;
+    out->is_wet    = 0;
+    return xplm_ProbeHitTerrain;
 }

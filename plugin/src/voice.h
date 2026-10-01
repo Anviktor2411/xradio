@@ -62,11 +62,24 @@ std::vector<Device> listDevices(bool capture);
 bool reopenDevices(const std::string& micName, const std::string& outName,
                    std::string* err);
 
-const std::string& currentMic();
-const std::string& currentOutput();
+// Copies, not references: the microphone is opened on a thread of its own,
+// so its name can change while the main thread is looking at it.
+std::string currentMic();
+std::string currentOutput();
 void shutdown();
 bool available();       // encoder + playback ready
-bool haveMicrophone();  // capture device opened
+// A microphone is there to use: open, opening, or waiting for the first PTT.
+// False with none at all, or one that refused to open.
+bool haveMicrophone();
+
+// The microphone is not opened when the plugin loads. It opens the first time
+// the pilot keys up, and closes again after ten minutes without a
+// transmission, or straight away with this. Holding a Bluetooth headset's
+// microphone switches the headset into its hands-free mode, which turns
+// everything else the pilot hears -- the sim, other plugins, music -- into
+// low-quality mono; nobody should pay that for a plugin they are not talking
+// on. Main thread only.
+void releaseMicrophone();
 
 void setTransmitting(bool on);   // PTT
 bool transmitting();

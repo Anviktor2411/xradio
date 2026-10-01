@@ -7,6 +7,7 @@
 #include "protocol.h"
 #include "settings.h"
 #include "ui.h"
+#include "voice.h"
 
 #include <atomic>
 #include <chrono>
@@ -438,6 +439,7 @@ int main(int argc, char** argv) {
     if (argc > 1) g_port = (uint16_t)atoi(argv[1]);
     if (system("mkdir -p /tmp/xradio-harness") != 0) return 1;
     setenv("XRADIO_NOTICE_HOLD", "1", 1);   // see the notice section below
+    setenv("XRADIO_MIC_IDLE", "2", 1);      // and the microphone section
 
     // Start from a config that hosts on our test port but is switched off,
     // so the test can turn it on through the window and watch what happens.
@@ -490,6 +492,62 @@ int main(int argc, char** argv) {
         check("not hosting yet", !shows(w, "Hosting  \xc2\xb7"));
         check("and not connected to anything either",
               !shows(w, "connected to") || shows(w, "socket error"));
+    }
+
+    printf("\nthe microphone is only held while it is being used\n");
+    {
+        // An open microphone is not free for the pilot. A Bluetooth headset
+        // whose microphone is in use drops into its hands-free mode, which
+        // turns everything else they hear -- the sim, other plugins' sounds
+        // -- mono, narrow and hollow, and Windows lights its microphone-in-
+        // use indicator for as long as it is held. This used to start the
+        // moment X-Plane loaded the plugin. A pilot flying alone with
+        // XRadio installed reported their sound "tunnelling".
+        fly(0.2);
+        check("loading the plugin does not open the microphone",
+              xr::voice::currentMic().empty(), xr::voice::currentMic());
+        auto w = harness::draw();
+        check("the window says when it will open", shows(w, "opens when you talk"));
+        if (!shows(w, "opens when you talk")) dump(w);
+        check("and a microphone still counts as being there",
+              xr::voice::haveMicrophone());
+
+        harness::ptt(true);
+        fly(0.4);
+        check("keying up opens it", !xr::voice::currentMic().empty(), xr::voice::status());
+        auto w2 = harness::draw();
+        check("and the window names it without the note",
+              shows(w2, "mic: ") && !shows(w2, "opens when you talk"));
+        harness::ptt(false);
+
+        // XRADIO_MIC_IDLE is two seconds here, against ten minutes for real.
+        fly(1.0);
+        check("a short pause keeps it", !xr::voice::currentMic().empty());
+        fly(1.8);
+        check("a long silence gives it back", xr::voice::currentMic().empty(),
+              xr::voice::status());
+        check("and the window says it will open again",
+              shows(harness::draw(), "opens when you talk"));
+
+        harness::ptt(true);
+        fly(0.4);
+        check("the next PTT opens it again", !xr::voice::currentMic().empty());
+        harness::ptt(false);
+        xr::voice::releaseMicrophone();
+        check("releasing it closes it at once", xr::voice::currentMic().empty());
+
+        // A radio with no power never touches the microphone at all.
+        harness::set("sim/cockpit2/switches/avionics_power_on", 0);
+        harness::set("sim/cockpit2/electrical/bus_volts", 0.0);
+        fly(0.2);
+        harness::ptt(true);
+        fly(0.4);
+        check("keying a dead radio leaves the microphone alone",
+              xr::voice::currentMic().empty(), xr::voice::currentMic());
+        harness::ptt(false);
+        harness::set("sim/cockpit2/switches/avionics_power_on", 1);
+        harness::set("sim/cockpit2/electrical/bus_volts", 24.0);
+        fly(0.2);
     }
 
     printf("\nswitching hosting on in the window\n");
@@ -1003,13 +1061,21 @@ int main(int argc, char** argv) {
         // sending that has the gear counted twice, and a pilot watching the
         // apron sees everybody hovering. What the receiver needs while we
         // are down is the ground.
+        //
+        // The first version of this worked the ground out as elevation minus
+        // y_agl. That is only the ground if y_agl is measured to the datum,
+        // and on some aircraft it is not: the subtraction took off nothing
+        // and the models went on hovering. So the plugin asks the sim where
+        // the ground is instead, and y_agl is only the fallback.
         Peer obs("GNDOBS", 57.858, 27.028);
         check("an observer joins", obs.login());
 
-        // Some altitude bookkeeping that has to survive the round trip: a
-        // stand at 100 m, with our datum 2.4 m above it.
+        // A stand at 100 m, with our datum 2.4 m above it -- and a y_agl
+        // that lies about it, the way the real one did.
+        harness::setTerrain(97.6);
+        harness::setProbeWorks(true);
         harness::set("sim/flightmodel/position/elevation", 100.0);
-        harness::set("sim/flightmodel/position/y_agl", 2.4);
+        harness::set("sim/flightmodel/position/y_agl", 0.01);      // the lie
         harness::set("sim/flightmodel/failures/onground_any", 1);
         for (int i = 0; i < 8; ++i) { obs.position(); fly(0.1); }
         auto bag = obs.drain(400);
@@ -1022,8 +1088,18 @@ int main(int argc, char** argv) {
             check("and still flagged as on the ground", me->onGround == 1);
         }
 
+        // The regression this exists for: with y_agl reading zero, the old
+        // arithmetic sent the datum altitude and every model hovered by the
+        // sender's own gear height.
+        if (me) {
+            check("a useless y_agl no longer leaves us a datum height too high",
+                  me->altMslM < 99.9f,
+                  std::to_string(me->altMslM) + " m; 100 would be the old bug");
+        }
+
         // Airborne, the datum is the aircraft, so it goes out untouched and
         // the receiver drops the offset instead (see xpmp_bridge.cpp).
+        harness::setTerrain(120.0);
         harness::set("sim/flightmodel/position/elevation", 900.0);
         harness::set("sim/flightmodel/position/y_agl", 800.0);
         harness::set("sim/flightmodel/failures/onground_any", 0);
@@ -1034,11 +1110,22 @@ int main(int argc, char** argv) {
               std::fabs(me->altMslM - 900.f) < 0.05f,
               me ? std::to_string(me->altMslM) + " m, wanted 900" : "no entry");
 
-        // A nonsense reading must not bury the model: that would look far
-        // worse than the hover it replaces.
+        // With no probe -- a frame where it misses, or a sim that will not
+        // give us one -- the old subtraction is still there as the fallback.
+        harness::setProbeWorks(false);
         harness::set("sim/flightmodel/position/elevation", 100.0);
-        harness::set("sim/flightmodel/position/y_agl", 4000.0);
+        harness::set("sim/flightmodel/position/y_agl", 2.4);
         harness::set("sim/flightmodel/failures/onground_any", 1);
+        for (int i = 0; i < 8; ++i) { obs.position(); fly(0.1); }
+        bag = obs.drain(400);
+        me = entryFor(bag, "HOSTER");
+        check("without a probe we fall back to y_agl", me != nullptr &&
+              std::fabs(me->altMslM - 97.6f) < 0.05f,
+              me ? std::to_string(me->altMslM) + " m, wanted 97.6" : "no entry");
+
+        // And the fallback keeps its own guard: a nonsense reading must not
+        // bury the model, which would look far worse than the hover.
+        harness::set("sim/flightmodel/position/y_agl", 4000.0);
         for (int i = 0; i < 8; ++i) { obs.position(); fly(0.1); }
         bag = obs.drain(400);
         me = entryFor(bag, "HOSTER");
@@ -1046,6 +1133,30 @@ int main(int argc, char** argv) {
               me != nullptr && std::fabs(me->altMslM - 100.f) < 0.05f,
               me ? std::to_string(me->altMslM) + " m, wanted 100" : "no entry");
 
+        // A probe that answers from the wrong side of the world is refused
+        // the same way, rather than dropping the aeroplane into a hole.
+        harness::setProbeWorks(true);
+        harness::setTerrain(-4000.0);
+        harness::set("sim/flightmodel/position/y_agl", 2.4);
+        for (int i = 0; i < 8; ++i) { obs.position(); fly(0.1); }
+        bag = obs.drain(400);
+        me = entryFor(bag, "HOSTER");
+        check("a probe answering absurdly far below is refused too",
+              me != nullptr && std::fabs(me->altMslM - 97.6f) < 0.05f,
+              me ? std::to_string(me->altMslM) + " m, wanted 97.6" : "no entry");
+
+        // And one that claims the ground is above us -- which happens on a
+        // bridge or a pier -- is left alone rather than lifting us.
+        harness::setTerrain(140.0);
+        for (int i = 0; i < 8; ++i) { obs.position(); fly(0.1); }
+        bag = obs.drain(400);
+        me = entryFor(bag, "HOSTER");
+        check("a probe answering above us is refused",
+              me != nullptr && std::fabs(me->altMslM - 97.6f) < 0.05f,
+              me ? std::to_string(me->altMslM) + " m, wanted 97.6" : "no entry");
+
+        harness::setTerrain(0.0);
+        harness::setProbeWorks(true);
         harness::set("sim/flightmodel/position/elevation", 914.0);
         harness::set("sim/flightmodel/position/y_agl", 0.0);
         harness::set("sim/flightmodel/failures/onground_any", 0);

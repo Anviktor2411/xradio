@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include "mathconst.h"
 
 #ifndef XRADIO_USE_VOICE
@@ -28,9 +29,9 @@ bool reopenDevices(const std::string&, const std::string&, std::string* err) {
     if (err) *err = "built without voice";
     return false;
 }
-static const std::string g_none;
-const std::string& currentMic() { return g_none; }
-const std::string& currentOutput() { return g_none; }
+std::string currentMic() { return {}; }
+std::string currentOutput() { return {}; }
+void releaseMicrophone() {}
 void setSidetone(bool) {}
 void setHiss(float) {}
 void setRadioFilter(bool) {}
@@ -134,8 +135,48 @@ OpusEncoder*      g_enc = nullptr;
 ma_context        g_ctx;
 ma_device         g_cap;
 ma_device         g_play;
-bool              g_ctxOk = false, g_capOk = false, g_playOk = false;
+bool              g_ctxOk = false, g_playOk = false;
+std::atomic<bool> g_capOk{false};
 Mode              g_mode = Mode::NoDevices;
+
+// The microphone is opened the first time the pilot keys up, not when X-Plane
+// loads the plugin, and closed again after a long silence.
+//
+// Holding a microphone open is not free for the pilot. A Bluetooth headset
+// whose microphone is in use drops out of its music profile into its
+// hands-free one, and everything played through it -- X-Plane, every other
+// plugin's sounds, anything else on the PC -- becomes narrow, mono and
+// hollow, the "in a tunnel" sound people report. Windows also shows the
+// microphone-in-use indicator for as long as it is held. The first version
+// opened it at startup and kept it for the whole session, which charged that
+// to everybody who had XRadio installed, including pilots flying alone.
+//
+// Opening it takes a few tens of milliseconds for a wired microphone and can
+// take a second or two for a Bluetooth one while the headset changes mode, so
+// it is done on a thread of its own: the first press of the PTT costs the
+// start of that one transmission, never a frozen frame.
+enum MicState : int {
+    MIC_NONE = 0,   // no capture device, or a build without devices
+    MIC_CLOSED,     // there is one; it opens on the next PTT
+    MIC_OPENING,    // the opener thread is at it
+    MIC_OPEN,
+    MIC_FAILED      // it would not open; the next PTT tries again
+};
+std::atomic<int>  g_mic{MIC_NONE};
+std::thread       g_micOpener;
+// Serialises ma_device_init/uninit for both devices: the opener thread and the
+// main thread must never be inside miniaudio's device setup at the same time.
+// Never held while waiting on g_mx (the capture callback takes g_mx, and
+// uninit waits for the callback to finish).
+std::mutex        g_devMx;
+// Guards the device names, which the opener writes and the window reads. Held
+// for a string copy and nothing else, so the main thread never waits on a
+// device that is slow to open.
+std::mutex        g_nameMx;
+std::chrono::steady_clock::time_point g_lastTx;   // main thread only
+// Ten minutes without keying up. XRADIO_MIC_IDLE (seconds) shortens it for
+// the test harness, which cannot wait ten minutes to see it happen.
+float             g_micIdleS = 600.f;
 
 std::atomic<bool>  g_tx{false};
 std::atomic<bool>  g_sidetone{false};
@@ -490,9 +531,14 @@ void render(int16_t* out, int count) {
 // Ask the backend what exists. Called on init and whenever the user opens
 // the settings window's audio tab, since devices come and go.
 void refreshDevices() {
+    if (!g_ctxOk) { g_capDevs.clear(); g_playDevs.clear(); return; }
+    // If the microphone is being opened right now, keep the list we have
+    // rather than asking the backend while it is busy with a device -- and
+    // rather than making the main thread wait for a headset to change mode.
+    std::unique_lock<std::mutex> busy(g_devMx, std::try_to_lock);
+    if (!busy.owns_lock()) return;
     g_capDevs.clear();
     g_playDevs.clear();
-    if (!g_ctxOk) return;
 
     ma_device_info* play = nullptr; ma_uint32 nPlay = 0;
     ma_device_info* cap  = nullptr; ma_uint32 nCap  = 0;
@@ -515,40 +561,110 @@ const ma_device_id* findDevice(const std::vector<DevEntry>& list, const std::str
     return nullptr;
 }
 
+// The speakers open at once: hearing other pilots needs nothing from the
+// pilot, and an output stream has none of the side effects a microphone has.
+// The microphone only gets its state set here; it opens on the first PTT.
 bool openDevices(std::string* err) {
-    ma_device_config pc = ma_device_config_init(ma_device_type_playback);
-    pc.playback.format    = ma_format_s16;
-    pc.playback.channels  = 1;
-    pc.playback.pDeviceID = (ma_device_id*)findDevice(g_playDevs, g_wantOut);
-    pc.sampleRate         = kSampleRate;
-    pc.periodSizeInFrames = kFrameSamples;
-    pc.dataCallback       = playbackCb;
-    if (ma_device_init(&g_ctx, &pc, &g_play) == MA_SUCCESS &&
-        ma_device_start(&g_play) == MA_SUCCESS) {
-        g_playOk = true;
-        g_playName = g_play.playback.name;
+    {
+        std::lock_guard<std::mutex> lk(g_devMx);
+        ma_device_config pc = ma_device_config_init(ma_device_type_playback);
+        pc.playback.format    = ma_format_s16;
+        pc.playback.channels  = 1;
+        pc.playback.pDeviceID = (ma_device_id*)findDevice(g_playDevs, g_wantOut);
+        pc.sampleRate         = kSampleRate;
+        pc.periodSizeInFrames = kFrameSamples;
+        pc.dataCallback       = playbackCb;
+        if (ma_device_init(&g_ctx, &pc, &g_play) == MA_SUCCESS) {
+            if (ma_device_start(&g_play) == MA_SUCCESS) {
+                g_playOk = true;
+                std::lock_guard<std::mutex> nk(g_nameMx);
+                g_playName = g_play.playback.name;
+            } else {
+                ma_device_uninit(&g_play);
+            }
+        }
     }
-
-    ma_device_config cfg = ma_device_config_init(ma_device_type_capture);
-    cfg.capture.format    = ma_format_s16;
-    cfg.capture.channels  = 1;
-    cfg.capture.pDeviceID = (ma_device_id*)findDevice(g_capDevs, g_wantMic);
-    cfg.sampleRate        = kSampleRate;
-    cfg.periodSizeInFrames = kFrameSamples;
-    cfg.dataCallback      = captureCb;
-    if (ma_device_init(&g_ctx, &cfg, &g_cap) == MA_SUCCESS &&
-        ma_device_start(&g_cap) == MA_SUCCESS) {
-        g_capOk = true;
-        g_capName = g_cap.capture.name;
-    }
+    g_mic.store(g_capDevs.empty() ? MIC_NONE : MIC_CLOSED);
 
     if (!g_playOk) {
         if (err) *err = "could not open a playback device";
         g_status = "no speakers";
         return false;
     }
-    g_status = g_capOk ? ("OK  mic: " + g_capName) : "no microphone (receive only)";
+    g_status = "OK";
     return true;
+}
+
+// Start opening the microphone, if it is not open or opening already. Main
+// thread: the device list it reads belongs to the main thread.
+void requestMic() {
+    if (g_mode == Mode::NoDevices || !g_ctxOk) return;
+    const int st = g_mic.load();
+    if (st == MIC_OPEN || st == MIC_OPENING) return;
+    if (g_micOpener.joinable()) g_micOpener.join();   // a finished earlier attempt
+
+    // Somebody may have plugged one in since the list was made.
+    if (st == MIC_NONE || st == MIC_FAILED) refreshDevices();
+
+    bool          useDefault = true;
+    ma_device_id  id;
+    memset(&id, 0, sizeof(id));
+    if (const ma_device_id* p = findDevice(g_capDevs, g_wantMic)) { id = *p; useDefault = false; }
+
+    // The idle clock starts now, whoever asked: a microphone opened for any
+    // reason gets its full ten minutes before it is given back.
+    g_lastTx = std::chrono::steady_clock::now();
+    g_mic.store(MIC_OPENING);
+    g_micOpener = std::thread([useDefault, id]() mutable {
+        std::lock_guard<std::mutex> lk(g_devMx);
+        ma_device_config cfg = ma_device_config_init(ma_device_type_capture);
+        cfg.capture.format     = ma_format_s16;
+        cfg.capture.channels   = 1;
+        cfg.capture.pDeviceID  = useDefault ? nullptr : &id;
+        cfg.sampleRate         = kSampleRate;
+        cfg.periodSizeInFrames = kFrameSamples;
+        cfg.dataCallback       = captureCb;
+        if (ma_device_init(&g_ctx, &cfg, &g_cap) == MA_SUCCESS) {
+            if (ma_device_start(&g_cap) == MA_SUCCESS) {
+                {
+                    std::lock_guard<std::mutex> nk(g_nameMx);
+                    g_capName = g_cap.capture.name;
+                }
+                g_capOk.store(true);
+                g_mic.store(MIC_OPEN);
+                return;
+            }
+            ma_device_uninit(&g_cap);
+        }
+        g_mic.store(MIC_FAILED);
+    });
+}
+
+// Close the microphone now. Main thread. Waits for an opener that is still
+// at it, which is the only time this can take more than a moment.
+void closeMic() {
+    if (g_micOpener.joinable()) g_micOpener.join();
+    {
+        std::lock_guard<std::mutex> lk(g_devMx);
+        if (g_capOk.load()) { ma_device_uninit(&g_cap); g_capOk.store(false); }
+    }
+    {
+        std::lock_guard<std::mutex> nk(g_nameMx);
+        g_capName.clear();
+    }
+    g_capAccum.clear();      // the capture thread is gone; nothing else touches it
+    g_micLevel.store(0.f);
+    const int st = g_mic.load();
+    if (st != MIC_NONE) g_mic.store(g_capDevs.empty() ? MIC_NONE : MIC_CLOSED);
+}
+
+// What the window calls the microphone before it has been opened: the one the
+// pilot picked, or whichever the system says is the default.
+std::string wantedMicName() {
+    if (!g_wantMic.empty())
+        for (const auto& d : g_capDevs) if (d.name == g_wantMic) return d.name;
+    for (const auto& d : g_capDevs) if (d.isDefault) return d.name;
+    return g_capDevs.empty() ? std::string("default") : g_capDevs.front().name;
 }
 
 void captureCb(ma_device*, void*, const void* in, ma_uint32 n) {
@@ -565,6 +681,11 @@ void playbackCb(ma_device*, void* out, const void*, ma_uint32 n) {
 bool init(Mode mode, std::string* err) {
     shutdown();
     g_mode = mode;
+    g_micIdleS = 600.f;
+    if (const char* e = getenv("XRADIO_MIC_IDLE")) {
+        const float v = (float)atof(e);
+        if (v > 0.f) g_micIdleS = v;
+    }
 
     int e = 0;
     g_enc = opus_encoder_create(kSampleRate, 1, OPUS_APPLICATION_VOIP, &e);
@@ -624,25 +745,46 @@ bool reopenDevices(const std::string& micName, const std::string& outName,
     const bool wasTx = g_tx.load();
     g_tx.store(false);
 
-    if (g_capOk)  { ma_device_uninit(&g_cap);  g_capOk = false; }
-    if (g_playOk) { ma_device_uninit(&g_play); g_playOk = false; }
+    closeMic();
+    {
+        std::lock_guard<std::mutex> lk(g_devMx);
+        if (g_playOk) { ma_device_uninit(&g_play); g_playOk = false; }
+    }
 
     g_wantMic = micName;
     g_wantOut = outName;
     refreshDevices();
     const bool ok = openDevices(err);
 
+    // Picking a new microphone in the middle of a transmission should not
+    // cut the transmission off; otherwise it waits for the next PTT like
+    // any other.
     g_tx.store(wasTx);
+    if (wasTx) requestMic();
     return ok;
 }
 
-const std::string& currentMic()    { return g_capName; }
-const std::string& currentOutput() { return g_playName; }
+std::string currentMic() {
+    std::lock_guard<std::mutex> nk(g_nameMx);
+    return g_capName;
+}
+std::string currentOutput() {
+    std::lock_guard<std::mutex> nk(g_nameMx);
+    return g_playName;
+}
+
+void releaseMicrophone() {
+    if (g_mic.load() == MIC_OPEN || g_mic.load() == MIC_OPENING) closeMic();
+}
 
 void shutdown() {
     g_tx.store(false);
-    if (g_capOk)  { ma_device_uninit(&g_cap);  g_capOk = false; }
-    if (g_playOk) { ma_device_uninit(&g_play); g_playOk = false; }
+    closeMic();
+    g_mic.store(MIC_NONE);
+    {
+        std::lock_guard<std::mutex> lk(g_devMx);
+        if (g_playOk) { ma_device_uninit(&g_play); g_playOk = false; }
+    }
     if (g_ctxOk)  { ma_context_uninit(&g_ctx); g_ctxOk = false; }
     if (g_enc)    { opus_encoder_destroy(g_enc); g_enc = nullptr; }
     std::lock_guard<std::mutex> lk(g_mx);
@@ -656,11 +798,17 @@ void shutdown() {
 }
 
 bool available()      { return g_enc != nullptr && (g_playOk || g_mode == Mode::NoDevices); }
-bool haveMicrophone() { return g_capOk; }
+bool haveMicrophone() {
+    const int st = g_mic.load();
+    return st == MIC_CLOSED || st == MIC_OPENING || st == MIC_OPEN;
+}
 
 void setTransmitting(bool on) {
-    if (on && !g_tx.load() && g_enc) opus_encoder_ctl(g_enc, OPUS_RESET_STATE);
+    const bool rising = on && !g_tx.load();
+    if (rising && g_enc) opus_encoder_ctl(g_enc, OPUS_RESET_STATE);
     g_tx.store(on);
+    g_lastTx = std::chrono::steady_clock::now();
+    if (rising) requestMic();
     if (!on) g_micLevel.store(0.f);
 }
 bool transmitting() { return g_tx.load(); }
@@ -701,6 +849,18 @@ void pollOutgoing(std::vector<OutFrame>& out) {
 
 void tick() {
     const auto now = std::chrono::steady_clock::now();
+
+    // Ten minutes without a transmission and the microphone goes back to the
+    // pilot -- a headset gets its music profile back, the in-use indicator
+    // goes out. The next PTT opens it again. Done before g_mx is taken:
+    // closing waits for the capture callback, which takes g_mx itself.
+    if (g_tx.load()) {
+        g_lastTx = now;
+    } else if (g_mic.load() == MIC_OPEN &&
+               std::chrono::duration<float>(now - g_lastTx).count() > g_micIdleS) {
+        closeMic();
+    }
+
     std::lock_guard<std::mutex> lk(g_mx);
     for (auto it = g_quality.begin(); it != g_quality.end();) {
         if (std::chrono::duration<float>(now - it->second.at).count() > 10.f) {
@@ -764,7 +924,19 @@ uint32_t speakerFreq(uint32_t sid) {
     return it == g_speakers.end() ? 0u : it->second->freqKhz;
 }
 
-std::string status() { return g_status; }
+std::string status() {
+    if (g_mode == Mode::NoDevices || !g_playOk) return g_status;
+    switch (g_mic.load()) {
+        case MIC_OPEN: {
+            std::lock_guard<std::mutex> nk(g_nameMx);
+            return "OK  mic: " + g_capName;
+        }
+        case MIC_OPENING: return "OK  mic: " + wantedMicName() + " (opening...)";
+        case MIC_CLOSED:  return "OK  mic: " + wantedMicName() + " (opens when you talk)";
+        case MIC_FAILED:  return "microphone would not open (receive only)";
+        default:          return "no microphone (receive only)";
+    }
+}
 
 Stats stats() {
     Stats s;

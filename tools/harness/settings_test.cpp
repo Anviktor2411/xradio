@@ -575,6 +575,57 @@ int main() {
                   saved.acIcao == "C17229", saved.acIcao);
         }
 
+        // ---- no label may reach the column its own value is drawn in ----
+        // A label wider than kValueX used to be drawn straight through the
+        // value beside it: "Radio sound (limiter, squelch, filter)[x] on",
+        // which reads as a rendering fault rather than as text that did not
+        // fit. Checked on every tab, because the longest labels move around
+        // as settings are added.
+        {
+            harness::menu(1);
+            int top = 0, left = 0;
+            harness::windowTop(kWin, &top, &left);
+            int overlaps = 0, cutShort = 0;
+            std::string worst, shortened;
+            for (int tab = 0; tab < xr::kNumTabs; ++tab) {
+                draw();
+                int tx = 0, ty = 0;
+                if (harness::drawnAt(xr::tabName(tab), &tx, &ty))
+                    harness::click(kWin, tx + 10, ty);
+                draw();
+
+                // Pair each value with the label on its row: a plain text
+                // line has no value beside it and is allowed to be long.
+                const auto& drawn = harness::drawnPositions();
+                for (const auto& v : drawn) {
+                    if (v.x != left + kValueX) continue;
+                    for (const auto& l : drawn) {
+                        if (l.y != v.y || l.x != left + 10) continue;
+                        const int endX = l.x + 7 * (int)l.text.size();
+                        if (endX > left + kValueX) {
+                            ++overlaps;
+                            worst = l.text;
+                        }
+                        // The clipping above means an overlap can no longer
+                        // happen, so on its own it would pass however narrow
+                        // the column got -- by quietly truncating every
+                        // label. This is the half that notices.
+                        if (l.text.size() > 2 &&
+                            l.text.compare(l.text.size() - 2, 2, "..") == 0) {
+                            ++cutShort;
+                            shortened = l.text;
+                        }
+                    }
+                }
+            }
+            check("no label is drawn over its own value", overlaps == 0,
+                  std::to_string(overlaps) + " overlap, e.g. \"" + worst + "\"");
+            check("and none has to be cut short to manage it", cutShort == 0,
+                  std::to_string(cutShort) + " truncated, e.g. \"" + shortened +
+                  "\" -- widen Ctx::kValueX or shorten the label");
+            harness::menu(1);
+        }
+
         XPluginDisable();
         XPluginStop();
     }
