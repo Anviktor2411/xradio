@@ -1,10 +1,15 @@
 # XRadio
 
-A multiplayer and radio plugin for X-Plane 12. Pilots see each other in the sky
-as real aircraft (CSL models) and talk to each other by voice on the COM
-frequencies they have tuned, push-to-talk, like the real thing.
+A multiplayer and radio plugin for X-Plane 12 and X-Plane 11. Pilots see each
+other in the sky as real aircraft (CSL models) and talk to each other by voice
+on the COM frequencies they have tuned, push-to-talk, like the real thing.
 
-Supported: **Windows, macOS (Intel + Apple Silicon), Linux**.
+Supported: **Windows, macOS (Intel + Apple Silicon), Linux**, on **X-Plane 12**
+and **X-Plane 11.50 or later**. On X-Plane 11 everything works the same way
+except shared weather, which needs the region weather datarefs that only
+X-Plane 12 has; pilots on 11 fly their own sky and are told so in Log.txt.
+A sim older than 11.30 has 25 kHz radios rather than 8.33 kHz ones, and the
+plugin reads those instead.
 
 ## Flying together
 
@@ -123,7 +128,10 @@ cd server
 python3 server.py --host 0.0.0.0 --port 49100 -v
 ```
 
-No dependencies beyond Python 3.10+. Open **UDP** port 49100 — in the
+Add `--dashboard` for a live picture of the flight in the terminal -- who is
+in, where, what they have tuned, who is talking -- instead of a log; `--log
+FILE` keeps the log as well. No dependencies beyond Python 3.10+. Open
+**UDP** port 49100 — in the
 machine's firewall *and* in the provider's, which is where most of the wasted
 evenings happen. A systemd unit is provided in `server/xradio.service`.
 
@@ -237,6 +245,16 @@ python3 server/server.py --port 49400 &
 python3 tools/fake_client.py --port 49400 --callsign PEER01 --lat 57.86 --lon 27.03 --talk --parrot &
 ./build-tests/plugin_harness 127.0.0.1 49400 CIRUN
 ```
+
+The same build runs on Windows with Visual Studio's compiler: from an *x64
+Native Tools* prompt add `-G Ninja` to the configure line and run the
+executables with `.exe`. Two things differ there. The stub SDK has no XPLM
+import library, so a test build on Windows leaves the `.xpl` itself out and
+says so when configuring. And Windows runs its own SSDP service on UDP 1900,
+so the UPnP tests need the fake router and the client to meet elsewhere:
+`python tools/harness/fake_igd.py --mode ok --ssdp-port 11900`, with
+`XRADIO_SSDP_PORT=11900` set alongside `XRADIO_UPNP_GATEWAY=127.0.0.1` when
+running `upnp_test`.
 
 The harness keys the PTT for two seconds; `--parrot` makes the peer send every
 voice frame it hears straight back, so the run proves the whole loop —
@@ -519,8 +537,11 @@ rather than letting it fly with half the behaviour.
 
 ## Configuration
 
-Easiest way: **Plugins → XRadio → Settings...** in the sim. The window has
-three tabs; click a field and type, click a toggle to flip it, click anywhere
+Easiest way: the **Settings** button at the top of the XRadio window, or
+**Plugins → XRadio → Settings...** in the sim. The same row of buttons has
+*Reconnect* and *Hide*, and while hosting a *Copy address* button that puts
+the address friends type on the clipboard. The settings window has four
+tabs; click a field and type, click a toggle to flip it, click anywhere
 on a slider's bar to set it, click the `< >` arrows to step through the audio
 devices. Tab moves to the next field, Enter saves, Escape or Cancel backs out
 without changing anything. Saving writes the config file and applies
@@ -737,16 +758,23 @@ do not reuse it for anything sensitive.
 
 ## Roadmap
 
-1. **Finding each other without swapping addresses** — a small list of public
-   servers, or a code you can read out over the phone instead of an IP.
-2. **Radio effects** — signal fading towards the edge of range, a "blocked"
-   squeal when two people transmit at once.
-3. **Text chat input field** in the window (receive-only for now).
-4. **Key binding from the settings window** — the PTT is bound through
-   X-Plane's own keyboard settings for now.
-5. **Bandwidth** — traffic is relayed at 10 Hz to every client in range;
+1. **A list of public servers**, so pilots who do not know each other can
+   find a flight without swapping addresses. (Join codes already cover the
+   swapping part.)
+2. **Bandwidth** — traffic is relayed at 10 Hz to every client in range;
    scaling past a couple of dozen pilots wants per-client rate limiting by
    distance.
+3. **Slats, spoilers and reversers on the wire** — the models follow the
+   flaps for now.
+
+## Contributing
+
+Pull requests are welcome. **[docs/hacking.md](docs/hacking.md)** is the map:
+what lives where, which thread touches what, how the wire protocol is kept in
+step between the plugin and the server, how a setting or a packet type is
+added, and how the tests work. The one rule that matters more than any other:
+a change to one relay server is a change to both, and the parity test will
+hold you to it.
 
 ## License
 

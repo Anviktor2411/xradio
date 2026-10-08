@@ -46,6 +46,16 @@ void addMonitor(int l, int t, int r, int b);
 
 bool drawnContains(const std::vector<std::string>& lines, const std::string& needle);
 
+// Where the fake X-Plane keeps its files: /tmp/xradio-harness on POSIX, the
+// user's temp folder on Windows, always with forward slashes. The stub's
+// prefs path lives in it, so this is also where the plugin writes its config.
+// The tests used to spell "/tmp/..." out and shell out to `mkdir -p`, which
+// does not exist on Windows.
+std::string tempDir();
+std::string cfgPath();                    // <tempDir()>/xradio.cfg
+bool        ensureTempDir();              // create it; false if that fails
+void        setEnv(const char* name, const char* value);   // setenv / _putenv_s
+
 // Position of a line from the most recent draw()/drawWindow() call.
 bool drawnAt(const std::string& needle, int* x, int* y);
 const std::vector<Drawn>& drawnPositions();

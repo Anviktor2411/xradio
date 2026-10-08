@@ -97,11 +97,20 @@ function(xradio_configure_target tgt)
         "${XPLANE_SDK}/CHeaders/XPLM"
         "${XPLANE_SDK}/CHeaders/Widgets"
         plugin/src)
-    # SDK feature levels. XPLM400 == X-Plane 12 APIs.
+    # SDK feature level. XPLM303 is X-Plane 11.50, the oldest sim XPMP2 runs
+    # in, and deliberately not XPLM400: with the X-Plane 12 APIs left out of
+    # the headers, nothing can creep in that would stop the plugin loading in
+    # X-Plane 11. Everything XRadio needs from the sim is in 11.50.
     target_compile_definitions(${tgt} PRIVATE
-        XPLM200=1 XPLM210=1 XPLM300=1 XPLM301=1 XPLM303=1 XPLM400=1)
+        XPLM200=1 XPLM210=1 XPLM300=1 XPLM301=1 XPLM303=1)
     if(WIN32)
         target_compile_definitions(${tgt} PRIVATE IBM=1 _CRT_SECURE_NO_WARNINGS NOMINMAX)
+        # Everything that compiles the plugin sources needs these, the test
+        # executables included -- they used to be linked into the .xpl only,
+        # so every test failed to link on Windows. winsock and iphlpapi for
+        # net.cpp and upnp.cpp, winhttp for the update check, user32 for the
+        # clipboard.
+        target_link_libraries(${tgt} PRIVATE wsock32 ws2_32 iphlpapi winhttp user32)
     elseif(APPLE)
         target_compile_definitions(${tgt} PRIVATE APL=1)
     else()
@@ -126,6 +135,23 @@ function(xradio_configure_target tgt)
 endfunction()
 
 # --- the plugin -------------------------------------------------------------
+# Windows links the plugin against the XPLM import library, which the stub SDK
+# the tests build against (tools/fake_sdk) does not have: it is headers only,
+# and the tests get their XPLM from tools/harness/xplm_stub.cpp instead. So a
+# test build on Windows leaves the .xpl out rather than refusing to configure.
+set(XR_BUILD_PLUGIN ON)
+if(WIN32 AND NOT EXISTS "${XPLANE_SDK}/Libraries/Win")
+    if(NOT XRADIO_BUILD_TESTS)
+        message(FATAL_ERROR
+            "No XPLM import library under '${XPLANE_SDK}/Libraries/Win'.\n"
+            "Run tools/fetch_deps.ps1, or configure with "
+            "-DXPLANE_SDK=<path to the SDK folder>.")
+    endif()
+    message(STATUS "XRadio: '${XPLANE_SDK}' has no Libraries/Win -- building the tests only")
+    set(XR_BUILD_PLUGIN OFF)
+endif()
+
+if(XR_BUILD_PLUGIN)
 add_library(XRadio SHARED ${XR_PLUGIN_SOURCES})
 xradio_configure_target(XRadio)
 
@@ -143,10 +169,8 @@ set_target_properties(XRadio PROPERTIES
 if(WIN32)
     find_library(XPLM_LIBRARY NAMES XPLM_64.lib XPLM
                  PATHS "${XPLANE_SDK}/Libraries/Win" REQUIRED)
-    # winhttp: the update check, which uses the HTTP stack Windows already has
-    # user32: the clipboard, for the "copy the join code" button
-    target_link_libraries(XRadio PRIVATE ${XPLM_LIBRARY} wsock32 ws2_32 iphlpapi
-                                         winhttp user32)
+    # The Windows system libraries come from xradio_configure_target.
+    target_link_libraries(XRadio PRIVATE ${XPLM_LIBRARY})
     set(XR_PLATDIR "win_x64")
 
 elseif(APPLE)
@@ -200,6 +224,7 @@ if(XRADIO_USE_XPMP2)
 endif()
 
 message(STATUS "XRadio -> ${XR_OUTDIR}  (XPMP2: ${XRADIO_USE_XPMP2}, voice: ${XRADIO_USE_VOICE})")
+endif()   # XR_BUILD_PLUGIN
 
 # --- tests ------------------------------------------------------------------
 # The real plugin code linked against a stub X-Plane (tools/fake_sdk) so it can
@@ -251,6 +276,7 @@ if(XRADIO_BUILD_TESTS)
     target_include_directories(clipboard_test PRIVATE plugin/src)
     if(WIN32)
         target_link_libraries(clipboard_test PRIVATE user32)
+        target_compile_definitions(clipboard_test PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
     endif()
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(clipboard_test PRIVATE -g -O1 -fsanitize=address,undefined)
@@ -262,9 +288,15 @@ if(XRADIO_BUILD_TESTS)
     target_link_libraries(update_test PRIVATE Threads::Threads)
     if(WIN32)
         target_link_libraries(update_test PRIVATE winhttp)
+        target_compile_definitions(update_test PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
     endif()
     target_include_directories(upnp_test PRIVATE plugin/src)
     target_link_libraries(upnp_test PRIVATE Threads::Threads)
+    if(WIN32)
+        # net.cpp needs winsock, upnp.cpp the routing table from iphlpapi.
+        target_link_libraries(upnp_test PRIVATE wsock32 ws2_32 iphlpapi)
+        target_compile_definitions(upnp_test PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    endif()
     if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(upnp_test PRIVATE -g -O1 -fsanitize=address,undefined)
         target_link_options(upnp_test    PRIVATE -fsanitize=address,undefined)

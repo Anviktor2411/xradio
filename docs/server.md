@@ -148,8 +148,31 @@ python3 /opt/xradio/server/server.py --host 0.0.0.0 --port 49100 -v
 | `--port 49100` | the UDP port. Any port works; this is the default pilots expect |
 | `--password word` | pilots must give this to join. See [below](#5-set-a-password) |
 | `-v` | log every packet type. Useful now, noisy later |
+| `--dashboard` | a live picture of the flight in this terminal instead of a log: who is in, where they are, what they have tuned, who is talking, packets per second. `--log FILE` keeps the log as well |
 
 All three can come from the environment instead — `XRADIO_HOST`, `XRADIO_PORT`, `XRADIO_PASSWORD` — which is how systemd and background services parse configurations.
+
+`--dashboard` is for the evening you are running the server yourself and want
+to see the flight rather than read about it. It redraws once a second and
+needs nothing installed:
+
+```
+XRadio relay server  ·  port 49100  ·  up 12m 03s  ·  no password
+pilots 2  ·  packets in 10/s, out 21/s  ·  sky from ESNA12
+
+callsign type  position              alt ft   kt  COM1    COM2    xpdr  radio seen
+ESNA12   C172  57.8500N 27.0251E       3000  110  122.800 -       1200  keyed    0s
+ESNB34   A20N  57.8798N 27.0470E       3000  110  122.800 -       1200           0s
+
+recent:
+  13:09:40  login: ESNA12 (C172) sid=1 from ('81.90.144.12', 61933)
+  13:09:45  text ESNA12 on 122.800: radio check
+
+Ctrl-C stops the server
+```
+
+Under systemd there is no terminal to draw on, so leave it off there and read
+the journal instead.
 
 #### Running Precompiled Standalone Binaries (No Python Required):
 

@@ -4,6 +4,7 @@
 // a pilot would experience it: switch it on in the settings window, then see
 // whether someone else can actually get in.
 #include "harness.h"
+#include "net.h"
 #include "protocol.h"
 #include "settings.h"
 #include "ui.h"
@@ -47,7 +48,7 @@ static void check(const std::string& name, bool ok, const std::string& detail = 
     if (!ok) ++failures;
 }
 
-static const char* kCfgPath = "/tmp/xradio-harness/xradio.cfg";
+static const std::string kCfgPath = harness::cfgPath();
 static constexpr int kWin = 2;              // the settings window
 static uint16_t      g_port = 49610;
 
@@ -80,7 +81,15 @@ public:
     Peer(const char* callsign, double lat, double lon)
         : callsign_(callsign), lat_(lat), lon_(lon) {
         fd_ = (int)socket(AF_INET, SOCK_DGRAM, 0);
+        // Windows wants the timeout as a DWORD of milliseconds. Handed a
+        // timeval it reads the first four bytes -- tv_sec, 0 -- as "no
+        // timeout", and a peer waiting on a server that has stopped then
+        // waits for ever.
+#ifdef _WIN32
+        DWORD tv = 200;
+#else
         timeval tv{0, 200 * 1000};
+#endif
         setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
         memset(&dst_, 0, sizeof(dst_));
         dst_.sin_family = AF_INET;
@@ -311,7 +320,11 @@ class FakeServer {
 public:
     explicit FakeServer(uint16_t port) {
         fd_ = (int)socket(AF_INET, SOCK_DGRAM, 0);
+#ifdef _WIN32
+        DWORD tv = 100;                 // milliseconds; see Peer
+#else
         timeval tv{0, 100 * 1000};
+#endif
         setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, (const char*)&tv, sizeof(tv));
         sockaddr_in me{};
         me.sin_family = AF_INET;
@@ -439,9 +452,14 @@ static void turnHostingOn() {
 
 int main(int argc, char** argv) {
     if (argc > 1) g_port = (uint16_t)atoi(argv[1]);
-    if (system("mkdir -p /tmp/xradio-harness") != 0) return 1;
-    setenv("XRADIO_NOTICE_HOLD", "1", 1);   // see the notice section below
-    setenv("XRADIO_MIC_IDLE", "2", 1);      // and the microphone section
+    if (!harness::ensureTempDir()) return 1;
+    harness::setEnv("XRADIO_NOTICE_HOLD", "1");   // see the notice section below
+    harness::setEnv("XRADIO_MIC_IDLE", "2");      // and the microphone section
+    // The one section that asks the router asks a loopback port nothing is
+    // listening on, so it gets "no router answered" in a few seconds rather
+    // than talking to whatever gateway this machine really has.
+    harness::setEnv("XRADIO_UPNP_GATEWAY", "127.0.0.1");
+    harness::setEnv("XRADIO_SSDP_PORT", "11901");
 
     // Start from a config that hosts on our test port but is switched off,
     // so the test can turn it on through the window and watch what happens.
@@ -494,6 +512,31 @@ int main(int argc, char** argv) {
         check("not hosting yet", !shows(w, "Hosting  \xc2\xb7"));
         check("and not connected to anything either",
               !shows(w, "connected to") || shows(w, "socket error"));
+    }
+
+    printf("\nthe window's own buttons\n");
+    {
+        // Settings, Reconnect and Hide used to live only in the Plugins menu,
+        // three clicks away from a window that is right there.
+        auto w = harness::draw();
+        check("the window offers Settings, Reconnect and Hide",
+              shows(w, "[ Settings ]") && shows(w, "[ Reconnect ]") && shows(w, "[ Hide ]"));
+        check("but not Copy address: there is nothing to copy yet",
+              !shows(w, "[ Copy address ]"));
+        int bx = 0, by = 0;
+        check("the Settings button was drawn", harness::drawnAt("[ Settings ]", &bx, &by));
+        harness::click(1, bx + 10, by);
+        check("clicking it opens the settings window", harness::windowVisible(kWin));
+        harness::pressVk(kWin, 0x1B);
+        drawSettings();
+        check("and Escape closes it again", !harness::windowVisible(kWin));
+
+        harness::draw();
+        check("the Hide button was drawn", harness::drawnAt("[ Hide ]", &bx, &by));
+        harness::click(1, bx + 10, by);
+        check("clicking it closes the window", !harness::windowVisible(1));
+        harness::menu(0);                        // Plugins > XRadio > Show/hide
+        check("and the menu brings it back", harness::windowVisible(1));
     }
 
     printf("\nthe microphone is only held while it is being used\n");
@@ -566,6 +609,10 @@ int main(int argc, char** argv) {
         auto w = harness::draw();
         check("the main window says it is hosting", shows(w, "Hosting"));
         check("our own client connected to it", shows(w, "connected to 127.0.0.1"));
+        // The address is only worth a button when there is one: a machine
+        // with no route out says "<this computer>", which is a sentence.
+        if (!xr::localAddress().empty())
+            check("and offers to copy the address for friends", shows(w, "[ Copy address ]"));
         if (failures) dump(w);
     }
 
@@ -737,10 +784,10 @@ int main(int argc, char** argv) {
         // A message to @CALLSIGN reaches a pilot anywhere in the flight, so
         // typing "@" lists everyone in it -- from the server's roster, not
         // the traffic list, which stops at 80 nm. Never ourselves.
-        Peer near("ATNEAR", 57.857, 27.027);
-        Peer far("ATFAR9", 59.94, 30.31);           // St Petersburg, ~190 nm away
-        check("two more pilots join", near.login() && far.login());
-        for (int i = 0; i < 8; ++i) { near.position(); far.position(); peer.position(); fly(0.1); }
+        Peer nearby("ATNEAR", 57.857, 27.027);
+        Peer faraway("ATFAR9", 59.94, 30.31);           // St Petersburg, ~190 nm away
+        check("two more pilots join", nearby.login() && faraway.login());
+        for (int i = 0; i < 8; ++i) { nearby.position(); faraway.position(); peer.position(); fly(0.1); }
         fly(0.4);
 
         auto lineWith = [](const std::vector<std::string>& w, const std::string& s) {
@@ -787,11 +834,11 @@ int main(int argc, char** argv) {
         check("and the list goes away", !shows(w, "Tab or Enter picks"));
         harness::typeText(1, "hello from afar");
         harness::pressVk(1, 0x0D);
-        for (int i = 0; i < 6; ++i) { near.position(); far.position(); peer.position(); fly(0.1); }
-        far.drain(400);
+        for (int i = 0; i < 6; ++i) { nearby.position(); faraway.position(); peer.position(); fly(0.1); }
+        faraway.drain(400);
         check("the message reaches a pilot the traffic list never showed",
-              far.lastText.body == "hello from afar" && far.lastText.to == "ATFAR9",
-              far.lastText.to + ": " + far.lastText.body);
+              faraway.lastText.body == "hello from afar" && faraway.lastText.to == "ATFAR9",
+              faraway.lastText.to + ": " + faraway.lastText.body);
 
         // The arrows move the highlight, and Enter takes it rather than
         // sending a callsign with nothing after it.
@@ -824,15 +871,15 @@ int main(int argc, char** argv) {
         harness::pressVk(1, 0x1B);
 
         // A pilot who leaves drops off the list.
-        near.logout();
-        for (int i = 0; i < 6; ++i) { far.position(); peer.position(); fly(0.1); }
+        nearby.logout();
+        for (int i = 0; i < 6; ++i) { faraway.position(); peer.position(); fly(0.1); }
         harness::click(1, sx + 40, sy);
         harness::typeText(1, "@");
         w = harness::draw();
         check("a pilot who logged out is gone from it", !shows(w, "@ATNEAR") && shows(w, "@ATFAR9"));
         if (shows(w, "@ATNEAR")) dump(w);
         harness::pressVk(1, 0x1B);
-        far.logout();
+        faraway.logout();
         fly(0.3);
     }
 
@@ -1509,6 +1556,75 @@ int main(int argc, char** argv) {
                                              wrong.rejectedWith() == xr::RJ_PASSWORD);
         Peer friendly("FRIEND2", 57.86, 27.03);
         check("the right password gets in", friendly.login("cumulus"));
+    }
+
+    printf("\nthe router box can change without the server restarting\n");
+    {
+        // "Ask the router to open it" used to restart the relay along with
+        // everything else on the Hosting tab, which threw every connected
+        // pilot off for the 12 s it takes them to notice and log in again.
+        // The router is a separate question from the server.
+        Peer steady("STEADY", 57.86, 27.03);
+        check("a pilot is flying along", steady.login("cumulus"));
+        for (int i = 0; i < 4; ++i) { steady.position(); fly(0.1); }
+        const int sidBefore = (int)steady.sid();
+
+        auto flipRouterBox = [&] {
+            harness::menu(1);
+            drawSettings();
+            int tx = 0, ty = 0, top = 0, left = 0;
+            harness::windowTop(kWin, &top, &left);
+            harness::drawnAt("Hosting", &tx, &ty);
+            harness::click(kWin, tx + 10, ty);
+            drawSettings();
+            int lx = 0, ly = 0;
+            if (!harness::drawnAt("Ask the router", &lx, &ly)) return false;
+            harness::click(kWin, left + xr::ui::Ctx::kValueX + 10, ly);
+            drawSettings();
+            drawSettings();                 // the tab may grow; see below
+            int bx = 0, by = 0;
+            harness::drawnAt("Save & apply", &bx, &by);
+            harness::click(kWin, bx + 20, by);
+            drawSettings();
+            return true;
+        };
+        check("the router toggle is on the Hosting tab", flipRouterBox());
+        {
+            xr::Settings saved;
+            xr::loadSettings(saved, kCfgPath);
+            check("and was saved as on", saved.hostUpnp);
+        }
+
+        // Through the change and after it, the pilot's traffic keeps coming
+        // on the session they already had: nothing restarted.
+        steady.drain(200);
+        int packets = 0;
+        for (int i = 0; i < 10; ++i) {
+            steady.position();
+            fly(0.1);
+            packets += steady.drain(50).traffic;
+        }
+        check("the other pilot's traffic never stopped", packets > 0,
+              std::to_string(packets) + " packets");
+        check("on the session they already had", (int)steady.sid() == sidBefore);
+        auto w = harness::draw();
+        check("and our own client was not thrown off either",
+              shows(w, "connected to 127.0.0.1") && !shows(w, "lost server"));
+        if (!shows(w, "connected to 127.0.0.1")) dump(w);
+
+        // Back off, the same way, so the sections after this find the
+        // configuration they expect -- and still without a restart.
+        check("switching it off again", flipRouterBox());
+        packets = 0;
+        for (int i = 0; i < 6; ++i) {
+            steady.position();
+            fly(0.1);
+            packets += steady.drain(50).traffic;
+        }
+        check("is just as quiet for everyone else", packets > 0 && (int)steady.sid() == sidBefore,
+              std::to_string(packets) + " packets");
+        steady.logout();
+        fly(0.3);
     }
 
     printf("\nswitching hosting off again\n");

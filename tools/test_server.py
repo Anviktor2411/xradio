@@ -318,6 +318,37 @@ def run():
     still = any(x.callsign == "ESOLD1" for x in srv.sessions.values())
     check("stale session is reaped", had and not still)
 
+    print("\nthe weather claim moves with a re-login")
+    # A host whose login ack was lost, or who logs in again after a network
+    # stall, logs in from the same address. The old session's claim on the
+    # sky used to survive that, naming a session that no longer existed, so
+    # nobody could share weather again for the rest of the flight.
+    src = Client("ESWXS1", 57.85, 27.02)
+    lst = Client("ESWXL1", 57.855, 27.025)
+
+    def claim():
+        src.sock.sendto(P.pack(P.PT_LOGIN, 0, P.LOGIN.pack(
+            P.pad("ESWXS1", 16), P.pad("C172", 8), P.PROTO_VERSION,
+            P.LF_WEATHER_SOURCE, P.pad("", 16), P.pad("", 32))), src.dest)
+        pkt = src.recv(P.PT_LOGIN_ACK)
+        src.sid = P.LOGIN_ACK.unpack_from(pkt, 0)[0] if pkt else 0
+        return src.sid
+
+    sky = P.WEATHER.pack(*([0, 43200.0, 180, 4.5, 99400.0, 7.0, 0.6, 0.0, 0.0, 3]
+                           + [0.0] * (4 * P.CLOUD_LAYERS + 7 * P.AIR_LAYERS)))
+    first = claim()
+    lst.login()
+    src.sock.sendto(P.pack(P.PT_WEATHER, src.sid, sky), src.dest)
+    check("the source's sky is relayed", lst.recv(P.PT_WEATHER) is not None)
+    second = claim()
+    check("logging in again gives a new session", first and second and second != first,
+          f"{first} -> {second}")
+    check("and the claim moved to it", srv._weather_sid == second,
+          f"claim held by {srv._weather_sid}, session is {second}")
+    src.sock.sendto(P.pack(P.PT_WEATHER, src.sid, sky), src.dest)
+    check("so the sky is still relayed", lst.recv(P.PT_WEATHER) is not None)
+    src.close(); lst.close()
+
     for c in (a, b, far, off, mid, stale, bad):
         c.close()
 

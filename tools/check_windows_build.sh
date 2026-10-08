@@ -31,7 +31,7 @@ fi
 
 FLAGS=(-std=c++17 -fsyntax-only -Wall -Wextra
        -DIBM=1 -DNOMINMAX -D_CRT_SECURE_NO_WARNINGS
-       -DXPLM200=1 -DXPLM210=1 -DXPLM300=1 -DXPLM301=1 -DXPLM303=1 -DXPLM400=1
+       -DXPLM200=1 -DXPLM210=1 -DXPLM300=1 -DXPLM301=1 -DXPLM303=1
        -Iplugin/src "-I$SDK/CHeaders/XPLM" "-I$SDK/CHeaders/Widgets")
 
 # Voice needs Opus and miniaudio; skip it rather than fail if they are absent.

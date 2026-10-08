@@ -8,13 +8,17 @@ A single asyncio UDP endpoint that:
     and is within VHF line-of-sight range.
 
 Run:  python3 server.py --host 0.0.0.0 --port 49100
+      python3 server.py --port 49100 --dashboard      # a live picture instead of a log
 """
 
 import argparse
 import asyncio
+import collections
 import logging
 import math
 import os
+import shutil
+import sys
 import time
 from dataclasses import dataclass, field
 
@@ -134,6 +138,10 @@ class XRadioServer(asyncio.DatagramProtocol):
         self.by_sid: dict[int, Session] = {}
         self._next_sid = 1
         self._t0 = time.monotonic()
+        # Everything that arrived and everything that went out, for the
+        # dashboard's packets-per-second line.
+        self.packets_in = 0
+        self.packets_out = 0
         # Whose sky everyone else flies in. The first pilot to claim it keeps
         # it until they leave; a second claimant would mean the weather
         # flickered between two sims.
@@ -149,6 +157,7 @@ class XRadioServer(asyncio.DatagramProtocol):
         LOG.info("listening on %s", transport.get_extra_info("sockname"))
 
     def datagram_received(self, data: bytes, addr: tuple):
+        self.packets_in += 1
         parsed = P.unpack_header(data)
         if parsed is None:
             return                      # not ours, or truncated -- ignore silently
@@ -169,6 +178,7 @@ class XRadioServer(asyncio.DatagramProtocol):
         LOG.debug("udp error: %s", exc)
 
     def _send(self, addr: tuple, ptype: int, sid: int, payload: bytes = b""):
+        self.packets_out += 1
         self.transport.sendto(P.pack(ptype, sid, payload), addr)
 
     def _now_ms(self) -> int:
@@ -220,9 +230,15 @@ class XRadioServer(asyncio.DatagramProtocol):
         ac_icao = _clean(P.cstr(icao_raw), 7)
         livery = _clean(P.cstr(livery_raw), 15)
 
-        old = self.sessions.pop(addr, None)
-        if old:
-            self.by_sid.pop(old.sid, None)
+        # A re-login from the same address replaces the old session, and
+        # everything that pointed at the old one lets go of it -- the weather
+        # claim above all. It used to survive here, naming a session that no
+        # longer existed, so a host whose login ack was lost, or who logged
+        # in again after a network stall, could never share the sky again
+        # and nor could anybody else.
+        old = self.sessions.get(addr)
+        if old is not None:
+            self._drop(old, "re-login")
 
         sid = self._next_sid
         self._next_sid += 1
@@ -484,6 +500,95 @@ class XRadioServer(asyncio.DatagramProtocol):
             self._send(me.addr, P.PT_TRAFFIC, me.sid, b"".join(parts))
 
 
+# --- the dashboard ----------------------------------------------------------
+class RecentEvents(logging.Handler):
+    """Keeps the last few log lines, for the dashboard to show under the table."""
+
+    def __init__(self, keep: int = 10):
+        super().__init__(level=logging.INFO)
+        self.lines: collections.deque = collections.deque(maxlen=keep)
+
+    def emit(self, record):
+        stamp = time.strftime("%H:%M:%S", time.localtime(record.created))
+        self.lines.append(f"{stamp}  {record.getMessage()}")
+
+
+class Dashboard:
+    """A live picture of the flight in the terminal, redrawn once a second.
+
+    What whoever runs the server wants to know while a flight is on: who is
+    in, where they are, what they have tuned, who is talking, and whether
+    packets are flowing -- without reading a log. Plain ANSI escapes, so it
+    needs nothing installed and works in any terminal, Windows 10's console
+    included.
+    """
+
+    def __init__(self, server: XRadioServer, port: int, recent: RecentEvents):
+        self.server, self.port, self.recent = server, port, recent
+        self.t0 = time.monotonic()
+        self.last_t = self.t0
+        self.last_in = self.last_out = 0
+        self.rate_in = self.rate_out = 0.0
+
+    async def run(self):
+        if os.name == "nt":
+            os.system("")                     # switches the console to ANSI escapes
+        sys.stdout.write("\x1b[?25l")         # hide the cursor
+        try:
+            while True:
+                self.draw()
+                await asyncio.sleep(1.0)
+        finally:
+            sys.stdout.write("\x1b[?25h\nserver stopped\n")
+            sys.stdout.flush()
+
+    @staticmethod
+    def _mhz(khz: int) -> str:
+        return f"{khz / 1000:.3f}" if khz else "-"
+
+    def draw(self):
+        s = self.server
+        now = time.monotonic()
+        dt = max(1e-3, now - self.last_t)
+        self.rate_in = (s.packets_in - self.last_in) / dt
+        self.rate_out = (s.packets_out - self.last_out) / dt
+        self.last_t, self.last_in, self.last_out = now, s.packets_in, s.packets_out
+
+        up = int(now - self.t0)
+        uptime = (f"{up // 3600}h {up % 3600 // 60:02d}m" if up >= 3600
+                  else f"{up // 60}m {up % 60:02d}s")
+        source = s.by_sid.get(s._weather_sid)
+        lines = [
+            f"XRadio relay server  ·  port {self.port}  ·  up {uptime}  ·  "
+            f"{'password required' if s.password else 'no password'}",
+            f"pilots {len(s.sessions)}  ·  packets in {self.rate_in:.0f}/s, out "
+            f"{self.rate_out:.0f}/s  ·  sky from {source.callsign if source else 'nobody yet'}",
+            "",
+            f"{'callsign':<9}{'type':<6}{'position':<22}{'alt ft':>7} {'kt':>4}  "
+            f"{'COM1':<8}{'COM2':<8}{'xpdr':<6}{'radio':<6}{'seen':>5}",
+        ]
+        for p in sorted(s.sessions.values(), key=lambda x: x.callsign):
+            if p.has_position:
+                pos = (f"{abs(p.lat):.4f}{'N' if p.lat >= 0 else 'S'} "
+                       f"{abs(p.lon):.4f}{'E' if p.lon >= 0 else 'W'}")
+            else:
+                pos = "-"
+            radio = ("voice" if now - p.last_voice < TX_HOLD_S
+                     else ("keyed" if p.tx_radio else ""))
+            lines.append(
+                f"{p.callsign:<9}{p.ac_icao:<6}{pos:<22}{p.alt_ft:>7.0f} "
+                f"{p.gs_ms * 1.94384:>4.0f}  {self._mhz(p.com1):<8}{self._mhz(p.com2):<8}"
+                f"{p.squawk:04d}  {radio:<6}{now - p.last_seen:>4.0f}s")
+        if not s.sessions:
+            lines.append("  nobody is connected")
+        lines += ["", "recent:"] + [f"  {line}" for line in self.recent.lines]
+        lines += ["", "Ctrl-C stops the server"]
+
+        width = shutil.get_terminal_size((100, 30)).columns
+        sys.stdout.write("\x1b[H\x1b[2J" + "\n".join(line[:width] for line in lines) + "\n")
+        sys.stdout.flush()
+
+
 async def main():
     ap = argparse.ArgumentParser(description="XRadio relay server")
     ap.add_argument("--host", default=os.environ.get("XRADIO_HOST", "0.0.0.0"))
@@ -491,12 +596,29 @@ async def main():
     ap.add_argument("--password", default=os.environ.get("XRADIO_PASSWORD", ""),
                     help="flight password pilots must give to join (default: none)")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--dashboard", action="store_true",
+                    help="show a live picture of the flight in this terminal instead of a log")
+    ap.add_argument("--log", metavar="FILE",
+                    help="with --dashboard, write the log to this file as well")
     args = ap.parse_args()
 
-    logging.basicConfig(
-        level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(message)s",
-    )
+    recent = None
+    if args.dashboard:
+        # The terminal belongs to the dashboard: the log goes to its "recent"
+        # list and, if asked, to a file, never to the screen.
+        LOG.setLevel(logging.DEBUG if args.verbose else logging.INFO)
+        LOG.propagate = False
+        recent = RecentEvents()
+        LOG.addHandler(recent)
+        if args.log:
+            fh = logging.FileHandler(args.log)
+            fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)-7s %(message)s"))
+            LOG.addHandler(fh)
+    else:
+        logging.basicConfig(
+            level=logging.DEBUG if args.verbose else logging.INFO,
+            format="%(asctime)s %(levelname)-7s %(message)s",
+        )
 
     loop = asyncio.get_running_loop()
     server = XRadioServer(password=args.password)
@@ -505,7 +627,11 @@ async def main():
     transport, _ = await loop.create_datagram_endpoint(
         lambda: server, local_addr=(args.host, args.port))
     try:
-        await server.run_traffic_loop()
+        if recent is not None:
+            await asyncio.gather(server.run_traffic_loop(),
+                                 Dashboard(server, args.port, recent).run())
+        else:
+            await server.run_traffic_loop()
     finally:
         transport.close()
 

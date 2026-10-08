@@ -108,6 +108,12 @@ class Client:
                 data, _ = self.sock.recvfrom(2048)
             except socket.timeout:
                 return None
+            except ConnectionResetError:
+                # Windows only: a datagram sent earlier was refused -- nothing
+                # was listening yet, which is exactly what the probe that
+                # waits for a server to come up sends into -- and the refusal
+                # is reported on the next read. Not an answer; keep waiting.
+                continue
             parsed = P.unpack_header(data)
             if parsed is None:
                 continue
@@ -129,6 +135,8 @@ class Client:
                 data, _ = self.sock.recvfrom(2048)
             except socket.timeout:
                 break
+            except ConnectionResetError:
+                continue                # see recv()
             parsed = P.unpack_header(data)
             if parsed is None:
                 continue
@@ -596,6 +604,19 @@ def scenario_weather(port):
     time.sleep(0.2)
     out["runt_relayed"] = len(other.drain(0.3)[P.PT_WEATHER]) > 0
 
+    # The source logs in again from the same address -- a lost login ack, or
+    # a client that logs in again after a network stall -- and must still be
+    # the source: the old session's claim has to go with the old session.
+    src.send(P.PT_LOGIN, P.LOGIN.pack(P.pad("ESWXA1", 16), P.pad("C172", 8),
+             P.PROTO_VERSION, P.LF_WEATHER_SOURCE, P.pad("", 16), P.pad("", 32)), sid=0)
+    ack = src.recv(P.PT_LOGIN_ACK)
+    new_sid = P.LOGIN_ACK.unpack_from(ack, 0)[0] if ack else 0
+    out["relogin_got_new_session"] = new_sid != 0 and new_sid != src.sid
+    src.sid = new_sid
+    src.send(P.PT_WEATHER, P.WEATHER.pack(*sky))
+    time.sleep(0.2)
+    out["relayed_after_relogin"] = len(other.drain(0.4)[P.PT_WEATHER]) > 0
+
     src.close(); other.close()
     return out
 
@@ -936,6 +957,9 @@ def main():
           str(r["intact"]))
     check("a pilot who did not claim it cannot set the weather", not r["stranger_relayed"])
     check("a truncated weather packet is dropped", not r["runt_relayed"])
+    check("logging in again gives the source a new session", r["relogin_got_new_session"])
+    check("and its sky is still relayed afterwards: the claim moved with it",
+          r["relayed_after_relogin"])
 
     r = cpp["login validation"]
     check("an old protocol version is refused", r["old_protocol_gets_no_ack"])

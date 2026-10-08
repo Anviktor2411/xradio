@@ -1,3 +1,9 @@
+// Other pilots as aircraft in the sim: the bridge to XPMP2, which loads the
+// CSL models and does the drawing, TCAS and map work. One XRAircraft per
+// remote session; its UpdatePosition() is called by XPMP2 every frame and
+// takes the pose from a Smoother, which interpolates in the sender's own
+// timeline. Built without XPMP2 (the tests), every function here is a stub
+// and other pilots exist only in the window's traffic list.
 #include "xpmp_bridge.h"
 #include "protocol.h"
 #include "mathconst.h"

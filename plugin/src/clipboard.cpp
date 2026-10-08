@@ -1,3 +1,9 @@
+// The clipboard, for the "Copy address" and "Copy join code" buttons.
+//
+// Three platforms, three mechanisms: the Win32 clipboard API, pbcopy on
+// macOS, and whichever of wl-copy / xclip / xsel a Linux desktop has. Only a
+// small alphabet is ever accepted (addresses, codes, frequencies), because
+// on two of the platforms the text passes through a shell.
 #include "clipboard.h"
 
 #include <cstdio>

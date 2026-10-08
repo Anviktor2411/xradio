@@ -1,3 +1,9 @@
+// The update check: one request to GitHub's releases endpoint, on a thread
+// of its own, twenty seconds after startup. The answer -- "a newer version
+// exists" plus where to get it -- is shown in the main window; nothing is
+// downloaded or installed. Uses the HTTP stack the operating system already
+// has (WinHTTP, or curl on macOS and Linux) rather than carrying a TLS
+// library into the sim. XRADIO_UPDATE_URL points a test at a stand-in site.
 #include "update.h"
 
 #include <atomic>

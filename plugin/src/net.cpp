@@ -1,3 +1,8 @@
+// UDP sockets, once, for all three platforms: the client socket the plugin
+// talks to a server with, the bound socket the built-in server listens on,
+// and the two helpers everything else needs -- waiting on a descriptor, and
+// finding this machine's own address. Every Winsock/BSD difference lives in
+// this file so that nothing else has to know about it.
 #include "net.h"
 
 #include <cstdio>    // snprintf -- MSVC does not pull this in via <cstring>

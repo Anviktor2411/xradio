@@ -42,9 +42,10 @@ int main(int argc, char** argv) {
     // Start it pointed at the WRONG port on purpose: the settings window is
     // then the only thing that can make the connection succeed, so the
     // connect check below also proves the settings path works end to end.
-    if (system("mkdir -p /tmp/xradio-harness") != 0) return 1;
+    if (!harness::ensureTempDir()) return 1;
     const int wrongPort = atoi(port) + 1;
-    FILE* f = fopen("/tmp/xradio-harness/xradio.cfg", "w");
+    FILE* f = fopen(harness::cfgPath().c_str(), "w");
+    if (!f) { fprintf(stderr, "cannot write %s\n", harness::cfgPath().c_str()); return 1; }
     fprintf(f, "host = %s\nport = %d\ncallsign = WRONG1\nactype = C172\n", host, wrongPort);
     fclose(f);
 
@@ -173,7 +174,7 @@ int main(int argc, char** argv) {
     }
     // The saved file must carry the corrected values, callsign upper-cased.
     {
-        FILE* cf = fopen("/tmp/xradio-harness/xradio.cfg", "r");
+        FILE* cf = fopen(harness::cfgPath().c_str(), "r");
         std::string all;
         char buf[256];
         while (cf && fgets(buf, sizeof(buf), cf)) all += buf;

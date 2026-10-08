@@ -32,7 +32,7 @@ static void check(const std::string& name, bool ok, const std::string& detail = 
     if (!ok) ++failures;
 }
 
-static const char* kCfgPath = "/tmp/xradio-harness/xradio.cfg";
+static const std::string kCfgPath = harness::cfgPath();
 
 // The settings window is the second window the plugin creates.
 static constexpr int kWin = 2;
@@ -64,8 +64,8 @@ static bool clickRow(const std::string& label, int xOffset) {
 static constexpr int kValueX = xr::ui::Ctx::kValueX;
 
 int main() {
-    if (system("mkdir -p /tmp/xradio-harness") != 0) return 1;
-    remove(kCfgPath);
+    if (!harness::ensureTempDir()) return 1;
+    remove(kCfgPath.c_str());
 
     printf("\nsettings model\n");
     {
@@ -236,7 +236,7 @@ int main() {
 
     printf("\nhand-edited nonsense is clamped or rejected\n");
     {
-        FILE* f = fopen(kCfgPath, "w");
+        FILE* f = fopen(kCfgPath.c_str(), "w");
         fprintf(f, "host = fly.example.net\nport = 49200\ncallsign = X\n"
                    "volume = 99\nhiss = -5\nreporthz = 1000\nsmoothms = 1\n"
                    "labeldist = 100000\nnot_a_key = 7\ngarbage line without equals\n");
@@ -259,7 +259,7 @@ int main() {
         check("empty callsign is rejected", xr::validate(s) == "Callsign cannot be empty");
         s.callsign = "OK";
         check("a valid set passes", xr::validate(s).empty());
-        check("a missing file is not a crash", !xr::loadSettings(s, "/tmp/xradio-harness/nope.cfg"));
+        check("a missing file is not a crash", !xr::loadSettings(s, harness::tempDir() + "/nope.cfg"));
     }
 
     printf("\nthe window itself\n");

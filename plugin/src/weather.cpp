@@ -1,3 +1,8 @@
+// Shared weather and time: reading the host's sky out of X-Plane 12's region
+// weather datarefs into a WeatherPayload, and writing somebody else's sky
+// back into them. Everything here is datarefs; the deciding of whose sky it
+// is happens on the server, and the sending in main.cpp. X-Plane 11 has no
+// region weather, so init() switches the whole feature off there.
 #include "weather.h"
 
 #include <cmath>
@@ -79,6 +84,16 @@ void init() {
     int missing = 0;
     g.zulu       = find("sim/time/zulu_time_sec", &missing);
     g.dateDays   = find("sim/time/local_date_days", &missing);
+
+    // The region weather is X-Plane 12's. X-Plane 11 has none of it, and
+    // that is one line in Log.txt, not twenty: every name below would be
+    // reported missing one by one otherwise, which reads like a fault.
+    if (!XPLMFindDataRef("sim/weather/region/sealevel_pressure_pas")) {
+        g_ready = false;
+        logMsg("no region weather datarefs (X-Plane 11): sky sharing is off, "
+               "everything else works as usual");
+        return;
+    }
 
     g.visibility  = find("sim/weather/region/visibility_reported_sm", &missing);
     g.pressure    = find("sim/weather/region/sealevel_pressure_pas", &missing);

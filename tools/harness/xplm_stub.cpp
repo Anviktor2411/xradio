@@ -18,12 +18,61 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
 #include <vector>
 
+#ifdef _WIN32
+#  include <direct.h>      // _mkdir
+#else
+#  include <sys/stat.h>    // mkdir
+#endif
+
 namespace harness {
+
+std::string tempDir() {
+    static const std::string dir = [] {
+#ifdef _WIN32
+        const char* t = getenv("TEMP");
+        if (!t || !*t) t = getenv("TMP");
+        std::string base = (t && *t) ? t : "C:/Temp";
+        for (auto& c : base) if (c == '\\') c = '/';
+        while (!base.empty() && base.back() == '/') base.pop_back();
+        return base + "/xradio-harness";
+#else
+        return std::string("/tmp/xradio-harness");
+#endif
+    }();
+    return dir;
+}
+
+std::string cfgPath() { return tempDir() + "/xradio.cfg"; }
+
+bool ensureTempDir() {
+    const std::string d = tempDir();
+#ifdef _WIN32
+    const int rc = _mkdir(d.c_str());
+#else
+    const int rc = mkdir(d.c_str(), 0755);
+#endif
+    if (rc == 0) return true;
+    // Already there is fine; anything else is not.
+    FILE* probe = fopen((d + "/.probe").c_str(), "w");
+    if (!probe) return false;
+    fclose(probe);
+    remove((d + "/.probe").c_str());
+    return true;
+}
+
+void setEnv(const char* name, const char* value) {
+#ifdef _WIN32
+    _putenv_s(name, value);
+#else
+    setenv(name, value, 1);
+#endif
+}
 
 // The ground, for the terrain probe. Sea level and a working probe unless a
 // test says otherwise.
@@ -363,7 +412,9 @@ void XPLMDebugString(const char* s) {
     }
 }
 
-void XPLMGetPrefsPath(char* out) { strcpy(out, "/tmp/xradio-harness/prefs.txt"); }
+void XPLMGetPrefsPath(char* out) {
+    snprintf(out, 1024, "%s/prefs.txt", harness::tempDir().c_str());
+}
 const char* XPLMGetDirectorySeparator(void) { return "/"; }
 
 void XPLMExtractFileAndPath(char* path) {
@@ -381,7 +432,8 @@ void XPLMUnregisterCommandHandler(XPLMCommandRef, XPLMCommandCallback_f, int, vo
 
 XPLMPluginID XPLMGetMyID(void) { return 1; }
 void XPLMGetPluginInfo(XPLMPluginID, char*, char* outFilePath, char*, char*) {
-    if (outFilePath) strcpy(outFilePath, "/tmp/xradio-harness/XRadio/lin_x64/lin.xpl");
+    if (outFilePath)
+        snprintf(outFilePath, 1024, "%s/XRadio/lin_x64/lin.xpl", harness::tempDir().c_str());
 }
 
 // ---------------------------------------------------------------------------

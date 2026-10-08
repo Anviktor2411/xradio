@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -306,20 +307,16 @@ std::vector<std::string> discover(int timeoutMs) {
     // Send from the interface that carries the internet route, not whatever
     // the OS picks as its multicast default. On a machine with virtual
     // adapters those are different interfaces and the router never hears us.
+    //
+    // IP_MULTICAST_IF alone does that. The socket itself is deliberately not
+    // bound to the address: bound, Windows refuses to let it talk to a
+    // loopback gateway at all (WSAEADDRNOTAVAIL -- the strong host model),
+    // which is where the test harness's fake router lives, and the unicast
+    // search needs no help with its source address anyway. Replies reach an
+    // unbound socket just the same.
     const std::string local = localAddress();
     in_addr localIn{};
     if (!local.empty() && inet_pton(AF_INET, local.c_str(), &localIn) == 1) {
-        sockaddr_in me{};
-        me.sin_family = AF_INET;
-        me.sin_addr   = localIn;
-        me.sin_port   = 0;
-        bind(
-#ifdef _WIN32
-            (SOCKET)f,
-#else
-            (int)f,
-#endif
-            (const sockaddr*)&me, sizeof(me));
         setsockopt(
 #ifdef _WIN32
             (SOCKET)f, IPPROTO_IP, IP_MULTICAST_IF, (const char*)&localIn, sizeof(localIn));
@@ -334,9 +331,17 @@ std::vector<std::string> discover(int timeoutMs) {
     setsockopt((int)f, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
 #endif
 
+    // Test seam, like XRADIO_UPNP_GATEWAY: Windows runs its own SSDP service
+    // on 1900, so a fake router on a developer's machine has to sit elsewhere.
+    uint16_t ssdpPort = 1900;
+    if (const char* forced = getenv("XRADIO_SSDP_PORT")) {
+        const int v = atoi(forced);
+        if (v > 0 && v < 65536) ssdpPort = (uint16_t)v;
+    }
+
     sockaddr_in mcast{};
     mcast.sin_family = AF_INET;
-    mcast.sin_port   = htons(1900);
+    mcast.sin_port   = htons(ssdpPort);
     mcast.sin_addr.s_addr = inet_addr("239.255.255.250");
 
     // Also straight at the gateway: a unicast M-SEARCH is answered by every
@@ -347,7 +352,7 @@ std::vector<std::string> discover(int timeoutMs) {
     const std::string gwAddr = gatewayAddress();
     if (!gwAddr.empty() && inet_pton(AF_INET, gwAddr.c_str(), &gw.sin_addr) == 1) {
         gw.sin_family = AF_INET;
-        gw.sin_port   = htons(1900);
+        gw.sin_port   = htons(ssdpPort);
         haveGw = true;
     }
 
@@ -592,11 +597,18 @@ Service           g_mappedVia;             // the service the mapping was made t
 std::chrono::steady_clock::time_point g_mappedAt;
 int               g_mappedLease = 0;       // seconds; 0 = permanent
 
-// A request that arrived while the worker was busy (the pilot changed the
-// port twice in quick succession, say). The worker picks it up when done
-// instead of the request being dropped.
-struct Pending { bool any = false; uint16_t port = 0; std::string desc; bool askRouter = true; };
-Pending           g_pending;
+// Work for the worker: map a port (or only look the address up), or give a
+// mapping back. One worker at a time, and a job that arrives while it is
+// busy -- the pilot changed the port twice in quick succession, or switched
+// hosting off and straight back on -- waits its turn and is run by the same
+// worker before it finishes. It used to be dropped if what was running was
+// a release, and a release arriving mid-request was dropped altogether,
+// which left the router forwarding to a server that had stopped.
+struct Job { bool release = false; uint16_t port = 0; std::string desc; bool askRouter = true; };
+std::deque<Job>   g_queue;                 // guarded by g_mx
+bool              g_workerAlive = false;   // guarded by g_mx
+uint16_t          g_wantPort = 0;          // guarded by g_mx: a port being asked for right now
+constexpr size_t  kMaxQueued = 8;
 
 void joinWorker() {
     if (g_worker.joinable()) g_worker.join();
@@ -777,35 +789,63 @@ void doRequest(uint16_t port, const std::string& desc, bool askRouter) {
     g_mappedPort  = r.mapped ? port : 0;
     g_mappedLease = r.mapped ? r.leaseSeconds : 0;
     g_mappedAt    = std::chrono::steady_clock::now();
+    if (g_wantPort == port) g_wantPort = 0;          // asked and answered
 }
 
-void requestAsync(uint16_t port, const std::string& description, bool askRouter) {
-    if (g_busy.exchange(true)) {
-        // Queue it; the running worker finishes with it.
-        std::lock_guard<std::mutex> lk(g_mx);
-        g_pending = {true, port, description, askRouter};
-        return;
+namespace {
+
+void doRelease(uint16_t port) {
+    removeMapping(port, 1500);
+    std::lock_guard<std::mutex> lk(g_mx);
+    if (g_mappedPort == port) g_mappedPort = 0;
+    g_mappedVia   = Service{};
+    g_mappedLease = 0;
+}
+
+// Runs jobs until the queue is empty, then lets the thread end; the next
+// job starts a new one.
+void workerLoop() {
+    for (;;) {
+        Job job;
+        {
+            std::lock_guard<std::mutex> lk(g_mx);
+            if (g_queue.empty() || g_abort.load()) {
+                g_queue.clear();
+                g_workerAlive = false;
+                g_busy.store(false);
+                return;
+            }
+            job = std::move(g_queue.front());
+            g_queue.pop_front();
+        }
+        if (job.release) doRelease(job.port);
+        else             doRequest(job.port, job.desc, job.askRouter);
     }
-    joinWorker();
+}
+
+void enqueue(Job job) {
+    bool start = false;
     {
         std::lock_guard<std::mutex> lk(g_mx);
-        g_latest = Result{};
-        g_pending = Pending{};
-    }
-    g_worker = std::thread([port, description, askRouter] {
-        doRequest(port, description, askRouter);
-        for (;;) {
-            Pending next;
-            {
-                std::lock_guard<std::mutex> lk(g_mx);
-                next = g_pending;
-                g_pending = Pending{};
-            }
-            if (!next.any || g_abort.load()) break;
-            doRequest(next.port, next.desc, next.askRouter);
+        if (!job.release && job.askRouter) g_wantPort = job.port;
+        if (g_queue.size() >= kMaxQueued) g_queue.pop_front();   // somebody clicking very fast
+        g_queue.push_back(std::move(job));
+        if (!g_workerAlive) {
+            g_workerAlive = true;
+            g_busy.store(true);
+            start = true;
         }
-        g_busy.store(false);
-    });
+    }
+    if (start) {
+        joinWorker();                        // the previous worker has finished
+        g_worker = std::thread(workerLoop);
+    }
+}
+
+}  // namespace
+
+void requestAsync(uint16_t port, const std::string& description, bool askRouter) {
+    enqueue(Job{false, port, description, askRouter});
 }
 
 // A router that only gave a timed lease needs asking again before it runs
@@ -828,21 +868,14 @@ void releaseAsync() {
     uint16_t port;
     {
         std::lock_guard<std::mutex> lk(g_mx);
-        port = g_mappedPort;
+        // What is mapped, or what a worker is still in the middle of mapping.
+        port = g_mappedPort ? g_mappedPort : g_wantPort;
         g_mappedPort = 0;
-        g_latest = Result{};
+        g_wantPort   = 0;
+        g_latest     = Result{};
     }
-    if (port == 0 || g_busy.exchange(true)) return;
-    joinWorker();
-    g_worker = std::thread([port] {
-        removeMapping(port, 1500);
-        {
-            std::lock_guard<std::mutex> lk(g_mx);
-            g_mappedVia = Service{};
-            g_mappedLease = 0;
-        }
-        g_busy.store(false);
-    });
+    if (port == 0) return;
+    enqueue(Job{true, port, "", false});
 }
 
 bool busy() { return g_busy.load(); }
@@ -866,6 +899,12 @@ void shutdown() {
     }
     g_abort.store(true);
     joinWorker();
+    {
+        std::lock_guard<std::mutex> lk(g_mx);
+        g_queue.clear();
+        g_workerAlive = false;
+        g_wantPort = 0;
+    }
     g_busy.store(false);
     g_abort.store(false);
 }

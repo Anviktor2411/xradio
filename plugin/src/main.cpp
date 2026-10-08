@@ -1,4 +1,4 @@
-// XRadio -- X-Plane 12 multiplayer + radio plugin.
+// XRadio -- multiplayer + radio plugin for X-Plane 11.50 and later, 12 included.
 //
 // Main thread (flight loop, 5 Hz): sends our position, drains the inbox of
 // non-voice packets, drives XPMP2 and the windows.
@@ -46,8 +46,13 @@
 #include <thread>
 #include <vector>
 
-#if !defined(XPLM300) || !defined(XPLM400)
-#  error "Build with -DXPLM200 -DXPLM210 -DXPLM300 -DXPLM301 -DXPLM400 for X-Plane 12"
+// X-Plane 11.50 is the floor: it is the first sim XPMP2 draws in, and every
+// API used here exists in it. The X-Plane 12 APIs (XPLM400) are deliberately
+// not enabled, so the plugin cannot grow a dependency on them by accident
+// and stop loading in X-Plane 11. What 12 adds -- the region weather that
+// sky sharing rides on -- is found by dataref at run time instead.
+#if !defined(XPLM303)
+#  error "Build with -DXPLM200 -DXPLM210 -DXPLM300 -DXPLM301 -DXPLM303 (X-Plane 11.50 or later)"
 #endif
 
 namespace {
@@ -118,6 +123,7 @@ struct Refs {
     XPLMDataRef lat, lon, elev, psi, theta, phi, gs, hpath, vh, yAgl;
     XPLMDataRef gear, flap, onGround;
     XPLMDataRef com1, com2, audioComSel, rxCom1, rxCom2, volCom1, volCom2;
+    XPLMDataRef com1Hz, com2Hz;         // the 25 kHz radios of a sim before 11.30
     XPLMDataRef ltNav, ltBeacon, ltStrobe, ltLanding, ltTaxi;
     XPLMDataRef avionicsOn, com1Power, com2Power, busVolts;
     XPLMDataRef xpdrMode, xpdrCode, xpdrIdent;
@@ -167,9 +173,19 @@ void findRefs() {
     g_ref.flap     = findRef("sim/cockpit2/controls/flap_ratio");
     g_ref.onGround = findRef("sim/flightmodel/failures/onground_any");
 
-    // 8.33 kHz variant reports the frequency in kHz, e.g. 118000 == 118.000 MHz
-    g_ref.com1        = findRef("sim/cockpit2/radios/actuators/com1_frequency_hz_833");
-    g_ref.com2        = findRef("sim/cockpit2/radios/actuators/com2_frequency_hz_833");
+    // The 8.33 kHz variant reports the frequency in kHz, e.g. 118000 ==
+    // 118.000 MHz. It arrived in X-Plane 11.30; a sim older than that only
+    // has the 25 kHz one, in units of 10 kHz (11880 == 118.800 MHz), which
+    // comKhz() scales. Tried quietly: one or the other is always there.
+    g_ref.com1        = firstRefOf({"sim/cockpit2/radios/actuators/com1_frequency_hz_833"});
+    g_ref.com2        = firstRefOf({"sim/cockpit2/radios/actuators/com2_frequency_hz_833"});
+    g_ref.com1Hz      = nullptr;
+    g_ref.com2Hz      = nullptr;
+    if (!g_ref.com1 || !g_ref.com2) {
+        g_ref.com1Hz  = findRef("sim/cockpit2/radios/actuators/com1_frequency_hz");
+        g_ref.com2Hz  = findRef("sim/cockpit2/radios/actuators/com2_frequency_hz");
+        logMsg("no 8.33 kHz radio datarefs (X-Plane before 11.30) -- using the 25 kHz ones");
+    }
     g_ref.audioComSel = findRef("sim/cockpit2/radios/actuators/audio_com_selection");
     g_ref.rxCom1      = findRef("sim/cockpit2/radios/actuators/audio_selection_com1");
     g_ref.rxCom2      = findRef("sim/cockpit2/radios/actuators/audio_selection_com2");
@@ -244,6 +260,18 @@ bool comPowered(int which) {
 }
 
 bool anyComPowered() { return comPowered(1) || comPowered(2); }
+
+// What COM1 or COM2 is tuned to, in kHz, from whichever dataref this sim has.
+uint32_t comKhz(int which) {
+    XPLMDataRef fine   = (which == 2) ? g_ref.com2   : g_ref.com1;
+    XPLMDataRef coarse = (which == 2) ? g_ref.com2Hz : g_ref.com1Hz;
+    if (fine)   return (uint32_t)id(fine);
+    if (coarse) return (uint32_t)id(coarse) * 10u;
+    return 0;
+}
+
+// The radio the audio panel has selected for transmit: 6 is COM1, 7 is COM2.
+int txCom() { return id(g_ref.audioComSel) == 7 ? 2 : 1; }
 
 // Our own transponder, as it would answer an interrogation.
 //
@@ -359,8 +387,11 @@ struct Remote {
 std::map<uint32_t, Remote> g_remote;
 int g_rejected = 0;   // traffic entries dropped as implausible
 
-// Defined with the hosting code further down; the main window needs it.
+// Defined with the hosting and settings code further down; the main window
+// needs them.
 std::string shareAddress();
+std::string shareAddressPlain();
+void openSettings();
 void reconnect();
 void setPtt(bool down);
 float g_lastWeatherSend = -1000.f;   // see sendWeather()
@@ -422,6 +453,16 @@ int                      g_atPick = 0;
 std::vector<int>         g_atRowsY;
 std::vector<std::string> g_atShown;
 constexpr int            kAtRows = 6;   // more than this and "keep typing"
+
+// The toolbar at the top of the main window: the things a pilot reaches for
+// most, as buttons, so none of them needs a trip to the Plugins menu. The
+// draw records where each one landed; the click handler tests against that,
+// the same way the @ list works.
+enum MainAction { kBtnSettings = 0, kBtnReconnect, kBtnHide, kBtnCopy };
+struct MainButton { int x0, x1, y; MainAction action; };
+std::vector<MainButton> g_mainButtons;
+float g_mainCopyAt = -100.f;            // when the Copy button was last pressed
+bool  g_mainCopyOk = false;             // ...and whether the clipboard took it
 
 XPLMWindowID     g_window       = nullptr;
 XPLMFlightLoopID g_loop         = nullptr;
@@ -548,8 +589,8 @@ void sendPosition() {
     p.flapRatio   = fd(g_ref.flap);
     // A dead radio is on no frequency at all, so the server does not route
     // anyone's voice to us and other pilots do not see us listening.
-    p.com1Khz     = comPowered(1) ? (uint32_t)id(g_ref.com1) : 0u;
-    p.com2Khz     = comPowered(2) ? (uint32_t)id(g_ref.com2) : 0u;
+    p.com1Khz     = comPowered(1) ? comKhz(1) : 0u;
+    p.com2Khz     = comPowered(2) ? comKhz(2) : 0u;
     p.onGround    = onGnd ? 1 : 0;
     p.xpdrMode    = ownXpdrMode();
     p.squawk      = ownSquawk();
@@ -563,10 +604,8 @@ void sendPosition() {
     if (id(g_ref.ltTaxi))    lights |= xr::LT_TAXI;
     p.lights = lights;
 
-    // audio_com_selection: 6 == COM1, 7 == COM2
-    const int sel = id(g_ref.audioComSel);
     uint8_t tx = xr::TX_NONE;
-    if (g_pttDown) tx = (sel == 7) ? xr::TX_COM2 : xr::TX_COM1;
+    if (g_pttDown) tx = (txCom() == 2) ? xr::TX_COM2 : xr::TX_COM1;
     if (tx == xr::TX_COM1 && !comPowered(1)) tx = xr::TX_NONE;
     if (tx == xr::TX_COM2 && !comPowered(2)) tx = xr::TX_NONE;
     p.txRadio = tx;
@@ -639,9 +678,7 @@ void sendText(const std::string& text) {
     // are tuned there before relaying. A message addressed to a callsign
     // names no radio at all -- it is not a transmission.
     xr::TextHeader th{};
-    th.freqKhz     = to.empty()
-                     ? (uint32_t)id(id(g_ref.audioComSel) == 7 ? g_ref.com2 : g_ref.com1)
-                     : 0u;
+    th.freqKhz     = to.empty() ? comKhz(txCom()) : 0u;
     th.fromSession = g_sessionId;
     strncpy(th.from, g_cfg.callsign.c_str(), sizeof(th.from) - 1);
     th.textLen     = len;
@@ -975,6 +1012,13 @@ std::mutex                        g_netErrMx;
 std::string                       g_netErr;         // why the socket could not be opened
 std::string                       g_netHost;        // what the thread should connect to
 uint16_t                          g_netPort = 0;
+float                             g_netErrAt = -1000.f;   // g_elapsed when it last failed to open
+std::string                       g_netErrLogged;         // so Log.txt gets each error once
+// A host name that would not resolve usually resolves a little later -- the
+// sim was started before the network was up, or a VPN was still connecting --
+// so a failed open is tried again this often, rather than left until the
+// pilot notices and finds the Reconnect menu item.
+constexpr float                   kSocketRetryS = 15.f;
 std::mutex                        g_inboxMx;
 std::deque<std::vector<uint8_t>>  g_inbox;
 const size_t                      kInboxCap = 256;
@@ -1167,10 +1211,22 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
     if (!g_sockReady.load()) {
         // Not open yet: either still resolving, or it failed and the thread
         // has left the reason for us.
-        std::lock_guard<std::mutex> lk(g_netErrMx);
-        if (!g_netErr.empty() && g_status.compare(0, 12, "socket error") != 0) {
-            g_status = "socket error: " + g_netErr;
-            logMsg("%s", g_status.c_str());
+        bool failed = false;
+        {
+            std::lock_guard<std::mutex> lk(g_netErrMx);
+            failed = !g_netErr.empty();
+            if (failed && g_status.compare(0, 12, "socket error") != 0) {
+                g_status = "socket error: " + g_netErr;
+                if (g_netErr != g_netErrLogged) {       // once per error, not per retry
+                    logMsg("%s", g_status.c_str());
+                    g_netErrLogged = g_netErr;
+                }
+                g_netErrAt = g_elapsed;
+            }
+        }
+        if (failed && g_elapsed - g_netErrAt > kSocketRetryS) {
+            netStop();
+            netStart();
         }
         return 0.5f;
     }
@@ -1213,8 +1269,7 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
     }
 
     // Which COM the PTT keys, published for the network thread's voice packets.
-    // audio_com_selection: 6 == COM1, 7 == COM2.
-    g_txFreqKhz.store((uint32_t)id(id(g_ref.audioComSel) == 7 ? g_ref.com2 : g_ref.com1));
+    g_txFreqKhz.store(comKhz(txCom()));
 
     // The audio panel's volume knobs, so turning a radio down in the cockpit
     // turns it down in the headset. A missing dataref reads 0, which would
@@ -1224,8 +1279,7 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
     // already told the server we are not listening.
     const float vol1 = comPowered(1) ? (g_ref.volCom1 ? fd(g_ref.volCom1) : 1.f) : 0.f;
     const float vol2 = comPowered(2) ? (g_ref.volCom2 ? fd(g_ref.volCom2) : 1.f) : 0.f;
-    xr::voice::setRadioVolumes((uint32_t)id(g_ref.com1), vol1,
-                               (uint32_t)id(g_ref.com2), vol2);
+    xr::voice::setRadioVolumes(comKhz(1), vol1, comKhz(2), vol2);
     // Guard reaches every aeroplane with a working radio, on whichever is
     // turned up louder. With the avionics off it reaches this one too, and is
     // heard exactly as much as anything else is: not at all.
@@ -1377,6 +1431,40 @@ void drawWindow(XPLMWindowID win, void*) {
 
     y -= xr::brand::draw(x, y, true);              // the mark is the first row
 
+    // The toolbar. Settings first and in green, because it is the one a new
+    // pilot is looking for. Hosting adds a button that puts the address a
+    // friend has to type on the clipboard -- nothing drawn in an X-Plane
+    // window can be selected with the mouse, so without it the address is
+    // something you read out loud.
+    g_mainButtons.clear();
+    {
+        struct Btn { const char* label; MainAction action; };
+        std::vector<Btn> btns = {{"[ Settings ]", kBtnSettings},
+                                 {"[ Reconnect ]", kBtnReconnect},
+                                 {"[ Hide ]", kBtnHide}};
+        if (xr::relay::running() && shareAddressPlain().find('<') == std::string::npos)
+            btns.push_back({"[ Copy address ]", kBtnCopy});
+        int bx = x;
+        for (const Btn& bt : btns) {
+            const int w = (int)XPLMMeasureString(xplmFont_Proportional, bt.label,
+                                                 (int)strlen(bt.label));
+            if (bx + w > r - 8) break;                 // a narrow window drops the rest
+            XPLMDrawString(bt.action == kBtnSettings ? green : grey, bx, y,
+                           (char*)bt.label, nullptr, xplmFont_Proportional);
+            g_mainButtons.push_back({bx, bx + w, y, bt.action});
+            bx += w + 14;
+        }
+        // What the last press of Copy did, for a few seconds: a clipboard
+        // operation that silently did nothing is worse than no button.
+        if (g_elapsed - g_mainCopyAt < 4.f) {
+            const char* note = g_mainCopyOk ? "copied" : "could not copy";
+            if (bx + 110 < r)
+                XPLMDrawString(g_mainCopyOk ? green : amber, bx, y, (char*)note, nullptr,
+                               xplmFont_Proportional);
+        }
+    }
+    y -= 18;
+
     drawFit(g_connected ? green : amber, x, y, r, g_status, xplmFont_Proportional);
     y -= 16;
     char who[200];
@@ -1385,7 +1473,7 @@ void drawWindow(XPLMWindowID win, void*) {
     // earlier was a data race ThreadSanitizer found: a string read while
     // another thread was halfway through assigning it.
     const std::string ep = g_sockReady.load() ? g_sock.endpoint() : std::string();
-    snprintf(who, sizeof(who), "%s as %s (%s%s%s)  ·  Plugins > XRadio > Settings",
+    snprintf(who, sizeof(who), "%s as %s (%s%s%s)",
              ep.empty() ? "no server" : ep.c_str(),
              g_cfg.callsign.c_str(), effectiveIcao().c_str(),
              effectiveLivery().empty() ? "" : " ", effectiveLivery().c_str());
@@ -1441,8 +1529,8 @@ void drawWindow(XPLMWindowID win, void*) {
     char hdr[160];
     const bool p1 = comPowered(1), p2 = comPowered(2);
     snprintf(hdr, sizeof(hdr), "COM1 %.3f%s   COM2 %.3f%s   %s",
-             id(g_ref.com1) / 1000.0, p1 ? "" : " (no power)",
-             id(g_ref.com2) / 1000.0, p2 ? "" : " (no power)",
+             comKhz(1) / 1000.0, p1 ? "" : " (no power)",
+             comKhz(2) / 1000.0, p2 ? "" : " (no power)",
              g_pttDown ? "** TX **" : "");
     drawFit(g_pttDown ? green : white, x, y, r, hdr, xplmFont_Proportional);
     y -= 16;
@@ -1512,6 +1600,16 @@ void drawWindow(XPLMWindowID win, void*) {
     }
     drawFit(myXpdrUp ? white : amber, x, y, r, title, xplmFont_Proportional);
     y -= 16;
+
+    // Column headings, laid out with the same widths as the rows below, so a
+    // list of a dozen contacts reads as a table rather than as numbers.
+    if (!contacts.empty() && y >= b + 100) {
+        char cols[96];
+        snprintf(cols, sizeof(cols), "%-8s %-5s %8s  %8s  %6s  %s",
+                 "callsign", "type", "altitude", "distance", "speed", "squawk");
+        drawFit(grey, x, y, r, cols, xplmFont_Basic);
+        y -= 14;
+    }
 
     const double myLat = dd(g_ref.lat), myLon = dd(g_ref.lon);
     for (const Remote* rp : contacts) {
@@ -1630,10 +1728,33 @@ void drawWindow(XPLMWindowID win, void*) {
             prompt, xplmFont_Basic);
 }
 
-// Clicking the "Say:" row takes the keyboard; clicking anywhere else in the
-// window gives it back, so the sim's own key bindings keep working.
-int mainWindowClick(XPLMWindowID win, int, int y, XPLMMouseStatus status, void*) {
+// What the toolbar buttons do.
+void mainButton(MainAction action) {
+    switch (action) {
+        case kBtnSettings:  openSettings(); break;
+        case kBtnReconnect: loadConfig(); reconnect(); break;   // same as the menu item
+        case kBtnHide:      XPLMSetWindowIsVisible(g_window, 0); break;
+        case kBtnCopy: {
+            std::string err;
+            g_mainCopyOk = xr::clipboard::set(shareAddressPlain(), &err);
+            g_mainCopyAt = g_elapsed;
+            if (!g_mainCopyOk) logMsg("could not copy the address: %s", err.c_str());
+            break;
+        }
+    }
+}
+
+// A toolbar button does its thing. Clicking the "Say:" row takes the
+// keyboard; clicking anywhere else in the window gives it back, so the sim's
+// own key bindings keep working.
+int mainWindowClick(XPLMWindowID win, int x, int y, XPLMMouseStatus status, void*) {
     if (status != xplm_MouseDown) return 1;
+    for (const MainButton& bt : g_mainButtons) {
+        if (y >= bt.y - 4 && y <= bt.y + 12 && x >= bt.x0 && x <= bt.x1) {
+            mainButton(bt.action);
+            return 1;
+        }
+    }
     // A name in the @ list: fill it in and keep typing.
     for (size_t i = 0; i < g_atRowsY.size() && i < g_atShown.size(); ++i) {
         if (y >= g_atRowsY[i] - 4 && y <= g_atRowsY[i] + 11) {
@@ -1822,6 +1943,18 @@ void applyHosting() {
     xr::upnp::requestAsync(port, "XRadio", g_cfg.hostUpnp);
 }
 
+// The router half on its own, for when "Ask the router to open it" changes
+// while the server keeps running. Switched off, the mapping is given back
+// and only the public address is looked up, for the forward-it-yourself
+// instructions on the Hosting tab.
+void applyRouter() {
+    if (!xr::relay::running()) return;
+    const uint16_t port = (uint16_t)g_cfg.hostPort_i();
+    xr::upnp::clear();
+    if (!g_cfg.hostUpnp) xr::upnp::releaseAsync();
+    xr::upnp::requestAsync(port, "XRadio", g_cfg.hostUpnp);
+}
+
 // The address on this network, for friends on the same LAN.
 std::string lanAddress() {
     const std::string lan = xr::localAddress();
@@ -1989,10 +2122,14 @@ void applySettings() {
                             // otherwise the setting appears to do nothing
                             // until the next flight.
                             (g_edit.shareWeather != g_cfg.shareWeather);
-    const bool hostChanged = (g_edit.hostEnabled != g_cfg.hostEnabled) ||
-                             (g_edit.hostPort != g_cfg.hostPort) ||
-                             (g_edit.password != g_cfg.password) ||
-                             (g_edit.hostUpnp != g_cfg.hostUpnp);
+    const bool relayChanged = (g_edit.hostEnabled != g_cfg.hostEnabled) ||
+                              (g_edit.hostPort != g_cfg.hostPort) ||
+                              (g_edit.password != g_cfg.password);
+    // The router question on its own does not touch the server. It used to
+    // restart it, which threw every connected pilot off for the 12 s it
+    // takes them to notice and log in again.
+    const bool routerChanged = !relayChanged && g_edit.hostEnabled &&
+                               (g_edit.hostUpnp != g_cfg.hostUpnp);
     const bool devChanged = (g_edit.micDevice != g_cfg.micDevice) ||
                             (g_edit.outDevice != g_cfg.outDevice);
 
@@ -2001,7 +2138,8 @@ void applySettings() {
     applyLiveSettings();
     // Start or stop the built-in server before reconnecting, so the client
     // has something to connect to by the time it tries.
-    if (hostChanged) applyHosting();
+    if (relayChanged) applyHosting();
+    else if (routerChanged) applyRouter();
 
     if (devChanged) {
         std::string err;
@@ -2468,7 +2606,7 @@ void menuHandler(void*, void* item) {
 PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     strcpy(outName, "XRadio");
     strcpy(outSig,  "ee.doesvic.xradio");
-    strcpy(outDesc, "Shared traffic and radio communication between X-Plane 12 pilots.");
+    strcpy(outDesc, "Shared traffic and radio communication between X-Plane pilots.");
 
     XPLMEnableFeature("XPLM_USE_NATIVE_PATHS", 1);
     XPLMEnableFeature("XPLM_USE_NATIVE_WIDGET_WINDOWS", 1);
@@ -2562,6 +2700,7 @@ PLUGIN_API void XPluginStop(void) {
     if (g_loop)   { XPLMDestroyFlightLoop(g_loop); g_loop = nullptr; }
     if (g_window)      { XPLMDestroyWindow(g_window);      g_window = nullptr; }
     if (g_settingsWin) { XPLMDestroyWindow(g_settingsWin); g_settingsWin = nullptr; }
+    if (g_noticeWin)   { XPLMDestroyWindow(g_noticeWin);   g_noticeWin = nullptr; }
     if (g_cmdPtt) { XPLMUnregisterCommandHandler(g_cmdPtt, pttHandler, 1, nullptr); }
     XPLMUnregisterKeySniffer(pttKeySniffer, 0, nullptr);
     if (g_menu)   { XPLMDestroyMenu(g_menu); g_menu = nullptr; }

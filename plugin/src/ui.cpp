@@ -1,3 +1,8 @@
+// The widgets the settings window is made of: tabs, text fields, toggles,
+// sliders, choices, a key binding row, buttons. Immediate mode: each is a
+// function called once per frame that draws itself, looks at the click or
+// keys that arrived since the last frame, and reports a change. See ui.h for
+// why everything is text drawn with XPLMDrawString.
 #include "ui.h"
 
 #include "XPLMDefs.h"

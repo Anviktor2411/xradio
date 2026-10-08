@@ -1,3 +1,10 @@
+// NAT-PMP (RFC 6886): the second way of asking a router to open a port,
+// tried when UPnP gets no answer. Two tiny binary UDP requests to the
+// gateway on port 5351 -- "what is your public address?" and "forward this
+// port to me" -- each answered in one datagram. Apple's routers, a lot of
+// OpenWrt and Fritz!Box firmware and anything running miniupnpd speak it
+// even with UPnP switched off. Blocking, with short timeouts; called from
+// the UPnP worker thread, never from the sim's main thread.
 #include "natpmp.h"
 
 #include "net.h"

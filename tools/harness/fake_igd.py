@@ -11,6 +11,10 @@ until asked for a timed one.
 
 Then run the client with XRADIO_UPNP_GATEWAY=127.0.0.1 so its unicast
 M-SEARCH lands here. Exits when its parent tells it to (SIGTERM).
+
+On Windows the real SSDP service already owns port 1900 and quietly takes
+the search instead; give both sides another port with --ssdp-port here and
+XRADIO_SSDP_PORT on the client.
 """
 
 import argparse
@@ -134,10 +138,10 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
 
-def ssdp():
+def ssdp(port):
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    s.bind(("127.0.0.1", SSDP_PORT))
+    s.bind(("127.0.0.1", port))
     while True:
         data, addr = s.recvfrom(2048)
         if not data.startswith(b"M-SEARCH"):
@@ -155,13 +159,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--mode", default="ok",
                     choices=["ok", "lease", "refuse", "private-wan", "deaf"])
+    ap.add_argument("--ssdp-port", type=int, default=SSDP_PORT,
+                    help="where to listen for M-SEARCH (the client: XRADIO_SSDP_PORT)")
     args = ap.parse_args()
     state["mode"] = args.mode
     if args.mode == "deaf":
         print("deaf: not answering anything", flush=True)
         threading.Event().wait()
         return
-    threading.Thread(target=ssdp, daemon=True).start()
+    threading.Thread(target=ssdp, args=(args.ssdp_port,), daemon=True).start()
     srv = HTTPServer(("127.0.0.1", HTTP_PORT), Handler)
     print(f"fake router up: mode={args.mode}", flush=True)
     srv.serve_forever()

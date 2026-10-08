@@ -25,7 +25,7 @@ fi
 SOURCES="plugin/src/xpmp_bridge.cpp"
 COMMON=(-std=c++17 -fsyntax-only -Wall -Wextra
         -DXRADIO_USE_XPMP2=1
-        -DXPLM200=1 -DXPLM210=1 -DXPLM300=1 -DXPLM301=1 -DXPLM303=1 -DXPLM400=1
+        -DXPLM200=1 -DXPLM210=1 -DXPLM300=1 -DXPLM301=1 -DXPLM303=1
         -Iplugin/src -Ilib/XPMP2/inc
         "-I$SDK/CHeaders/XPLM" "-I$SDK/CHeaders/Widgets")
 

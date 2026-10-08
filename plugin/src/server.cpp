@@ -1,3 +1,11 @@
+// The relay server that "Host a flight here" runs inside the plugin. The
+// protocol logic is Core, which has no socket at all: it is handed each
+// datagram and a clock, and sends through a callback, so the tests can drive
+// it. Below Core is the thin part that owns the UDP socket and the thread.
+//
+// server/server.py is the same thing in Python. Both have to behave
+// identically -- tools/test_server_parity.py checks -- so a change to one
+// is a change to both.
 #include "server.h"
 
 #include "mathconst.h"
@@ -263,7 +271,13 @@ void Core::onLogin(const Peer& from, const uint8_t* p, int len, double now) {
     std::string acIcao   = clean(lp.acIcao,   sizeof(lp.acIcao),   7);
     std::string livery   = clean(lp.livery,   sizeof(lp.livery),   15);
 
-    sessions_.erase(from);                  // a re-login replaces the old session
+    // A re-login from the same address replaces the old session, and
+    // everything that pointed at the old one lets go of it -- the weather
+    // claim above all. It used to survive here, naming a session that no
+    // longer existed, so a host whose login ack was lost, or who logged in
+    // again after a network stall, could never share the sky again and nor
+    // could anybody else. drop() also marks the roster for resending.
+    drop(from);
 
     Session s;
     s.sid      = nextSid_++;
