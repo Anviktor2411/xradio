@@ -115,6 +115,17 @@ void  setSidetone(bool on);      // hear your own voice while keyed
 void  setHiss(float level);      // 0..1, scales every bit of noise the radio makes
 void  setRadioFilter(bool on);   // the whole radio sound: limiter, overdrive,
                                  // squelch, 300-2700 Hz filter. Off = clean audio.
+// The squelch knob: how good a signal has to be (see setSignalQuality) before
+// the receiver opens for it at all. A station below it is not heard and does
+// not open the squelch, like a signal too weak for a real radio. 0 means the
+// knob is all the way down: the squelch is open, there is constant static,
+// and the faintest station gets through.
+void  setSquelch(float minQuality);
+// How much of the other pilot's cockpit comes through their microphone, 0..1.
+// It goes through their transmitter's limiter like the voice does, so it is
+// held down under the words and swells up between them, the way it does on a
+// real transmission.
+void  setCabinNoise(float level);
 // How good another pilot's signal is, 1 next door down to 0 at the VHF
 // horizon: sets their noise level and how badly they break up. The main
 // thread works it out from distance; unknown pilots count as strong.

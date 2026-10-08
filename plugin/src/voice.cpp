@@ -35,6 +35,8 @@ void releaseMicrophone() {}
 void setSidetone(bool) {}
 void setHiss(float) {}
 void setRadioFilter(bool) {}
+void setSquelch(float) {}
+void setCabinNoise(float) {}
 void setSignalQuality(uint32_t, float) {}
 void shutdown() {}
 bool available() { return false; }
@@ -122,6 +124,19 @@ struct Speaker {
     int                              concealed = 0;
     std::chrono::steady_clock::time_point lastRx;
 
+    // Their cockpit, as their microphone hears it: engine and wind, which is
+    // a low roar rather than a hiss, so white noise through a one-pole
+    // low-pass. Seeded per speaker so two pilots do not share a cockpit.
+    uint32_t                         cabRng = 0x9E3779B9u;
+    float                            cabLp  = 0.f;
+    float cabin(float amp) {
+        cabRng = cabRng * 1664525u + 1013904223u;
+        const float white = (float)(cabRng >> 16) / 32768.f - 1.f;
+        cabLp += 0.12f * (white - cabLp);          // corner near 900 Hz
+        return cabLp * amp * 3.f;                  // the low-pass eats most of the level
+    }
+    float                            flutterPhase = 0.f;   // see render()
+
     ~Speaker() { if (dec) opus_decoder_destroy(dec); }
 };
 
@@ -182,6 +197,8 @@ std::atomic<bool>  g_tx{false};
 std::atomic<bool>  g_sidetone{false};
 std::atomic<bool>  g_filter{true};
 std::atomic<float> g_hiss{0.35f};
+std::atomic<float> g_squelch{0.1f};     // the squelch knob, as a minimum signal quality
+std::atomic<float> g_cabin{0.3f};       // the other pilot's cockpit through their microphone
 std::atomic<float> g_micLevel{0.f};
 std::atomic<float> g_volume{1.f};
 // the audio panel: tuned frequencies and knob positions, main thread -> playback
@@ -258,6 +275,16 @@ void designLowpass(Biquad& q, float fc, float Q) {
     q.a1 = -2.f * c / a0;        q.a2 = (1.f - alpha) / a0;
 }
 
+// A peaking EQ: `gainDb` at `fc`, unity elsewhere.
+void designPeak(Biquad& q, float fc, float Q, float gainDb) {
+    const float A = powf(10.f, gainDb / 40.f);
+    const float w = 2.f * (float)kPi * fc / (float)kSampleRate;
+    const float c = cosf(w), s = sinf(w), alpha = s / (2.f * Q);
+    const float a0 = 1.f + alpha / A;
+    q.b0 = (1.f + alpha * A) / a0; q.b1 = -2.f * c / a0; q.b2 = (1.f - alpha * A) / a0;
+    q.a1 = -2.f * c / a0;          q.a2 = (1.f - alpha / A) / a0;
+}
+
 // Levels are in int16 units. The hiss setting (0..1) scales the noise ones.
 constexpr float kLimThreshold = 2000.f;   // -24 dBFS: everything above comes out the same
 constexpr float kLimMakeup    = 9.f;
@@ -282,6 +309,11 @@ inline float softClip(float x, float level) {
 constexpr float kNoiseStrong  = 250.f;
 constexpr float kNoiseWeak    = 13700.f;
 constexpr float kNoiseBurst   = 16000.f;  // squelch opening and closing
+constexpr float kNoiseStatic  = 4800.f;   // the squelch knob all the way down
+// The other pilot's cockpit at the full setting, before their limiter. Small,
+// because the limiter's make-up gain multiplies it by ten between words --
+// which is exactly the swell a real transmission has between words.
+constexpr float kCabinAmp     = 450.f;
 constexpr float kHetAmp       = 4000.f;   // two carriers on one frequency
 constexpr float kClickAmp     = 14000.f;
 constexpr int   kClickLen     = 96;       // 2 ms step, the filter turns it into a click
@@ -291,6 +323,7 @@ constexpr int   kSettle       = 1440;     // 30 ms: let the filters ring down
 
 struct Radio {
     Biquad hp1, hp2, lp1, lp2;            // 4th order each side
+    Biquad presence;                      // the headset: a lift where speech cuts through
     float  env = 0.f;                     // our own transmitter's envelope (sidetone)
     bool   open = false;                  // squelch state
     int    burst = 0, tail = 0, click = 0, settle = 0;
@@ -304,6 +337,10 @@ struct Radio {
         designHighpass(hp2, 300.f, 1.3066f);
         designLowpass(lp1, 2700.f, 0.5412f);
         designLowpass(lp2, 2700.f, 1.3066f);
+        // Aviation headsets and cockpit speakers are forward in the upper
+        // mids; a few dB there is the difference between a telephone and
+        // a radio.
+        designPeak(presence, 1800.f, 1.0f, 3.f);
     }
 
     float white() {
@@ -321,7 +358,7 @@ struct Radio {
         return softClip(x * g * kLimMakeup * kDrive, kClipLevel);
     }
 
-    float filter(float x) { return lp2.run(lp1.run(hp2.run(hp1.run(x)))); }
+    float filter(float x) { return presence.run(lp2.run(lp1.run(hp2.run(hp1.run(x))))); }
 
     // The audio amplifier at the end of the chain. Speech is already held
     // down by the overdrive, but click + noise + squeal on top of it could
@@ -339,7 +376,11 @@ struct Radio {
     // One output sample. `speech` is the mixed, already-transmitter-processed
     // voice (0 when nobody is talking), `quality` the best signal among the
     // carriers (1 next door, 0 at the horizon), `carriers` how many.
-    float receiver(float speech, bool carrier, int carriers, float quality, float hiss) {
+    // `squelchOpen` is the knob turned all the way down: static whenever
+    // nobody is on, which is how a pilot listens for a station too faint to
+    // open the squelch.
+    float receiver(float speech, bool carrier, int carriers, float quality, float hiss,
+                   bool squelchOpen) {
         float noiseAmp = 0.f;
         if (tail > 0) {
             noiseAmp = hiss * kNoiseBurst;
@@ -348,6 +389,8 @@ struct Radio {
             const float w = 1.f - quality;
             noiseAmp = hiss * (kNoiseStrong + (kNoiseWeak - kNoiseStrong) * w);
             if (burst > 0) { noiseAmp = noiseAmp > hiss * kNoiseBurst ? noiseAmp : hiss * kNoiseBurst; --burst; }
+        } else if (squelchOpen) {
+            noiseAmp = hiss * kNoiseStatic;
         }
         float x = carrier ? speech : 0.f;
         if (noiseAmp > 0.f) x += white() * noiseAmp;
@@ -471,19 +514,52 @@ void render(int16_t* out, int count) {
     std::unique_lock<std::mutex> lk(g_mx, std::try_to_lock);
     if (!lk.owns_lock()) return;                 // never stall the audio thread
 
+    const float sq    = g_squelch.load();
+    const float cabin = g_cabin.load();
+
     static std::vector<float> mix;
     mix.assign((size_t)count, 0.f);
-    int   carriers = 0;
-    float best = 0.f;                            // strongest signal among them
 
+    // Who is on, and how strong the strongest of them is -- needed before the
+    // mixing, because with two stations on at once the louder one dominates.
+    // The squelch knob decides who is on at all: a station below it is not a
+    // carrier, its frames are thrown away unheard, and the squelch stays shut
+    // as if nobody had keyed, which is what a real radio does with a signal
+    // too weak to open it.
+    int   onAir = 0;
+    float strongest = 0.f;
     for (auto& kv : g_speakers) {
         Speaker& sp = *kv.second;
+        const float q = qualityOf(kv.first);
+        if (fx && q < sq) {
+            sp.packets.clear(); sp.pcm.clear(); sp.pcmPos = 0; sp.playing = false;
+            continue;
+        }
+        if (!sp.playing && (int)sp.packets.size() < kPrebuffer) continue;
+        ++onAir;
+        if (q > strongest) strongest = q;
+    }
+
+    int   carriers = 0;
+    float best = 0.f;                            // strongest signal actually heard
+    for (auto& kv : g_speakers) {
+        Speaker& sp = *kv.second;
+        const float q = qualityOf(kv.first);
+        if (fx && q < sq) continue;
         if (!sp.playing) {
             if ((int)sp.packets.size() < kPrebuffer) continue;
             sp.playing = true;
         }
-        const float q = qualityOf(kv.first);
         const float knob = radioGain(sp.freqKhz);
+        // AM has no capture effect to speak of, but the louder carrier does
+        // win: with two on at once the weaker is heard underneath, not
+        // alongside.
+        const float share = (onAir > 1 && strongest > 0.f) ? (0.35f + 0.65f * q / strongest) : 1.f;
+        // Flutter: the signal wavering as the far aircraft banks and the path
+        // between you changes, a slow wobble that deepens towards the horizon.
+        const float w = 1.f - q;
+        const float flutterDepth = 0.6f * w * w;
+        const float flutterStep  = 2.f * (float)kPi * (4.f + 3.f * w) / (float)kSampleRate;
         bool contributed = false;
         for (int i = 0; i < count; ++i) {
             if (sp.pcmPos >= sp.pcm.size()) {
@@ -498,11 +574,20 @@ void render(int16_t* out, int count) {
                     sp.dropped = false;
                 }
             }
-            // Their transmitter, then the cockpit's volume knob for that radio.
             float smp = sp.dropped ? 0.f : (float)sp.pcm[sp.pcmPos];
-            if (fx) smp = Radio::transmitter(sp.txEnv, smp);
+            if (fx) {
+                // Their cockpit into their microphone, then their transmitter:
+                // the limiter holds the roar down under the words and lets it
+                // swell back up between them, the way a real transmission does.
+                if (!sp.dropped) smp += sp.cabin(cabin * kCabinAmp);
+                smp = Radio::transmitter(sp.txEnv, smp);
+                sp.flutterPhase += flutterStep;
+                if (sp.flutterPhase > 2.f * (float)kPi) sp.flutterPhase -= 2.f * (float)kPi;
+                smp *= 1.f - flutterDepth * (0.5f + 0.5f * sinf(sp.flutterPhase));
+            }
             ++sp.pcmPos;
-            mix[(size_t)i] += smp * knob;
+            // ...then the cockpit's volume knob for that radio.
+            mix[(size_t)i] += smp * knob * share;
             contributed = true;
         }
         if (contributed) { ++carriers; if (q > best) best = q; }
@@ -520,10 +605,11 @@ void render(int16_t* out, int count) {
     }
 
     g_radio.gate(carrier);
-    if (!g_radio.active()) return;               // silence, and the filters stay put
+    const bool squelchOpen = sq <= 0.001f;       // the knob all the way down
+    if (!g_radio.active() && !squelchOpen) return;   // silence, and the filters stay put
     for (int i = 0; i < count; ++i) {
         const float speech = carrier ? mix[(size_t)i] : 0.f;
-        float v = g_radio.receiver(speech, carrier, carriers, best, hiss) * vol;
+        float v = g_radio.receiver(speech, carrier, carriers, best, hiss, squelchOpen) * vol;
         out[i] = (int16_t)(v > 32767.f ? 32767.f : (v < -32768.f ? -32768.f : v));
     }
 }
@@ -825,6 +911,8 @@ void onIncomingFrame(uint32_t sid, uint16_t seq, const uint8_t* data, int len,
         int e = 0;
         slot->dec = opus_decoder_create(kSampleRate, 1, &e);
         if (e != OPUS_OK) { g_speakers.erase(sid); return; }
+        slot->cabRng = 0x9E3779B9u ^ (sid * 2654435761u);   // their own cockpit noise
+        if (slot->cabRng == 0) slot->cabRng = 1;
     }
     Speaker& sp = *slot;
     if (freqKhz) sp.freqKhz = freqKhz;
@@ -888,6 +976,12 @@ void  setSidetone(bool on) {
     }
 }
 void  setHiss(float level)     { g_hiss.store(level < 0.f ? 0.f : (level > 1.f ? 1.f : level)); }
+void  setSquelch(float minQuality) {
+    g_squelch.store(minQuality < 0.f ? 0.f : (minQuality > 1.f ? 1.f : minQuality));
+}
+void  setCabinNoise(float level) {
+    g_cabin.store(level < 0.f ? 0.f : (level > 1.f ? 1.f : level));
+}
 void setRadioVolumes(uint32_t com1Khz, float com1Vol, uint32_t com2Khz, float com2Vol) {
     g_com1Khz.store(com1Khz);
     g_com2Khz.store(com2Khz);
@@ -911,8 +1005,13 @@ float micLevel()         { return g_micLevel.load(); }
 
 std::vector<uint32_t> activeSpeakers() {
     std::vector<uint32_t> out;
+    const bool  fx = g_filter.load();
+    const float sq = g_squelch.load();
     std::lock_guard<std::mutex> lk(g_mx);
     for (auto& kv : g_speakers) {
+        // A station the squelch keeps out is not heard, so it is not shown
+        // either: a real radio gives no sign of a signal too weak to open it.
+        if (fx && qualityOf(kv.first) < sq) continue;
         if (kv.second->playing || !kv.second->packets.empty()) out.push_back(kv.first);
     }
     return out;

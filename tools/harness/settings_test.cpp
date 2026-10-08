@@ -330,6 +330,10 @@ int main() {
             harness::windowTop(kWin, &top, &left);
             check("the Audio tab was drawn", harness::drawnAt("Audio", &tx, &ty));
             harness::click(kWin, tx + 10, ty);
+            // The Audio tab is taller than the window opens at; the first
+            // draw finds that out and grows the window, the second shows
+            // everything. A pilot sees only the second.
+            draw();
             auto audio = draw();
             check("clicking it switches tab",
                   shows(audio, "Microphone") && shows(audio, "Radio noise") &&

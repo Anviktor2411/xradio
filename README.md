@@ -567,6 +567,8 @@ server, port, callsign or aircraft type causes a reconnect.
 | Volume | incoming radio volume |
 | Hear own voice | sidetone: hear yourself while keyed, like a real headset |
 | Radio noise | scales every bit of noise the radio makes: the faint floor under a strong signal, the hiss that grows towards the horizon, the squelch bursts. 0 for none |
+| Squelch | how strong a signal has to be before the receiver opens for it, like the knob on the radio. Turned up, a distant station is kept out; all the way down the squelch is open — constant static, and the faintest station gets through |
+| Cockpit noise | how much of the other pilot's cockpit comes through their microphone. It goes through their transmitter's limiter like the voice does, so it sits under the words and swells up between them |
 | Radio sound | the whole VHF radio character — limiter, overdrive, squelch, 300–2700 Hz filter, distance fading, the blocked squeal. Off = clean audio |
 
 The audio tab also shows a live mic level meter and the voice status line, so
@@ -607,6 +609,8 @@ speakers =
 volume = 0.8
 sidetone = no
 hiss = 0.35
+squelch = 0.1
+cabinnoise = 0.3
 radiofilter = yes
 
 showtraffic = yes
@@ -632,7 +636,10 @@ or the monitor layout changed while X-Plane was running — use
 command `xradio/ptt` and bind it to a key or joystick button. Hold it to talk
 on whichever COM the audio panel has selected for transmit; release it to
 listen. Like a real radio it is half-duplex — you do not hear others while you
-are keyed.
+are keyed. And like a real transceiver it has a stuck-mic timer: after 35
+seconds of continuous key-down it stops transmitting and says so in the radio
+log, until the key is released and pressed again, so a jammed switch cannot
+block the frequency for everybody.
 
 ## Voice
 
@@ -675,9 +682,9 @@ side, in the order the real signal goes through it (`plugin/src/voice.cpp`,
 
 | stage | what it does |
 |---|---|
-| transmitter | a modulation limiter squashes every syllable to the same level, then a soft overdrive adds the crunch that consonants get when a voice over-modulates |
-| channel | noise that rises as the other aircraft nears the VHF horizon; near it the audio breaks up, whole 20 ms frames going missing; two people keying at once produce the beating heterodyne squeal |
-| receiver | the squelch opens with a click and a burst of noise, closes with a longer burst and a click once the carrier drops; a 4th-order 300–2700 Hz audio filter; an output stage that cannot be driven past two thirds of full scale, whatever comes in |
+| transmitter | the other pilot's cockpit comes in through their microphone — engine and wind, a roar rather than a hiss; a modulation limiter squashes every syllable to the same level and holds that roar down under the words, letting it swell back up between them; then a soft overdrive adds the crunch that consonants get when a voice over-modulates |
+| channel | noise that rises as the other aircraft nears the VHF horizon; the signal flutters, a slow wobble in its level that deepens towards the horizon; near it the audio breaks up, whole 20 ms frames going missing; two people keying at once produce the beating heterodyne squeal, with the stronger of them on top and the weaker underneath |
+| receiver | a squelch knob: a station weaker than its setting does not open the receiver at all, and with the knob all the way down the squelch is open and there is constant static; the squelch opens with a click and a burst of noise, closes with a longer burst and a click once the carrier drops; a 4th-order 300–2700 Hz audio filter with a headset's lift around 1.8 kHz; an output stage that cannot be driven past two thirds of full scale, whatever comes in |
 
 Distance comes from the same VHF horizon the server uses to route
 transmissions (`1.23 × (√h₁ + √h₂)` nm): a signal is clean to about half of

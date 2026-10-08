@@ -435,6 +435,20 @@ std::string      g_loginProblem;            // why the server will not have us
 std::string      g_loginIcao, g_loginLivery;   // what the current session was logged in as
 float            g_lastRxTime   = -99.f;
 bool             g_pttDown      = false;
+float            g_pttDownAt    = -1.f;      // g_elapsed when the key went down
+
+// Real transceivers stop transmitting after about half a minute of continuous
+// key-down -- 35 s on most GA radios -- so a jammed microphone switch or a
+// PTT taped down cannot block the frequency for everybody. The pilot has to
+// release and press again. XRADIO_PTT_TIMEOUT shortens it for the harness.
+float pttTimeoutS() {
+    static const float v = [] {
+        const char* e = getenv("XRADIO_PTT_TIMEOUT");
+        const float f = e ? (float)atof(e) : 0.f;
+        return (f > 0.1f && f < 600.f) ? f : 35.f;
+    }();
+    return v;
+}
 std::string      g_status       = "not connected";
 std::vector<std::string> g_chatLog;   // newest last, capped
 
@@ -540,7 +554,13 @@ void sendLogin() {
     // and ignores the rest, so this is an offer, not an announcement -- which
     // is the only way it can work on a dedicated server, where there is no
     // host whose sim could be the obvious answer.
-    p.flags = g_cfg.shareWeather ? xr::LF_WEATHER_SOURCE : 0;
+    //
+    // Only a sim that can actually read its weather makes the offer. An
+    // X-Plane 11 pilot has nothing to send, and if the server awarded the
+    // claim to them, every X-Plane 12 pilot in the flight would be refused
+    // and nobody would get a sky -- in a mixed flight, with the setting
+    // sitting there saying everyone was sharing.
+    p.flags = (g_cfg.shareWeather && xr::weather::available()) ? xr::LF_WEATHER_SOURCE : 0;
     memcpy(buf + off, &p, sizeof(p));
     g_sock.send(buf, off + (int)sizeof(p));
     g_lastLogin = g_elapsed;
@@ -1288,6 +1308,18 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
     // Switching the avionics off mid-transmission has to unkey us.
     if (g_pttDown && !anyComPowered()) setPtt(false);
 
+    // So does the stuck-mic timer; see pttTimeoutS().
+    if (g_pttDown && g_elapsed - g_pttDownAt > pttTimeoutS()) {
+        setPtt(false);
+        char line[120];
+        snprintf(line, sizeof(line),
+                 "transmitter timed out after %.0f s -- release the key and press again",
+                 (double)pttTimeoutS());
+        addChat(line);
+        pushNotice(line, 1);
+        logMsg("%s", line);
+    }
+
     if (!g_connected) {
         // Retry until acked -- slowly once the server has said no, since the
         // answer will not change until the settings do -- and after a while
@@ -1354,6 +1386,7 @@ void setPtt(bool down) {
     if (down && !anyComPowered()) return;
     if (down == g_pttDown) return;
     g_pttDown = down;
+    if (down) g_pttDownAt = g_elapsed;
     xr::voice::setTransmitting(g_pttDown);
     // Tell the server straight away rather than at the next 5 Hz tick, so
     // the [TX] label on our aircraft follows the key without a lag.
@@ -1495,7 +1528,9 @@ void drawWindow(XPLMWindowID win, void*) {
     // and "somebody else got there first".
     if (g_connected) {
         const char* sky = "my own";
-        if (someoneElseIsTheSky())
+        if (!xr::weather::available())
+            sky = "my own (X-Plane 11 cannot share weather)";
+        else if (someoneElseIsTheSky())
             sky = g_cfg.followWeather ? "the flight's" : "the flight's (not following)";
         else if (g_cfg.shareWeather)
             sky = "mine, shared with the flight";
@@ -2066,6 +2101,8 @@ void applyLiveSettings() {
     xr::voice::setSidetone(g_cfg.sidetone);
     xr::voice::setHiss(g_cfg.hiss);
     xr::voice::setRadioFilter(g_cfg.radioFilter);
+    xr::voice::setSquelch(g_cfg.squelch);
+    xr::voice::setCabinNoise(g_cfg.cabinNoise);
     xr::Smoother::setDefaultPlayout(g_cfg.smoothMs / 1000.0);
     g_pttKeyVk = g_cfg.pttKey;
     xr::csl::setTrafficVisible(g_cfg.showTraffic);

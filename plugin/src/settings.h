@@ -36,6 +36,13 @@ struct Settings {
     bool        sidetone   = false;        // hear yourself while keyed
     float       hiss       = 0.35f;        // every bit of noise the radio makes
     bool        radioFilter = true;        // the whole radio sound; off = clean audio
+    // The squelch knob: how strong a signal has to be before the receiver
+    // opens for it. All the way down (0) the squelch is open: constant static,
+    // and the faintest distant station gets through.
+    float       squelch    = 0.1f;
+    // The other pilot's cockpit, as their microphone hears it, under their
+    // voice. 0 for a studio.
+    float       cabinNoise = 0.3f;
     // With the window closed a pilot sees nothing at all: no radio log, no
     // sign that anybody called. A small notice in the corner is the whole of
     // what they get, so it is on by default.
@@ -124,6 +131,9 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"volume",    "Volume",         Kind::Slider, 1, &s.volume,     0.f, 1.f, "%", 0},
         {"sidetone",  "Hear own voice", Kind::Bool,   1, &s.sidetone},
         {"hiss",      "Radio noise",    Kind::Slider, 1, &s.hiss,       0.f, 1.f, "%", 0},
+        {"squelch",   "Squelch",        Kind::Slider, 1, &s.squelch,    0.f, 1.f, "%", 0},
+        {"cabinnoise", "Cockpit noise in transmissions", Kind::Slider, 1, &s.cabinNoise,
+                       0.f, 1.f, "%", 0},
         {"radiofilter", "Radio sound (limiter, squelch, filter)", Kind::Bool, 1, &s.radioFilter},
         {"pttkey",    "Push-to-talk key", Kind::KeyBind, 1, &s.pttKey},
         {"popups",    "Show messages when the window is closed", Kind::Bool, 1,

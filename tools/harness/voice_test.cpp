@@ -77,6 +77,15 @@ static void fresh() {
     setRadioFilter(true);
     setHiss(0.35f);
     setSidetone(false);
+    setSquelch(0.1f);        // the defaults, except the other pilot's cockpit:
+    setCabinNoise(0.f);      // off, so each measurement is about one thing
+}
+
+// The level of a tone over time, in 10 ms steps: for seeing it waver.
+static std::vector<double> envelope(const std::vector<int16_t>& v, int fromMs, int toMs) {
+    std::vector<double> out;
+    for (int ms = fromMs; ms + 10 <= toMs; ms += 10) out.push_back(rms(slice(v, ms, ms + 10)));
+    return out;
 }
 
 static std::vector<int16_t> renderMs(int ms) {
@@ -249,10 +258,12 @@ int main() {
               std::to_string(tail) + " vs " + std::to_string(settled));
         check("then the squelch closes to silence", after < 1.0, std::to_string(after));
 
-        // Distance: the same silent carrier is noisier from the horizon.
+        // Distance: the same silent carrier is noisier from the horizon --
+        // from just inside it, because right at it the squelch, at its
+        // default setting, keeps the station out altogether.
         fresh(); setHiss(1.f);
         feed(25, encode(nothing));
-        setSignalQuality(25, 0.f);
+        setSignalQuality(25, 0.15f);
         const double weak = rms(slice(renderMs(300), 60, 280));
         fresh(); setHiss(1.f);
         feed(26, encode(nothing));
@@ -338,6 +349,70 @@ int main() {
             setSignalQuality(77, 0.3f);
             return signalQualityOf(77) > 0.29f && signalQualityOf(77) < 0.31f && signalQualityOf(78) == 1.f;
         }());
+
+        // The other pilot's cockpit comes through their microphone: a silent
+        // transmission still carries a roar, and it is theirs, not the
+        // radio's -- it is there with the radio noise turned right down.
+        fresh(); setHiss(0.f); setCabinNoise(1.f);
+        feed(50, encode(nothing));
+        const double roar = rms(slice(renderMs(300), 100, 280));
+        fresh(); setHiss(0.f); setCabinNoise(0.f);
+        feed(51, encode(nothing));
+        const double studio = rms(slice(renderMs(300), 100, 280));
+        check("a transmission carries the other pilot's cockpit noise", roar > 300.0,
+              std::to_string(roar));
+        check("none with the setting at zero", studio < 5.0, std::to_string(studio));
+        // ...and their limiter holds it down under the voice: with a tone on
+        // top the roar is squashed, so the mix is not simply tone plus roar.
+        fresh(); setHiss(0.f); setCabinNoise(1.f);
+        feed(52, encode(tone(300)));
+        const double voiceAndRoar = rms(slice(renderMs(300), 100, 280));
+        check("under a voice the limiter holds it down",
+              voiceAndRoar < midLevel * 1.25, std::to_string(voiceAndRoar) + " vs " + std::to_string(midLevel));
+
+        // Flutter: towards the horizon a steady tone wavers, a slow wobble
+        // in its level; next door it does not.
+        fresh(); setHiss(0.f);
+        feed(53, encode(tone(240)));
+        setSignalQuality(53, 0.5f);
+        auto env = envelope(renderMs(240), 40, 220);
+        double lo = 1e9, hi = 0;
+        for (double e : env) { lo = std::min(lo, e); hi = std::max(hi, e); }
+        check("half way to the horizon the signal flutters", hi > lo * 1.10,
+              std::to_string(lo) + " .. " + std::to_string(hi));
+        fresh(); setHiss(0.f);
+        feed(54, encode(tone(240)));
+        setSignalQuality(54, 1.f);
+        env = envelope(renderMs(240), 40, 220);
+        lo = 1e9; hi = 0;
+        for (double e : env) { lo = std::min(lo, e); hi = std::max(hi, e); }
+        check("next door it is steady", hi < lo * 1.08,
+              std::to_string(lo) + " .. " + std::to_string(hi));
+
+        // The squelch knob: turned up, a station that is not strong enough
+        // does not open the receiver at all, and the window does not list
+        // it. Turned down, the same station is heard.
+        fresh(); setHiss(0.f); setSquelch(0.6f);
+        feed(55, encode(tone(240)));
+        setSignalQuality(55, 0.45f);
+        const double kept_out = rms(slice(renderMs(240), 40, 220));
+        check("a station below the squelch setting is not heard", kept_out < 5.0,
+              std::to_string(kept_out));
+        check("and is not shown as talking", activeSpeakers().empty(),
+              std::to_string(activeSpeakers().size()) + " shown");
+        fresh(); setHiss(0.f); setSquelch(0.1f);
+        feed(56, encode(tone(240)));
+        setSignalQuality(56, 0.45f);
+        const double let_in = rms(slice(renderMs(240), 40, 220));
+        check("with the squelch lowered it comes through", let_in > 2000.0,
+              std::to_string(let_in));
+        // All the way down the squelch is open: static with nobody on.
+        fresh(); setHiss(1.f); setSquelch(0.f);
+        const double open = rms(slice(renderMs(200), 50, 200));
+        check("squelch all the way down: constant static", open > 100.0, std::to_string(open));
+        fresh(); setHiss(1.f); setSquelch(0.1f);
+        const double shut = rms(slice(renderMs(200), 50, 200));
+        check("a notch up and it is silent again", shut < 1.0, std::to_string(shut));
 
         // Switched off, the radio gets out of the way entirely.
         fresh(); setRadioFilter(false); setHiss(1.f);

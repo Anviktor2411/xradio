@@ -460,6 +460,7 @@ int main(int argc, char** argv) {
     // than talking to whatever gateway this machine really has.
     harness::setEnv("XRADIO_UPNP_GATEWAY", "127.0.0.1");
     harness::setEnv("XRADIO_SSDP_PORT", "11901");
+    harness::setEnv("XRADIO_PTT_TIMEOUT", "1.5");   // 35 s for real; see the stuck-mic section
 
     // Start from a config that hosts on our test port but is switched off,
     // so the test can turn it on through the window and watch what happens.
@@ -592,6 +593,27 @@ int main(int argc, char** argv) {
         harness::ptt(false);
         harness::set("sim/cockpit2/switches/avionics_power_on", 1);
         harness::set("sim/cockpit2/electrical/bus_volts", 24.0);
+        fly(0.2);
+    }
+
+    printf("\na stuck PTT times out\n");
+    {
+        // Real transceivers stop transmitting after about half a minute of
+        // continuous key-down, so a jammed microphone switch cannot block
+        // the frequency for everybody. The pilot has to release and press
+        // again. XRADIO_PTT_TIMEOUT makes the half minute 1.5 s here.
+        harness::ptt(true);
+        fly(0.4);
+        check("keyed", xr::voice::transmitting());
+        fly(1.6);
+        check("the transmitter times out on its own", !xr::voice::transmitting());
+        check("and the window says why", shows(harness::draw(), "timed out"));
+        harness::ptt(false);
+        fly(0.2);
+        harness::ptt(true);
+        fly(0.3);
+        check("pressing again keys up as normal", xr::voice::transmitting());
+        harness::ptt(false);
         fly(0.2);
     }
 
