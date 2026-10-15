@@ -119,9 +119,11 @@ std::string Wizard::blocker(int step, const Settings& s, const VoiceInfo& v) {
         case 2:
             if (s.pttKey <= 0) return "a push-to-talk key (click the field and press a key), or bind the command xradio/ptt in X-Plane";
             return "";
-        default:
+        case 3:
             if (!s.hostEnabled && upperTrim(s.host).empty()) return "a server address or join code, or host the flight yourself";
             return "";
+        default:
+            return "";   // SimBrief is optional
     }
 }
 
@@ -131,7 +133,8 @@ const char* Wizard::title(int step, const char* lang) {
         case 0: return et ? "Kes sa oled" : "Who you are";
         case 1: return et ? "Heli" : "Audio";
         case 2: return et ? "Saatenupp" : "Push-to-talk";
-        default: return et ? "Lend" : "The flight";
+        case 3: return et ? "Lend" : "The flight";
+        default: return et ? "SimBrief (valikuline)" : "SimBrief (optional)";
     }
 }
 

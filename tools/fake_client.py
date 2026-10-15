@@ -10,6 +10,7 @@ Start two of them on the same frequency to check that they see each other.
 
 import argparse
 import math
+import re
 import socket
 import sys
 import threading
@@ -78,6 +79,11 @@ def run(args):
     stop = threading.Event()
     voice_rx = [0]
     voice_tx = [0]
+    rx_texts = []                       # texts from others, for --script's waitfor and placeholders
+    # the state the position packets report; --script moves it (`me`: the receiver has a local `st` of its own)
+    me = {"lat": args.lat, "lon": args.lon, "alt_m": args.alt_ft / 3.28084, "gs_ms": args.speed_kt * 0.514444,
+          "hdg": args.heading, "com1": args.com1, "squawk": args.squawk, "on_ground": 1 if (args.atc or args.on_ground) else 0,
+          "end": False}
 
     def receiver():
         while not stop.is_set():
@@ -107,7 +113,9 @@ def run(args):
                 text = payload[P.TEXT_HDR.size:P.TEXT_HDR.size + tlen]
                 where = "direct" if P.cstr(to) else f"{freq / 1000:.3f}"
                 print(f"  [{where}] {P.cstr(frm)}: "
-                      f"{text.decode('utf-8', 'replace')}")
+                      f"{text.decode('utf-8', 'replace')}", flush=True)
+                if P.cstr(frm) != args.callsign:
+                    rx_texts.append(text.decode("utf-8", "replace"))
             elif ptype == P.PT_VOICE:
                 freq, from_sid, seq, olen = P.VOICE_HDR.unpack_from(payload, 0)
                 opus = payload[P.VOICE_HDR.size:P.VOICE_HDR.size + olen]
@@ -120,7 +128,7 @@ def run(args):
                     # client can test its whole receive path against itself.
                     voice_tx[0] += 1
                     sock.sendto(P.pack(P.PT_VOICE, sid, P.VOICE_HDR.pack(
-                        args.com1, sid, voice_tx[0] & 0xFFFF, len(opus)) + opus), dest)
+                        me["com1"], sid, voice_tx[0] & 0xFFFF, len(opus)) + opus), dest)
             # --- v6 ---
             elif ptype == P.PT_ATC_LIST:
                 count, _ = P.ATC_LIST_HDR.unpack_from(payload, 0)
@@ -167,37 +175,115 @@ def run(args):
     atc_last = [""]
     threading.Thread(target=receiver, daemon=True).start()
 
+    def send_text(body):
+        data = body.encode()
+        sock.sendto(P.pack(P.PT_TEXT, sid, P.TEXT_HDR.pack(
+            me["com1"], sid, P.pad(args.callsign, 16), len(data), P.pad("", 16)) + data), dest)
+        print(f"  said on {me['com1'] / 1000:.3f}: {body}", flush=True)
+
+    def fill(text):
+        """{squawk} {climb} {fl} {rwy} {sid} from the last text received."""
+        last = rx_texts[-1] if rx_texts else ""
+        def grab(rx, default=""):
+            m = re.search(rx, last, re.I)
+            return m.group(1) if m else default
+        return (text.replace("{squawk}", grab(r"squawk (\d{4})", "0000"))
+                    .replace("{climb}", grab(r"climb (\d{3,5}) feet", "4000"))
+                    .replace("{fl}", grab(r"flight level (\d{2,3})", "120"))
+                    .replace("{rwy}", grab(r"runway (\d{2}[LRC]?)", "26"))
+                    .replace("{sid}", grab(r"via ([A-Z]{3,5}\d[A-Z]?) departure", "flight planned route")))
+
+    def run_script(path):
+        try:
+            src = sys.stdin if path == "-" else open(path, encoding="utf-8")   # "-": commands arrive on stdin as the test goes
+        except OSError as e:
+            print(f"script: cannot read {path}: {e}", flush=True)
+            return
+        for raw in src:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            cmd, _, rest = line.partition(" ")
+            cmd = cmd.lower()
+            if cmd == "wait":
+                time.sleep(float(rest or 1))
+            elif cmd == "say":
+                send_text(fill(rest))
+            elif cmd == "waitfor":
+                parts = rest.rsplit(" ", 1)
+                rx, limit = (parts[0], float(parts[1])) if len(parts) == 2 and re.fullmatch(r"[\d.]+", parts[1]) else (rest, 60.0)
+                t0, seen = time.time(), len(rx_texts)
+                hit = None
+                while time.time() - t0 < limit and not stop.is_set():
+                    for t in rx_texts[seen:]:
+                        if re.search(rx, t, re.I):
+                            hit = t
+                            break
+                    if hit:
+                        break
+                    time.sleep(0.1)
+                print(f"script: {'matched' if hit else 'TIMEOUT waiting for'} /{rx}/" + (f": {hit}" if hit else ""), flush=True)
+            elif cmd == "com1":
+                me["com1"] = int(rest)
+                print(f"script: com1 {me['com1']}", flush=True)
+            elif cmd == "pos":
+                a = rest.split()
+                me["lat"], me["lon"] = float(a[0]), float(a[1])
+                if len(a) > 2: me["alt_m"] = float(a[2]) / 3.28084
+                if len(a) > 3: me["gs_ms"] = float(a[3]) * 0.514444
+                if len(a) > 4: me["hdg"] = float(a[4])
+                if len(a) > 5: me["on_ground"] = 1 if a[5].lower().startswith("g") else 0
+                print(f"script: pos {me['lat']:.5f} {me['lon']:.5f} {me['alt_m'] * 3.28084:.0f} ft {me['gs_ms'] / 0.514444:.0f} kt {'ground' if me['on_ground'] else 'air'}", flush=True)
+            elif cmd == "squawk":
+                me["squawk"] = int(rest)
+            elif cmd == "plan":
+                parts = rest.split()
+                dep, dst = (parts + ["", ""])[:2]
+                route = " ".join(parts[2:])
+                sock.sendto(P.pack(P.PT_FLIGHTPLAN, sid, P.flightplan(
+                    args.callsign, args.actype, dep, dst, route, rules=args.rules,
+                    cruise_ft=args.cruise, remarks=args.remarks)), dest)
+                print(f"script: filed flight plan {dep} -> {dst} {route}".rstrip(), flush=True)
+            elif cmd == "end":
+                me["end"] = True
+                return
+            else:
+                print(f"script: unknown command {cmd!r}", flush=True)
+        print("script: done", flush=True)
+
+    if args.script:
+        threading.Thread(target=run_script, args=(args.script,), daemon=True).start()
+
     if args.direct:
         to, _, body = args.direct.partition(" ")
         body = (body or "hello").encode()
         sock.sendto(P.pack(P.PT_TEXT, sid, P.TEXT_HDR.pack(
             0, sid, P.pad(args.callsign, 16), len(body), P.pad(to.upper(), 16)) + body), dest)
 
-    lat, lon = args.lat, args.lon
-    alt_m = args.alt_ft / 3.28084
-    gs_ms = args.speed_kt * 0.514444
     tick = 0.2
     next_text = time.time() + 5.0
     try:
-        while True:
-            # dead-reckon along the heading
-            d = gs_ms * tick / 6371000.0
-            hdg = math.radians(args.heading)
-            lat += math.degrees(d * math.cos(hdg))
-            lon += math.degrees(d * math.sin(hdg) / max(0.01, math.cos(math.radians(lat))))
+        while not me["end"]:
+            # dead-reckon along the heading (a scripted aircraft is placed, not flown)
+            if not args.script:
+                d = me["gs_ms"] * tick / 6371000.0
+                hdg = math.radians(me["hdg"])
+                me["lat"] += math.degrees(d * math.cos(hdg))
+                me["lon"] += math.degrees(d * math.sin(hdg) / max(0.01, math.cos(math.radians(me["lat"]))))
+            lat, lon, alt_m, gs_ms = me["lat"], me["lon"], me["alt_m"], me["gs_ms"]
 
             sock.sendto(P.pack(P.PT_POSITION, sid, P.POSITION.pack(
                 lat, lon,                                   # 2d
-                alt_m, args.heading, 0.0, 0.0, gs_ms, 0.0, 0.0,   # 7f
-                args.com1, args.com2,                       # 2I: com1, com2
+                alt_m, me["hdg"], 0.0, 0.0, gs_ms, 0.0, 0.0,   # 7f
+                me["com1"], args.com2,                      # 2I: com1, com2
                 0,                                          # lights
-                1 if args.atc else 0,                       # onGround
+                me["on_ground"],                            # onGround
                 P.TX_COM1 if args.talk else P.TX_NONE,      # txRadio
                 P.RX_COM1 | (P.RX_COM2 if args.com2 else 0),   # rxMask
                 int(time.monotonic() * 1000) & 0xFFFFFFFF,  # timeMs
-                args.heading,                               # trackTrue
+                me["hdg"],                                  # trackTrue
                 0.0,                                        # vsMs
-                args.squawk,                                # squawk
+                me["squawk"],                               # squawk
                 args.xpdr,                                  # xpdrMode
                 0)), dest)                                  # xpdrIdent
 
@@ -207,8 +293,8 @@ def run(args):
                 for i in range(1, args.inject + 1):
                     entries.append(P.TRAFFIC_ENTRY.pack(
                         i, P.pad(f"AI{i:03d}", 16), P.pad("A320", 8), lat, lon + 0.01 * i, alt_m + 100.0 * i,
-                        args.heading, 0.0, 0.0, gs_ms, 1.0, 0.0, 0, 0, 0, P.XPDR_ALT,
-                        int(time.monotonic() * 1000) & 0xFFFFFFFF, args.heading, 0.0, P.pad("", 16),
+                        me["hdg"], 0.0, 0.0, gs_ms, 1.0, 0.0, 0, 0, 0, P.XPDR_ALT,
+                        int(time.monotonic() * 1000) & 0xFFFFFFFF, me["hdg"], 0.0, P.pad("", 16),
                         2000 + i, 0, 0))
                     if len(entries) == P.MAX_TRAFFIC_ENTRIES or i == args.inject:
                         sock.sendto(P.pack(P.PT_AI_TRAFFIC, sid, P.TRAFFIC_HDR.pack(len(entries), 0)
@@ -223,7 +309,7 @@ def run(args):
             if args.talk and time.time() >= next_text:
                 msg = f"{args.callsign} position report".encode()
                 sock.sendto(P.pack(P.PT_TEXT, sid, P.TEXT_HDR.pack(
-                    args.com1, sid, P.pad(args.callsign, 16), len(msg), P.pad("", 16)) + msg), dest)
+                    me["com1"], sid, P.pad(args.callsign, 16), len(msg), P.pad("", 16)) + msg), dest)
                 next_text = time.time() + 5.0
 
             time.sleep(tick)
@@ -271,6 +357,12 @@ if __name__ == "__main__":
     ap.add_argument("--rules", default="V", help="flight plan rules: I, V, Y or Z")
     ap.add_argument("--cruise", type=int, default=3500, help="flight plan cruise altitude, ft")
     ap.add_argument("--remarks", default="")
+    ap.add_argument("--script", default="", metavar="FILE",
+                    help="a scripted pilot: one command per line -- wait S | say TEXT | waitfor REGEX [S] | "
+                         "com1 KHZ | pos LAT LON ALT_FT GS_KT HDG [ground|air] | squawk NNNN | plan DEP DEST ROUTE | end "
+                         "(FILE, or - for stdin). "
+                         "In say TEXT, {squawk} {climb} {fl} {rwy} {sid} are filled from the last text received")
+    ap.add_argument("--on-ground", action="store_true", help="report on the ground (a parked or taxiing aircraft)")
     ap.add_argument("--direct", default="", metavar="'CALLSIGN message'",
                     help="send one direct message after logging in")
     run(ap.parse_args())

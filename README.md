@@ -335,6 +335,12 @@ python3 tools/fake_client.py --callsign ESNB34 --lat 57.88 --lon 27.05 --heading
 Both should list each other on the `traffic:` line, and ESNB34 should receive
 ESNA12's text message.
 
+`fake_client.py --script FILE` (or `--script -` for stdin) plays a pilot from a script: `say TEXT` on
+COM1 (with `{squawk}`, `{climb}`, `{fl}`, `{rwy}`, `{sid}` filled from the last text received),
+`waitfor REGEX [seconds]`, `com1 KHZ`, `pos LAT LON ALT_FT GS_KT HDG ground|air`, `squawk NNNN`,
+`plan DEP DEST ROUTE`, `wait S`, `end`. TowerTrainer's `tests/aiatc.test.mjs` flies one from a stand
+at EETN to the airspace boundary under its AI controllers this way.
+
 ## Building the plugin
 
 The window needs `lib/imgui` (fetched by `tools/fetch_deps.sh`); `-DXRADIO_UI_IMGUI=OFF` builds the text-only

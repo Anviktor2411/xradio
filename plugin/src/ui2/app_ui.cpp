@@ -529,6 +529,11 @@ void drawWizard(Model& m, const Actions& a) {
         auto fields = describe(e);
         for (auto& f : fields) if (std::string(f.key) == "pttkey") drawField(f, m, a);
         muted("Or bind the command xradio/ptt to a joystick button in X-Plane.");
+    } else if (w.step == 4) {
+        auto fields = describe(e);
+        for (auto& f : fields) if (std::string(f.key) == "simbriefuser") drawField(f, m, a);
+        muted(tr("Optional: with your SimBrief username or pilot ID, the Flight plan tab imports your latest OFP with one press (official API, only when you press). Leave it empty to skip."));
+        if (ImGui::Button(tr("Plan on SimBrief")) && a.openUrl) a.openUrl(kSimbriefNewFlightUrl);
     } else {
         if (ImGui::RadioButton("Join a friend's flight", !e.hostEnabled)) e.hostEnabled = false;
         ImGui::SameLine(); if (ImGui::RadioButton("Host it myself", e.hostEnabled)) e.hostEnabled = true;

@@ -24,6 +24,7 @@ on screen ("the server runs another XRadio version").
   X-Plane .fms* saves the route for the FMS (never overwriting without a second press), and the
   clearance ATC answers with is shown next to the plan with differences marked. HTTP 400 (unknown user
   or no flight planned yet) is explained in plain words; *Plan on SimBrief* opens SimBrief's own page.
+  The first-run wizard asks for the SimBrief username as its optional last step.
 - **Tower mode.** Plugins → XRadio → *Tower mode* (`xradio/tower/toggle`): the camera moves to the
   tower cab of the airport TowerTrainer is running (the `apt.dat` viewpoint, else the OpenStreetMap
   tower), your aircraft is frozen and restored exactly on leaving, and five windows show the trainer's

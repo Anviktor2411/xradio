@@ -21,6 +21,7 @@ const Pair kEt[] = {
     {"ATIS", "ATIS"}, {"Read", "Loe"}, {"Listen", "Kuula"}, {"Hide computer-flown", "Peida arvuti lennatavad"}, {"Filter", "Filter"},
     {"nobody else is in this flight", "kedagi teist lennus pole"}, {"Message", "Sõnum"}, {"Say", "Ütle"}, {"Send", "Saada"},
     {"wilco", "wilco"}, {"roger", "roger"}, {"say again", "say again"}, {"unable", "unable"}, {"private", "privaatne"}, {"to", "kellele"},
+    {"Optional: with your SimBrief username or pilot ID, the Flight plan tab imports your latest OFP with one press (official API, only when you press). Leave it empty to skip.", "Valikuline: SimBriefi kasutajanime või piloodi ID-ga impordib lennuplaani leht sinu viimase OFP ühe vajutusega (ametlik API, ainult vajutades). Jäta tühjaks, kui ei kasuta."},
     {"Plan on SimBrief", "Planeeri SimBriefis"}, {"fetching...", "laen..."}, {"no OFP imported yet", "OFP-d pole veel imporditud"},
     {"enter your SimBrief username or pilot ID in Settings > SimBrief", "sisesta SimBriefi kasutajanimi või piloodi ID: Seaded > SimBrief"},
     {"rwy ", "rada "}, {"alternate", "varulennuväli"}, {"cruise", "reisikõrgus"}, {"route", "marsruut"}, {"fuel block / trip", "kütus block / trip"},

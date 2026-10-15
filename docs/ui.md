@@ -66,8 +66,9 @@ The light theme: ![radio light](ui/radio-light.png)
 ## First run
 
 The wizard opens when there is no callsign yet: who you are (callsign, aircraft type), audio (devices and
-a mic test), push-to-talk (press a key), and the flight (join by address / join code, or host). Skip is
-always available; Settings has everything afterwards.
+a mic test), push-to-talk (press a key), the flight (join by address / join code, or host), and -- optional --
+your SimBrief username or Pilot ID for the Flight plan tab's import. Skip is always available; Settings has
+everything afterwards.
 
 ## Code
 

@@ -175,10 +175,10 @@ private:
     std::deque<Toast> items_;
 };
 
-// The first-run wizard: four short steps, with what blocks the next one.
+// The first-run wizard: five short steps, with what blocks the next one (the SimBrief one never does).
 struct Wizard {
-    int step = 0;                     // 0 callsign/type, 1 audio, 2 push-to-talk, 3 host or join
-    static constexpr int kSteps = 4;
+    int step = 0;                     // 0 callsign/type, 1 audio, 2 push-to-talk, 3 host or join, 4 SimBrief (optional)
+    static constexpr int kSteps = 5;
     static std::string blocker(int step, const Settings& s, const VoiceInfo& v);   // "" when the step is complete
     static const char* title(int step, const char* lang);
 };

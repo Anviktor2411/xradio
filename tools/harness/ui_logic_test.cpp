@@ -65,6 +65,7 @@ int main() {
     s.host = "K7M2Q-X4PB9";
     check(Wizard::blocker(3, s, v).empty(), "a join code satisfies the last step");
     check(std::string(Wizard::title(0, "et")) == "Kes sa oled" && std::string(Wizard::title(0, "en")) == "Who you are", "wizard titles in both languages");
+    check(Wizard::kSteps == 5 && std::string(Wizard::title(4, "en")) == "SimBrief (optional)" && Wizard::blocker(4, s, v).empty(), "wizard step 5 is SimBrief and never blocks");
 
     FlightPlanView fp;
     fp.dep = "EETN"; fp.dest = "EVRA"; fp.type = "A320"; fp.rules = "I"; fp.cruise = "36000";
