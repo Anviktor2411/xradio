@@ -22,6 +22,9 @@ option(XRADIO_BUILD_TESTS "Build the test harness (needs no X-Plane)"      OFF)
 # The test builds run under AddressSanitizer/UBSan on GCC and Clang. A toolchain
 # without the sanitizer runtimes (MinGW-w64, for one) builds them with this off.
 option(XRADIO_SANITIZE    "Sanitizers in the test builds (GCC/Clang)"        ON)
+# The Dear ImGui window (lib/imgui, fetched by tools/fetch_deps.sh). OFF keeps the text-only window,
+# which is also what the test builds use (the stub SDK has no OpenGL).
+option(XRADIO_UI_IMGUI    "The Dear ImGui user interface"                    ON)
 
 if(NOT EXISTS "${XPLANE_SDK}/CHeaders/XPLM/XPLMPlugin.h")
     message(FATAL_ERROR
@@ -156,9 +159,35 @@ if(WIN32 AND NOT EXISTS "${XPLANE_SDK}/Libraries/Win")
     set(XR_BUILD_PLUGIN OFF)
 endif()
 
+set(XR_IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/imgui")
+set(XR_UI2_SOURCES
+    plugin/src/ui2/app_ui.cpp plugin/src/ui2/host.cpp plugin/src/ui2/i18n.cpp plugin/src/ui2/imgui_xp.cpp
+    plugin/src/ui2/model.cpp plugin/src/ui2/theme.cpp)
+set(XR_IMGUI_SOURCES "${XR_IMGUI_DIR}/imgui.cpp" "${XR_IMGUI_DIR}/imgui_draw.cpp" "${XR_IMGUI_DIR}/imgui_tables.cpp" "${XR_IMGUI_DIR}/imgui_widgets.cpp")
+
 if(XR_BUILD_PLUGIN)
-add_library(XRadio SHARED ${XR_PLUGIN_SOURCES})
+if(XRADIO_UI_IMGUI AND NOT EXISTS "${XR_IMGUI_DIR}/imgui.cpp")
+    message(WARNING "lib/imgui not found (run tools/fetch_deps.sh): building the text-only window")
+    set(XRADIO_UI_IMGUI OFF)
+endif()
+
+if(XRADIO_UI_IMGUI)
+    add_library(XRadio SHARED ${XR_PLUGIN_SOURCES} ${XR_UI2_SOURCES} ${XR_IMGUI_SOURCES})
+else()
+    add_library(XRadio SHARED ${XR_PLUGIN_SOURCES})
+endif()
 xradio_configure_target(XRadio)
+if(XRADIO_UI_IMGUI)
+    target_compile_definitions(XRadio PRIVATE XRADIO_UI_IMGUI=1 IMGUI_DISABLE_OBSOLETE_FUNCTIONS=1)
+    target_include_directories(XRadio PRIVATE "${XR_IMGUI_DIR}")
+    if(WIN32)
+        target_link_libraries(XRadio PRIVATE opengl32)
+    elseif(APPLE)
+        target_link_libraries(XRadio PRIVATE "-framework OpenGL")
+    else()
+        target_link_libraries(XRadio PRIVATE GL)
+    endif()
+endif()
 
 if(XRADIO_USE_XPMP2)
     target_link_libraries(XRadio PRIVATE XPMP2)
@@ -269,6 +298,17 @@ if(XRADIO_BUILD_TESTS)
     xradio_test_exe(settings_test  tools/harness/settings_test.cpp)
     xradio_test_exe(hosting_test   tools/harness/hosting_test.cpp)
     xradio_test_exe(tower_test     tools/harness/tower_test.cpp)
+    # the new window's logic, without ImGui or X-Plane
+    add_executable(ui_logic_test tools/harness/ui_logic_test.cpp plugin/src/ui2/model.cpp)
+    target_include_directories(ui_logic_test PRIVATE plugin/src)
+    target_compile_features(ui_logic_test PRIVATE cxx_std_17)
+    # the window rendered to PNG files for the documentation (needs lib/imgui, no OpenGL)
+    if(EXISTS "${XR_IMGUI_DIR}/imgui.cpp")
+        add_executable(ui_preview tools/ui_preview/main.cpp plugin/src/ui2/app_ui.cpp plugin/src/ui2/i18n.cpp plugin/src/ui2/model.cpp plugin/src/ui2/theme.cpp ${XR_IMGUI_SOURCES})
+        target_include_directories(ui_preview PRIVATE plugin/src "${XR_IMGUI_DIR}")
+        target_compile_definitions(ui_preview PRIVATE IMGUI_DISABLE_OBSOLETE_FUNCTIONS=1)
+        target_compile_features(ui_preview PRIVATE cxx_std_17)
+    endif()
     # Not a test: renders a WAV through the radio chain so it can be listened to.
     xradio_test_exe(radio_demo     tools/harness/radio_demo.cpp)
 

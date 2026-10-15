@@ -23,6 +23,9 @@
 #include "weather.h"
 #include "xpmp_bridge.h"
 #include "tower.h"
+#ifdef XRADIO_UI_IMGUI
+#  include "ui2/host.h"
+#endif
 
 #include "XPLMDataAccess.h"
 #include "XPLMDisplay.h"
@@ -485,6 +488,13 @@ xr::UdpSocket    g_sock;
 std::atomic<uint32_t> g_sessionId{0};      // read by the network thread too
 std::atomic<uint32_t> g_txFreqKhz{0};      // radio the PTT keys, for voice packets
 bool             g_connected    = false;
+#ifdef XRADIO_UI_IMGUI
+int   g_pktCount = 0;          // packets dispatched this second (the window's connection line)
+float g_pktCountAt = 0.f;
+int   g_pktRate = 0;
+xr::ui2::Model   buildModel();
+xr::ui2::Actions makeActions();
+#endif
 float            g_elapsed      = 0.f;
 float            g_lastLogin    = -99.f;
 float            g_firstLogin   = -1.f;     // when this connection attempt began
@@ -540,9 +550,21 @@ XPLMFlightLoopID g_loop         = nullptr;
 XPLMCommandRef   g_cmdPtt       = nullptr;
 XPLMMenuID       g_menu         = nullptr;
 
+// The window's structured log (Phase U): every chat line, with who / what / where when known.
+struct Msg { float t = 0; std::string from, text; uint32_t khz = 0; bool atc = false, priv = false, mine = false, guard = false, system = true; };
+std::vector<Msg> g_msgLog;
 void addChat(const std::string& s) {
     g_chatLog.push_back(s);
     if (g_chatLog.size() > 12) g_chatLog.erase(g_chatLog.begin());
+    Msg m; m.t = g_elapsed; m.text = s;
+    g_msgLog.push_back(m);
+    if (g_msgLog.size() > 200) g_msgLog.erase(g_msgLog.begin());
+}
+// Fills in the last line's sender and kind (handleText / sendText call this right after addChat).
+void tagLastMsg(const std::string& from, const std::string& text, uint32_t khz, bool atc, bool priv, bool mine) {
+    if (g_msgLog.empty()) return;
+    Msg& m = g_msgLog.back();
+    m.from = from; m.text = text; m.khz = khz; m.atc = atc; m.priv = priv; m.mine = mine; m.guard = xr::isGuard(khz); m.system = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -577,6 +599,9 @@ float noticeHoldS() {
 void updateNotices();          // defined with the window, below
 
 void pushNotice(const std::string& text, int colour) {
+#ifdef XRADIO_UI_IMGUI
+    if (!text.empty()) xr::ui2::host::toast(text, colour == 1 ? 1 : colour == 2 ? 2 : 0);
+#endif
     if (!g_cfg.popUps || text.empty()) return;
     g_notices.push_back({text, g_elapsed, colour});
     if (g_notices.size() > kMaxNotices) g_notices.erase(g_notices.begin());
@@ -1104,6 +1129,7 @@ void handleText(const uint8_t* payload, int len) {
                  from.c_str(), msg.c_str());
     }
     addChat(line);
+    tagLastMsg(from, msg, th.freqKhz, fromAtc, !to.empty(), false);
     // Amber for the two that were aimed at getting your attention, green for
     // a controller, white for ordinary chatter on a frequency you are already
     // listening to.
@@ -1383,6 +1409,9 @@ void netStop() {
 
 // Main thread: dispatch what the network thread queued.
 void pumpNetwork() {
+#ifdef XRADIO_UI_IMGUI
+    if (g_elapsed - g_pktCountAt >= 1.f) { g_pktRate = g_pktCount; g_pktCount = 0; g_pktCountAt = g_elapsed; }
+#endif
     std::deque<std::vector<uint8_t>> batch;
     {
         std::lock_guard<std::mutex> lk(g_inboxMx);
@@ -1393,6 +1422,9 @@ void pumpNetwork() {
         memcpy(&h, pkt.data(), sizeof(h));
         const uint8_t* payload = pkt.data() + sizeof(h);
         g_lastRxTime = g_elapsed;
+#ifdef XRADIO_UI_IMGUI
+        ++g_pktCount;
+#endif
 
         switch (h.type) {
             case xr::PT_LOGIN_ACK: {
@@ -1480,6 +1512,9 @@ float g_lastAircraftCheck = 0.f;
 float flightLoop(float elapsedSinceLast, float, int, void*) {
     g_elapsed += elapsedSinceLast;
     xr::tower::tick(elapsedSinceLast, g_elapsed);
+#ifdef XRADIO_UI_IMGUI
+    xr::ui2::host::update(buildModel());
+#endif
 
     if (!g_sockReady.load()) {
         // Not open yet: either still resolving, or it failed and the thread
@@ -1659,6 +1694,7 @@ int pttHandler(XPLMCommandRef, XPLMCommandPhase phase, void*) {
 int g_pttKeyVk = 0;
 
 int pttKeySniffer(char, XPLMKeyFlags flags, char vk, void*) {
+    if (g_cfg.towerKey > 0 && (unsigned char)vk == (unsigned char)g_cfg.towerKey && (flags & xplm_DownFlag) && !(flags & xplm_UpFlag)) { xr::tower::toggle(); return 0; }
     const int k = (unsigned char)vk;
     if (g_pttKeyVk == 0 || k != g_pttKeyVk) return 1;      // not ours, pass it on
     if (flags & xplm_DownFlag) setPtt(true);
@@ -2435,6 +2471,10 @@ void applyLiveSettings() {
 }
 
 void openSettings() {
+#ifdef XRADIO_UI_IMGUI
+    xr::ui2::host::showSettings();
+    return;
+#endif
     g_edit = g_cfg;
     g_settingsNote.clear();
     g_captureKey = false;
@@ -2962,6 +3002,9 @@ void createSettingsWindow() {
 // Last resort if a window is dragged off-screen, or the monitor layout
 // changed while X-Plane was running.
 void resetWindowPositions() {
+#ifdef XRADIO_UI_IMGUI
+    xr::ui2::host::resetPositions();
+#endif
     int l, t, r, b;
     if (g_window) {
         safeWindowRect(460, 400, 0, &l, &t, &r, &b);
@@ -3017,10 +3060,151 @@ const struct { const char* name; const char* desc; } kTowerCmds[] = {
     {"xradio/tower/windows",     "XRadio tower: show / hide the tower windows"},
 };
 
+#ifdef XRADIO_UI_IMGUI
+// ---------------------------------------------------------------------------
+// Phase U: what the new window shows (filled every frame) and what it can ask for
+// ---------------------------------------------------------------------------
+uint32_t standbyKhz(int which) {
+    XPLMDataRef r = XPLMFindDataRef(which == 2 ? "sim/cockpit2/radios/actuators/com2_standby_frequency_hz_833" : "sim/cockpit2/radios/actuators/com1_standby_frequency_hz_833");
+    return r ? (uint32_t)XPLMGetDatai(r) : 0;
+}
+void setStandbyKhz(int which, uint32_t khz) {
+    XPLMDataRef r = XPLMFindDataRef(which == 2 ? "sim/cockpit2/radios/actuators/com2_standby_frequency_hz_833" : "sim/cockpit2/radios/actuators/com1_standby_frequency_hz_833");
+    if (r) XPLMSetDatai(r, (int)khz);
+}
+uint32_t g_guardPrevKhz = 0;
+
+xr::ui2::Actions makeActions() {
+    xr::ui2::Actions a;
+    a.tune = [](int which, uint32_t khz) { tuneRadio(which, khz); };
+    a.setStandby = [](int which, uint32_t khz) { setStandbyKhz(which, khz); };
+    a.swap = [](int which) { const uint32_t act = comKhz(which), stby = standbyKhz(which); if (stby) tuneRadio(which, stby); if (act) setStandbyKhz(which, act); };
+    a.setVolume = [](int which, float v) { XPLMDataRef r = which == 2 ? g_ref.volCom2 : g_ref.volCom1; if (r) XPLMSetDataf(r, v); };
+    a.setGuard = [](bool on) {
+        if (on) { g_guardPrevKhz = comKhz(2); tuneRadio(2, 121500); }
+        else if (g_guardPrevKhz) { tuneRadio(2, g_guardPrevKhz); g_guardPrevKhz = 0; }
+    };
+    a.sendText = [](const std::string& t) { sendText(t); };
+    a.fileFlightPlan = []() { return sendFlightPlan(); };
+    a.cancelFlightPlan = []() { cancelFlightPlan(); };
+    a.applySettings = [](const xr::Settings& s) { g_edit = s; applySettings(); xr::ui2::host::applyDisplay(g_cfg); };
+    a.reconnect = []() { loadConfig(); reconnect(); };
+    a.refreshDevices = []() { refreshDeviceLists(); };
+    a.copyAddress = []() { mainButton(kBtnCopy); return std::string(g_mainCopyOk ? "copied" : "could not copy"); };
+    a.toggleTower = []() { xr::tower::toggle(); };
+    a.keyPtt = [](bool down) { setPtt(down); };
+    a.openUrl = [](const std::string& url) { xr::ui2::openUrlNative(url); };
+    a.importSimbrief = []() { pushNotice("SimBrief import arrives with the flight-plan tab update (S3)", 1); };
+    a.writeFms = []() { return std::string("writing .fms files arrives with S3"); };
+    a.checkUpdate = []() {};
+    return a;
+}
+
+xr::ui2::Model buildModel() {
+    xr::ui2::Model m;
+    m.elapsed = g_elapsed;
+    m.settings = g_cfg;
+    m.conn.connected = g_connected;
+    m.conn.connecting = !g_connected && g_sockReady.load();
+    m.conn.status = g_status;
+    m.conn.endpoint = g_sockReady.load() ? g_sock.endpoint() : std::string();
+    m.conn.callsign = g_cfg.callsign; m.conn.icao = effectiveIcao(); m.conn.livery = effectiveLivery();
+    m.conn.protoLocal = xr::kProtoVersion; m.conn.protoServer = g_connected ? xr::kProtoVersion : 0;
+    if (g_status.find("another XRadio version") != std::string::npos) m.conn.versionMismatch = g_status;
+    m.conn.lastPacketS = g_lastRxTime < 0 ? -1.f : g_elapsed - g_lastRxTime;
+    m.conn.packetsPerS = g_pktRate;
+    int peers = 0, ais = 0;
+    for (const auto& kv : g_remote) { if (kv.second.ai) ++ais; else ++peers; }
+    m.conn.peers = peers; m.conn.aiCount = ais;
+    if (g_connected) {
+        m.conn.skyLine = !xr::weather::available() ? "my own (X-Plane 11 cannot share weather)" : someoneElseIsTheSky() ? (g_cfg.followWeather ? "the flight's" : "the flight's (not following)") : g_cfg.shareWeather ? "mine, shared with the flight" : "my own";
+    }
+    const std::vector<uint32_t> speakers = xr::voice::activeSpeakers();
+    float bestSignal = 0.f;
+    std::string who;
+    for (uint32_t sid : speakers) {
+        auto it = g_remote.find(sid);
+        if (who.empty()) who = it != g_remote.end() ? it->second.callsign : std::to_string(sid);
+        bestSignal = std::max(bestSignal, xr::voice::signalQualityOf(sid));
+    }
+    m.txWho = who;
+    m.pttDown = g_pttDown; m.pttDownAt = g_pttDownAt;
+    for (int i = 0; i < 2; ++i) {
+        xr::ui2::Com& c = m.com[i];
+        c.which = i + 1; c.activeKhz = comKhz(i + 1); c.standbyKhz = standbyKhz(i + 1); c.powered = comPowered(i + 1);
+        for (const auto& st : g_atcList) if (st.freqKhz && st.freqKhz == c.activeKhz) { c.stationName = st.callsign; break; }
+        const bool txHere = txCom() == i + 1;
+        c.tx = g_pttDown && txHere;
+        c.rx = !speakers.empty() && txHere;
+        c.signal = c.rx ? bestSignal : 0.f;
+        const XPLMDataRef vr = i == 0 ? g_ref.volCom1 : g_ref.volCom2;
+        c.volume = vr ? XPLMGetDataf(vr) : 1.f;
+    }
+    m.guard = comKhz(2) == 121500;
+    const uint32_t c1 = comKhz(1), c2 = comKhz(2);
+    for (const auto& st : g_atcList) {
+        xr::ui2::Station x;
+        x.callsign = st.callsign; x.kindName = atcKindName(st.kind); x.icao = st.icao; x.freqKhz = st.freqKhz;
+        x.atis = st.kind == xr::ATC_ATIS; x.tuned = st.freqKhz && (st.freqKhz == c1 || st.freqKhz == c2);
+        x.ai = st.callsign.find("TTRAIN") != std::string::npos;
+        m.atc.push_back(x);
+    }
+    for (const auto& kv : g_atis) {
+        const AtisText& at = kv.second;
+        if (at.freqKhz != c1 && at.freqKhz != c2) continue;
+        if (g_elapsed - at.at > 600.f) continue;
+        m.atis.emplace_back(at.icao + " information " + std::string(1, at.letter), at.text);
+    }
+    const double myLat = dd(g_ref.lat), myLon = dd(g_ref.lon);
+    for (const auto& kv : g_remote) {
+        const Remote& r = kv.second;
+        xr::ui2::Pilot q;
+        q.sid = r.sid; q.callsign = r.callsign; q.type = r.acIcao; q.distNm = distanceNm(myLat, myLon, r.lat, r.lon);
+        q.altFt = r.altMslM * 3.28084f; q.gsKt = r.gsMs * 1.94384f; q.squawk = r.squawk; q.ai = r.ai; q.drawn = r.drawn;
+        q.talking = std::find(speakers.begin(), speakers.end(), r.sid) != speakers.end();
+        q.signal = q.talking ? xr::voice::signalQualityOf(r.sid) : 0.f;
+        q.emergency = r.squawk == 7500 || r.squawk == 7600 || r.squawk == 7700;
+        m.pilots.push_back(q);
+    }
+    for (const Msg& x : g_msgLog) {
+        xr::ui2::Message mm;
+        mm.t = x.t; mm.from = x.from; mm.text = x.text; mm.freqKhz = x.khz; mm.atc = x.atc; mm.priv = x.priv; mm.mine = x.mine; mm.guard = x.guard; mm.system = x.system;
+        char tt[16]; snprintf(tt, sizeof tt, "%d:%02d", (int)x.t / 60, (int)x.t % 60); mm.timeText = tt;
+        m.messages.push_back(mm);
+    }
+    m.fp.rules = g_cfg.fpRules; m.fp.dep = g_cfg.fpDep; m.fp.dest = g_cfg.fpDest; m.fp.altn = g_cfg.fpAltn; m.fp.type = effectiveIcao(); m.fp.callsign = g_cfg.callsign;
+    m.fp.route = g_cfg.fpRoute; m.fp.cruise = g_cfg.fpCruise; m.fp.remarks = g_cfg.fpRemarks;
+    m.fp.status = g_fp.status == xr::FP_ACK ? 2 : g_fp.status == xr::FP_CLEARED ? 3 : g_fp.status == xr::FP_CANCELLED ? 4 : g_fp.filed ? 1 : 0;
+    m.fp.squawk = g_fp.squawk;
+    {
+        const xr::relay::Status st = xr::relay::status();
+        const xr::upnp::Result u = xr::upnp::latest();
+        m.host.running = st.running; m.host.port = st.port; m.host.clients = st.clients; m.host.callsigns = st.callsigns; m.host.error = st.error.empty() ? g_hostNote : st.error;
+        m.host.mapped = u.mapped; m.host.doubleNat = u.doubleNat; m.host.upnpBusy = xr::upnp::busy(); m.host.router = u.router; m.host.upnpAsked = g_cfg.hostUpnp;
+        if (st.running) {
+            m.host.address = shareAddressPlain();
+            if (!u.externalIp.empty()) m.host.joinCode = xr::joincode::encode(u.externalIp, st.port);
+            m.host.lanAddress = lanAddress();
+            if (!u.mapped && !u.error.empty()) m.host.error = u.error;
+        }
+    }
+    m.voice.available = xr::voice::available(); m.voice.haveMic = xr::voice::haveMicrophone(); m.voice.status = xr::voice::status(); m.voice.micLevel = g_pttDown ? xr::voice::micLevel() : 0.f;
+    m.voice.micDevices = g_micList; m.voice.outDevices = g_outList;
+    const xr::update::Info up = xr::update::latest();
+    m.update.newer = up.newer; m.update.latest = up.latest; m.update.url = up.url; m.update.current = xr::brand::version();
+    m.towerActive = xr::tower::active(); m.towerStatus = xr::tower::statusLine();
+    return m;
+}
+#endif
+
 void menuHandler(void*, void* item) {
     intptr_t which = (intptr_t)item;
-    if (which == 0 && g_window) {
-        XPLMSetWindowIsVisible(g_window, !XPLMGetWindowIsVisible(g_window));
+    if (which == 0) {
+#ifdef XRADIO_UI_IMGUI
+        xr::ui2::host::toggleMain();
+#else
+        if (g_window) XPLMSetWindowIsVisible(g_window, !XPLMGetWindowIsVisible(g_window));
+#endif
     } else if (which == 1) {
         openSettings();
     } else if (which == 2) {
@@ -3071,6 +3255,12 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     // and two suites already know the settings window as number two.
     createNoticeWindow();
     xr::tower::createWindows();     // windows 4..8 in the harness's numbering
+#ifdef XRADIO_UI_IMGUI
+    // the text windows stay as the fallback build; with the ImGui window they are never shown
+    if (g_window) XPLMSetWindowIsVisible(g_window, 0);
+    if (g_noticeWin) XPLMSetWindowIsVisible(g_noticeWin, 0);
+    xr::ui2::host::init(makeActions(), g_cfg);
+#endif
 
     std::string cslErr;
     if (!xr::csl::init(pluginRootDir(), effectiveIcao(), g_cfg.cslPath, &cslErr)) {
@@ -3151,6 +3341,16 @@ PLUGIN_API void XPluginDisable(void) {
 }
 
 PLUGIN_API void XPluginStop(void) {
+#ifdef XRADIO_UI_IMGUI
+    {   // remember where the window and the overlay were, and the tab
+        const std::string g = xr::ui2::host::mainGeometry(), o = xr::ui2::host::overlayPosition();
+        if (!g.empty()) g_cfg.uiWin = g;
+        if (!o.empty()) g_cfg.uiOverlayPos = o;
+        g_cfg.uiTab = std::to_string(xr::ui2::host::currentTab());
+        xr::saveSettings(g_cfg, g_cfgPath);
+    }
+    xr::ui2::host::shutdown();
+#endif
     xr::tower::shutdown();
     netStop();
     xr::relay::stop();

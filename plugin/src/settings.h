@@ -105,6 +105,17 @@ struct Settings {
     float       towerHeight = 0.f;         // metres; 0 = apt.dat / 30 m
     bool        tower3d = true;
     bool        towerWindows = true;
+    int         towerKey = 0;              // key that toggles Tower mode; 0 = none
+
+    // --- the window (Phase U) ---
+    float       uiScale = 1.f;             // 0.75 .. 2
+    std::string uiTheme = "dark";          // dark / light
+    bool        uiOverlay = true;          // the compact cockpit strip
+    std::string uiLang = "en";             // en / et
+    bool        uiWizardDone = false;      // the first-run wizard ran
+    std::string uiWin;                     // remembered window geometry "l,t,r,b"
+    std::string uiOverlayPos;              // remembered overlay position "l,t"
+    std::string uiTab = "0";               // remembered tab
 
     int         port_i() const { return atoi(port.c_str()); }
     int         hostPort_i() const { return atoi(hostPort.c_str()); }
@@ -207,6 +218,16 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"towerheight", "Cab height, m (0 = scenery)", Kind::Slider, 5, &s.towerHeight, 0.f, 120.f, "m", 0},
         {"tower3d",     "Its traffic as 3D models", Kind::Bool, 5, &s.tower3d},
         {"towerwindows", "Open the tower windows", Kind::Bool, 5, &s.towerWindows},
+        {"towerkey",    "Tower mode key", Kind::KeyBind, 5, &s.towerKey},
+
+        {"uiscale",     "UI scale",       Kind::Slider, 6, &s.uiScale, 0.75f, 2.f, "x", 2},
+        {"uitheme",     "Theme (dark, light)", Kind::Text, 6, &s.uiTheme, 0,0,"",0, 8},
+        {"uioverlay",   "Cockpit overlay strip", Kind::Bool, 6, &s.uiOverlay},
+        {"uilang",      "Language (en, et)", Kind::Text, 6, &s.uiLang, 0,0,"",0, 2},
+        {"uiwizard",    "First-run wizard done", Kind::Bool, 6, &s.uiWizardDone},
+        {"uiwin",       "Window geometry", Kind::Text, 6, &s.uiWin, 0,0,"",0, 40},
+        {"uioverlaypos", "Overlay position", Kind::Text, 6, &s.uiOverlayPos, 0,0,"",0, 20},
+        {"uitab",       "Last tab",       Kind::Text, 6, &s.uiTab, 0,0,"",0, 2, true},
     };
 }
 
@@ -217,10 +238,11 @@ inline const char* tabName(int i) {
         case 2:  return "Traffic";
         case 3:  return "Hosting";
         case 4:  return "ATC";
-        default: return "Tower";
+        case 5:  return "Tower";
+        default: return "Display";
     }
 }
-inline constexpr int kNumTabs = 6;
+inline constexpr int kNumTabs = 7;
 
 // The name of an X-Plane virtual key, for the window. Letters and digits are
 // their ASCII; the rest are the handful people actually bind.

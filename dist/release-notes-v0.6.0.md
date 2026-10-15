@@ -9,6 +9,14 @@ on screen ("the server runs another XRadio version").
 
 ### New
 
+- **A new window.** One window with a sidebar, drawn with Dear ImGui: a COM1/COM2 radio stack with
+  station names, RX/TX lights and signal strength; controllers online (click to tune, AI badges, ATIS);
+  the pilots with distance, frequency and who is talking; chat-style messages with ATC and private ones
+  highlighted, unread counts and quick replies; the flight plan with SimBrief import and the plan next to
+  the clearance you received; hosting and connecting with the address to share, router status and
+  connection quality; grouped settings with a mic test and key capture; English or Estonian; dark and
+  light themes; a compact cockpit overlay with toasts; a first-run wizard. Pops out and works in VR.
+  Screenshots in `docs/ui.md`. The old text window stays as a build option.
 - **Tower mode.** Plugins → XRadio → *Tower mode* (`xradio/tower/toggle`): the camera moves to the
   tower cab of the airport TowerTrainer is running (the `apt.dat` viewpoint, else the OpenStreetMap
   tower), your aircraft is frozen and restored exactly on leaving, and five windows show the trainer's

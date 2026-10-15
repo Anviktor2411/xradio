@@ -336,6 +336,9 @@ ESNA12's text message.
 
 ## Building the plugin
 
+The window needs `lib/imgui` (fetched by `tools/fetch_deps.sh`); `-DXRADIO_UI_IMGUI=OFF` builds the text-only
+window instead. `tools/ui_preview` renders the window to PNG files without X-Plane (`docs/ui/`).
+
 Requirements: git, CMake 3.16+, and a C++17 compiler
 (Windows: Visual Studio 2022 C++ tools; macOS: Xcode command line tools;
 Linux: gcc or clang).
@@ -555,6 +558,21 @@ the plan and holds the cap on computer-flown aircraft. Calls from a
 controller and private messages are read out by the sim so they are not
 missed with the window shut. The whole of it, for pilots and for programs
 that want to be ATC: [docs/atc.md](docs/atc.md).
+
+## The window
+
+![the Radio tab](docs/ui/radio.png)
+
+One window with a sidebar -- Radio (COM1/COM2 stack with active and standby, station names, RX/TX lights,
+signal strength, volumes, guard, the push-to-talk panel), ATC (controllers online, click to tune, ATIS),
+Pilots (roster with distance, frequency, talking indicator, AI badges, filter), Messages (chat-style log,
+private and ATC highlighted, unread badge, quick replies, @-completion), Flight plan (SimBrief import,
+file, plan vs. clearance), Host / Connect (hosting with the address to share and router status, join by
+address or code, connection quality and server version), Settings (grouped; mic test, key capture, scale,
+theme, language English / Eesti) and Tower -- plus a compact cockpit overlay with toasts and a four-step
+first-run wizard. Drawn with Dear ImGui (MIT) in X-Plane's own windows: pop-out, VR and HiDPI like any
+other. Screenshots of every tab and the details are in `docs/ui.md`; the earlier text-only window remains
+as the fallback build (`-DXRADIO_UI_IMGUI=OFF`).
 
 ## Tower mode: control from the tower in X-Plane
 

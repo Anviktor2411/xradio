@@ -18,7 +18,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-CXX=x86_64-w64-mingw32-g++
+CXX=${CXX:-x86_64-w64-mingw32-g++}
 if ! command -v "$CXX" > /dev/null; then
     echo "  skip  $CXX not installed (apt-get install mingw-w64)"
     exit 0
@@ -33,14 +33,21 @@ FLAGS=(-std=c++17 -fsyntax-only -Wall -Wextra
        -DIBM=1 -DNOMINMAX -D_CRT_SECURE_NO_WARNINGS
        -DXPLM200=1 -DXPLM210=1 -DXPLM300=1 -DXPLM301=1 -DXPLM303=1
        -Iplugin/src "-I$SDK/CHeaders/XPLM" "-I$SDK/CHeaders/Widgets")
+UI2=""
+if [ -f lib/imgui/imgui.h ]; then
+    FLAGS+=(-DXRADIO_UI_IMGUI=1 -Ilib/imgui)
+    UI2="plugin/src/ui2/app_ui.cpp plugin/src/ui2/host.cpp plugin/src/ui2/i18n.cpp plugin/src/ui2/imgui_xp.cpp plugin/src/ui2/model.cpp plugin/src/ui2/theme.cpp"
+else
+    echo "  note  lib/imgui not fetched -- skipping the ImGui window"
+fi
 
 # Voice needs Opus and miniaudio; skip it rather than fail if they are absent.
 if [ -f lib/miniaudio/miniaudio.h ] && [ -d lib/opus/include ]; then
     FLAGS+=(-DXRADIO_USE_VOICE=1 -Ilib/miniaudio -Ilib/opus/include)
     SOURCES="plugin/src/clipboard.cpp plugin/src/main.cpp plugin/src/net.cpp
              plugin/src/server.cpp plugin/src/ui.cpp plugin/src/upnp.cpp
-             plugin/src/voice.cpp plugin/src/xpmp_bridge.cpp
-             tools/server_main.cpp"
+             plugin/src/voice.cpp plugin/src/xpmp_bridge.cpp plugin/src/tcp.cpp plugin/src/tower.cpp
+             tools/server_main.cpp $UI2"
 else
     echo "  note  Opus/miniaudio not fetched -- skipping voice.cpp"
     SOURCES="plugin/src/clipboard.cpp plugin/src/main.cpp plugin/src/net.cpp
