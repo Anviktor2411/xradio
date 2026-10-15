@@ -29,7 +29,7 @@ import protocol as P          # noqa: E402
 # Every struct whose layout both sides have to agree on.
 STRUCTS = ("HEADER", "LOGIN", "LOGIN_ACK", "LOGIN_REJECT", "POSITION",
            "TRAFFIC_HDR", "TRAFFIC_ENTRY", "TEXT_HDR", "VOICE_HDR", "WEATHER",
-           "ROSTER_HDR", "ROSTER_ENTRY")
+           "ROSTER_HDR", "ROSTER_ENTRY", "FLIGHTPLAN", "ATIS_HDR", "ATC_LIST_HDR", "ATC_ENTRY")
 
 # Not structs, but the same class of mistake: a packet budget, an entry cap or
 # a well-known frequency that drifts apart shows up as traffic that thins out
@@ -40,6 +40,16 @@ CONSTANTS = (
     ("MAX_ROSTER_ENTRIES", lambda: P.MAX_ROSTER_ENTRIES),
     ("PT_ROSTER", lambda: P.PT_ROSTER),
     ("GUARD_KHZ", lambda: P.GUARD_KHZ),
+    ("PROTO_VERSION", lambda: P.PROTO_VERSION),
+    ("MAX_ATC_ENTRIES", lambda: P.MAX_ATC_ENTRIES),
+    ("MAX_ATIS_BYTES", lambda: P.MAX_ATIS_BYTES),
+    ("PT_AI_TRAFFIC", lambda: P.PT_AI_TRAFFIC),
+    ("PT_FLIGHTPLAN", lambda: P.PT_FLIGHTPLAN),
+    ("PT_ATIS", lambda: P.PT_ATIS),
+    ("PT_ATC_LIST", lambda: P.PT_ATC_LIST),
+    ("LF_ATC", lambda: P.LF_ATC),
+    ("LF_INJECTOR", lambda: P.LF_INJECTOR),
+    ("AI_SID", lambda: P.ai_sid(7, 12)),
 )
 
 

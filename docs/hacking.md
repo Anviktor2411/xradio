@@ -3,6 +3,12 @@
 A map for anyone who wants to read, change or extend the code. The README
 says what XRadio does and how to build it; this says how it is put together,
 where things live, and the few rules that keep it working on three
+platforms. (v0.6.0 added air traffic control -- `LF_ATC`/`LF_INJECTOR` logins,
+`PT_AI_TRAFFIC`, `PT_FLIGHTPLAN`, `PT_ATIS`, `PT_ATC_LIST`: the server side is
+`_on_ai_traffic` / `_on_flightplan` / `_on_atis` / `_broadcast_atc_list` in
+`server/server.py` and the same names in `plugin/src/server.cpp`; the plugin
+side is `handleAtcList` / `handleAtis` / `handleFlightPlan` / `sendFlightPlan`
+in `main.cpp` and the ATC tab in `settings.h`. `docs/atc.md` has the protocol.)
 platforms and two sims.
 
 ## The shape of it

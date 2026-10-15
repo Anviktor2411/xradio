@@ -19,6 +19,9 @@ set(XPLANE_SDK "${CMAKE_CURRENT_SOURCE_DIR}/lib/XPMP2/lib/SDK"
 option(XRADIO_USE_XPMP2   "Render other pilots as CSL models using XPMP2"   ON)
 option(XRADIO_USE_VOICE   "Voice over the radio (Opus + miniaudio)"        ON)
 option(XRADIO_BUILD_TESTS "Build the test harness (needs no X-Plane)"      OFF)
+# The test builds run under AddressSanitizer/UBSan on GCC and Clang. A toolchain
+# without the sanitizer runtimes (MinGW-w64, for one) builds them with this off.
+option(XRADIO_SANITIZE    "Sanitizers in the test builds (GCC/Clang)"        ON)
 
 if(NOT EXISTS "${XPLANE_SDK}/CHeaders/XPLM/XPLMPlugin.h")
     message(FATAL_ERROR
@@ -243,7 +246,7 @@ if(XRADIO_BUILD_TESTS)
         # No audio hardware on a CI runner: miniaudio's null backend keeps the
         # capture/playback threads running so the whole pipeline is exercised.
         target_compile_definitions(${name} PRIVATE XRADIO_NULL_AUDIO=1)
-        if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        if(XRADIO_SANITIZE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
             target_compile_options(${name} PRIVATE -g -O1 -fsanitize=address,undefined
                                                     -fno-omit-frame-pointer)
             target_link_options(${name}    PRIVATE -fsanitize=address,undefined)
@@ -252,7 +255,7 @@ if(XRADIO_BUILD_TESTS)
 
     # The hosted server now listens on a home machine's port, so it gets the
     # sanitizers too: tools/harness/fuzz_client.py attacks this binary.
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    if(XRADIO_SANITIZE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(xradio_server PRIVATE -g -O1 -fsanitize=address,undefined
                                                      -fno-omit-frame-pointer)
         target_link_options(xradio_server    PRIVATE -fsanitize=address,undefined)
@@ -278,7 +281,7 @@ if(XRADIO_BUILD_TESTS)
         target_link_libraries(clipboard_test PRIVATE user32)
         target_compile_definitions(clipboard_test PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
     endif()
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    if(XRADIO_SANITIZE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(clipboard_test PRIVATE -g -O1 -fsanitize=address,undefined)
         target_link_options(clipboard_test    PRIVATE -fsanitize=address,undefined)
     endif()
@@ -297,7 +300,7 @@ if(XRADIO_BUILD_TESTS)
         target_link_libraries(upnp_test PRIVATE wsock32 ws2_32 iphlpapi)
         target_compile_definitions(upnp_test PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
     endif()
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    if(XRADIO_SANITIZE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(upnp_test PRIVATE -g -O1 -fsanitize=address,undefined)
         target_link_options(upnp_test    PRIVATE -fsanitize=address,undefined)
     endif()
@@ -305,7 +308,7 @@ if(XRADIO_BUILD_TESTS)
     # Pure maths, no plugin sources needed.
     add_executable(smoothing_test tools/harness/smoothing_test.cpp)
     target_include_directories(smoothing_test PRIVATE plugin/src)
-    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    if(XRADIO_SANITIZE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(smoothing_test PRIVATE -g -O1 -fsanitize=address,undefined)
         target_link_options(smoothing_test    PRIVATE -fsanitize=address,undefined)
     endif()

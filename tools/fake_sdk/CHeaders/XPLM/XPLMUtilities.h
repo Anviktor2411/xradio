@@ -2,6 +2,7 @@
 #pragma once
 #include "XPLMDefs.h"
 void XPLMDebugString(const char*);
+void XPLMSpeakString(const char*);   // v6: ATC calls are read out
 void XPLMGetPrefsPath(char* outPrefsPath);
 const char* XPLMGetDirectorySeparator(void);
 void XPLMExtractFileAndPath(char* inFullPath);

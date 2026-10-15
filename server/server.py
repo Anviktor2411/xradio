@@ -18,6 +18,7 @@ import logging
 import math
 import os
 import shutil
+import socket
 import sys
 import time
 from dataclasses import dataclass, field
@@ -43,6 +44,15 @@ MAX_ENTRIES_TOTAL = 60
 MAX_TEXT_BYTES = 200        # cap relayed text so one client cannot spam huge frames
 ROSTER_INTERVAL_S = 5.0     # everyone in the flight, to everyone, this often and on every join/leave
 MAX_VOICE_BYTES = 512       # one 20 ms Opus frame at 24 kbit/s is ~60 bytes
+# v6. An injected aircraft the injector has stopped refreshing is gone: it
+# would otherwise hang in everyone's sky after the program driving it died.
+AI_TIMEOUT_S = 5.0
+# ...and how many one injector may drive: the same cap one client's traffic
+# packet set gets, nearest first on the way out.
+MAX_AI_PER_INJECTOR = MAX_ENTRIES_TOTAL
+# The ATC list goes out with the roster: whenever a station joins or leaves,
+# and this often besides.
+ATC_LIST_INTERVAL_S = ROSTER_INTERVAL_S
 
 
 @dataclass
@@ -78,6 +88,13 @@ class Session:
     squawk: int = 1200          # the four digits as they read on the panel
     xpdr_mode: int = P.XPDR_ALT
     xpdr_ident: int = 0
+    # v6
+    atc: bool = False           # an ATC station: never relayed as traffic, listed in PT_ATC_LIST
+    injector: bool = False      # drives aircraft of its own (PT_AI_TRAFFIC)
+    ai: bool = False            # this record is one of those aircraft, not a client
+    owner: int = 0              # ...and this is the injector it belongs to
+    fp: bytes = None            # a pilot's latest flight plan, as it will be relayed
+    atis_seen: dict = field(default_factory=dict)   # icao -> letter already sent to this pilot
 
     @property
     def alt_ft(self) -> float:
@@ -104,6 +121,43 @@ class Session:
 def _clean(s: str, maxlen: int) -> str:
     """Keep printable ASCII only: these strings end up on other pilots' screens."""
     return "".join(c for c in s if 32 <= ord(c) < 127)[:maxlen].strip()
+
+
+def disable_udp_reset(transport):
+    """Windows only: stop a vanished client from costing us other clients' packets.
+
+    When a datagram is sent to a port nobody listens on any more, Windows
+    answers itself with an ICMP "port unreachable" and reports it on the next
+    receive of the *sending* socket as WSAECONNRESET -- and that failed
+    receive is a receive that did not happen, so a packet from somebody else
+    is lost. A pilot who closed X-Plane while the server still relayed
+    traffic to them produced a steady stream of those, and single packets
+    from everyone else (a text, a flight plan) went missing until the dead
+    session timed out. The C++ server switches the behaviour off with
+    SIO_UDP_CONNRESET; this is the same switch, from Python."""
+    if os.name != "nt":
+        return
+    sock = transport.get_extra_info("socket") if transport else None
+    if sock is None:
+        return
+    # asyncio hands out a read-only wrapper; the real socket is behind it.
+    # Python's socket.ioctl() knows only three control codes and this is not
+    # one of them, so the call goes straight to Winsock.
+    raw = getattr(sock, "_sock", sock)
+    try:
+        import ctypes
+        ws2 = ctypes.windll.ws2_32
+        ws2.WSAIoctl.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong,
+                                 ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p,
+                                 ctypes.c_void_p]
+        ws2.WSAIoctl.restype = ctypes.c_int
+        sio_udp_connreset = 0x9800000C          # _WSAIOW(IOC_VENDOR, 12)
+        off = ctypes.c_ulong(0)
+        returned = ctypes.c_ulong(0)
+        ws2.WSAIoctl(raw.fileno(), sio_udp_connreset, ctypes.byref(off), ctypes.sizeof(off),
+                     None, 0, ctypes.byref(returned), None, None)
+    except (OSError, AttributeError, ValueError):
+        pass
 
 
 def distance_nm(a: Session, b: Session) -> float:
@@ -150,6 +204,12 @@ class XRadioServer(asyncio.DatagramProtocol):
         self._roster_dirty = False
         self._last_roster = 0.0
         self._roster_epoch = 0
+        # v6. Aircraft driven by injectors, by their flight-wide id; the ATIS
+        # texts on the air, by airport; and whether the ATC list changed.
+        self.ai: dict[int, Session] = {}
+        self.atis: dict[str, dict] = {}
+        self._atc_dirty = False
+        self._last_atc = 0.0
 
     # -- asyncio plumbing ---------------------------------------------------
     def connection_made(self, transport):
@@ -209,6 +269,12 @@ class XRadioServer(asyncio.DatagramProtocol):
             self._send(addr, P.PT_PONG, s.sid)
         elif ptype == P.PT_WEATHER:
             self._on_weather(s, payload)
+        elif ptype == P.PT_AI_TRAFFIC:
+            self._on_ai_traffic(s, payload)
+        elif ptype == P.PT_FLIGHTPLAN:
+            self._on_flightplan(s, payload)
+        elif ptype == P.PT_ATIS:
+            self._on_atis(s, payload)
         elif ptype == P.PT_LOGOUT:
             self._drop(s, "logout")
 
@@ -250,15 +316,24 @@ class XRadioServer(asyncio.DatagramProtocol):
             last_seen=time.monotonic(),
             livery=livery,
             weather_source=bool(flags & P.LF_WEATHER_SOURCE),
+            atc=bool(flags & P.LF_ATC),
+            injector=bool(flags & P.LF_INJECTOR),
         )
         self.sessions[addr] = s
         self.by_sid[sid] = s
         if s.weather_source and self._weather_sid == 0:
             self._weather_sid = sid
             LOG.info("weather and time now come from %s", s.callsign)
-        LOG.info("login: %s (%s) sid=%d from %s", s.callsign, s.ac_icao, sid, addr)
+        LOG.info("login: %s (%s) sid=%d from %s%s%s", s.callsign, s.ac_icao, sid, addr,
+                 " [ATC]" if s.atc else "", " [injector]" if s.injector else "")
         self._send(addr, P.PT_LOGIN_ACK, sid, P.LOGIN_ACK.pack(sid, self._now_ms()))
         self._roster_dirty = True
+        self._atc_dirty = True
+        # A station that joins late still gets every plan in the flight.
+        if s.atc:
+            for p in self.sessions.values():
+                if p.fp and p.sid != sid:
+                    self._send(addr, P.PT_FLIGHTPLAN, sid, p.fp)
 
     def _on_position(self, s: Session, payload):
         if len(payload) < P.POSITION.size:
@@ -292,6 +367,8 @@ class XRadioServer(asyncio.DatagramProtocol):
         s.gs_ms = gs_ms
         s.gear = min(1.0, max(0.0, gear))
         s.flap = min(1.0, max(0.0, flap))
+        if s.atc and s.com1 != com1:
+            self._atc_dirty = True          # a station retuned: the list says its frequency
         s.com1, s.com2 = com1, com2
         s.lights, s.on_ground = lights, on_ground
         s.tx_radio, s.rx_mask = tx_radio, rx_mask
@@ -303,14 +380,180 @@ class XRadioServer(asyncio.DatagramProtocol):
         s.xpdr_mode = xpdr_mode if xpdr_mode <= P.XPDR_TA_RA else P.XPDR_OFF
         s.xpdr_ident = 1 if xpdr_ident else 0
         s.has_position = True
+        self._offer_atis(s)
+
+    # -- v6: air traffic control ------------------------------------------
+    def _speaker(self, s: Session, from_sid: int):
+        """Who a text or voice packet is from: the session itself, or -- for an
+        injector naming one of its own aircraft -- that aircraft."""
+        if s.injector and P.is_ai_sid(from_sid):
+            ai = self.ai.get(from_sid)
+            if ai is not None and ai.owner == s.sid:
+                return ai
+        return s
+
+    def _on_ai_traffic(self, s: Session, payload):
+        """The aircraft an injector drives, as TRAFFIC_ENTRY records with the
+        injector's own local numbers in sessionId. Validated exactly like a
+        position report: the renderer at the other end trusts nothing less."""
+        if not s.injector or len(payload) < P.TRAFFIC_HDR.size:
+            return
+        count, _ = P.TRAFFIC_HDR.unpack_from(payload, 0)
+        off = P.TRAFFIC_HDR.size
+        now = time.monotonic()
+        mine = sum(1 for a in self.ai.values() if a.owner == s.sid)
+        for _ in range(count):
+            if off + P.TRAFFIC_ENTRY.size > len(payload):
+                break
+            e = P.TRAFFIC_ENTRY.unpack_from(payload, off)
+            off += P.TRAFFIC_ENTRY.size
+            local = e[0] & 0xFFFF
+            if local == 0:
+                continue
+            sid = P.ai_sid(s.sid, local)
+            if e[22] & P.AI_REMOVE:
+                if self.ai.pop(sid, None) is not None:
+                    mine -= 1
+                continue
+            lat, lon, alt_m, heading, pitch, roll, gs_ms, gear, flap = e[3:12]
+            track, vs_ms = e[17], e[18]
+            if not (math.isfinite(lat) and -90.0 <= lat <= 90.0):
+                continue
+            if not (math.isfinite(lon) and -180.0 <= lon <= 180.0):
+                continue
+            if not (math.isfinite(alt_m) and -1000.0 <= alt_m <= 40000.0):
+                continue
+            if not all(math.isfinite(v) for v in (heading, pitch, roll, gs_ms, gear, flap, track, vs_ms)):
+                continue
+            if not -200.0 <= vs_ms <= 200.0 or not 0.0 <= gs_ms <= 1500.0:
+                continue
+            a = self.ai.get(sid)
+            if a is None:
+                if mine >= MAX_AI_PER_INJECTOR:
+                    continue
+                a = Session(sid=sid, addr=None, callsign="", ac_icao="", last_seen=now,
+                            ai=True, owner=s.sid, tx_radio=P.TX_NONE, rx_mask=0)
+                self.ai[sid] = a
+                mine += 1
+            a.callsign = _clean(P.cstr(e[1]), 15) or f"AI{local}"
+            a.ac_icao = _clean(P.cstr(e[2]), 7) or "ZZZZ"
+            a.lat, a.lon, a.alt_m = lat, lon, alt_m
+            a.heading, a.pitch, a.roll, a.gs_ms = heading % 360.0, pitch, roll, gs_ms
+            a.gear, a.flap = min(1.0, max(0.0, gear)), min(1.0, max(0.0, flap))
+            a.lights, a.on_ground = e[12], e[13]
+            a.xpdr_mode = e[15] if e[15] <= P.XPDR_TA_RA else P.XPDR_OFF
+            a.time_ms, a.track, a.vs_ms = e[16], track % 360.0, vs_ms
+            a.livery = _clean(P.cstr(e[19]), 15)
+            squawk = e[20]
+            a.squawk = squawk if 0 <= squawk <= 7777 and all(c <= "7" for c in f"{squawk:04d}") else 0
+            a.xpdr_ident = 1 if e[21] else 0
+            a.has_position = True
+            a.last_seen = now
+
+    def _on_flightplan(self, s: Session, payload):
+        """A pilot files; every station hears. A station answers; the pilot and
+        the other stations hear. The latest copy is kept with the pilot's
+        session so a station that joins later still sees it."""
+        d = P.unpack_flightplan(payload)
+        if d is None:
+            return
+        if s.atc:
+            target = self.by_sid.get(d["session_id"])
+            if target is None or target.atc or target.ai:
+                return
+            out = P.FLIGHTPLAN.pack(target.sid, P.pad(target.callsign, 16), *P.FLIGHTPLAN.unpack_from(payload, 0)[2:])
+            target.fp = out
+            self._send(target.addr, P.PT_FLIGHTPLAN, target.sid, out)
+            for p in self.sessions.values():
+                if p.atc and p.sid != s.sid:
+                    self._send(p.addr, P.PT_FLIGHTPLAN, p.sid, out)
+            LOG.info("flight plan for %s: %s by %s (squawk %04d)", target.callsign,
+                     {P.FP_ACK: "acknowledged", P.FP_CLEARED: "cleared", P.FP_CANCELLED: "cancelled"}.get(d["status"], d["status"]),
+                     s.callsign, d["squawk"])
+            return
+        if s.injector:
+            return                      # computer-flown aircraft do not file
+        fields = list(P.FLIGHTPLAN.unpack_from(payload, 0))
+        fields[0] = s.sid
+        fields[1] = P.pad(s.callsign, 16)   # a pilot files as who they logged in as
+        fields[5] = 0                       # only ATC assigns a squawk
+        if fields[4] not in (P.FP_FILED, P.FP_CANCELLED):
+            fields[4] = P.FP_FILED
+        out = P.FLIGHTPLAN.pack(*fields)
+        s.fp = None if fields[4] == P.FP_CANCELLED else out
+        for p in self.sessions.values():
+            if p.atc:
+                self._send(p.addr, P.PT_FLIGHTPLAN, p.sid, out)
+        LOG.info("flight plan %s: %s %s -> %s %s", "cancelled" if fields[4] == P.FP_CANCELLED else "filed",
+                 s.callsign, d["dep"], d["dest"], d["route"])
+
+    def _on_atis(self, s: Session, payload):
+        """A station publishes the ATIS of an airport; it is offered to
+        everyone tuned to its frequency, now and when they tune in later."""
+        if not s.atc or len(payload) < P.ATIS_HDR.size:
+            return
+        freq, icao_raw, letter, _r, text_len = P.ATIS_HDR.unpack_from(payload, 0)
+        icao = _clean(P.cstr(icao_raw), 7).upper()
+        text = payload[P.ATIS_HDR.size:P.ATIS_HDR.size + min(text_len, P.MAX_ATIS_BYTES)]
+        if not icao or not freq:
+            return
+        letter = letter.decode("ascii", "replace")
+        if not ("A" <= letter <= "Z"):
+            letter = "A"
+        out = P.ATIS_HDR.pack(freq, P.pad(icao, 8), letter.encode(), 0, len(text)) + text
+        old = self.atis.get(icao)
+        self.atis[icao] = {"freq": freq, "letter": letter, "text": text, "owner": s.sid, "payload": out}
+        if old is None or old["freq"] != freq:
+            self._atc_dirty = True
+        if old is None or old["letter"] != letter or old["text"] != text:
+            LOG.info("ATIS %s information %s on %.3f (%d bytes)", icao, letter, freq / 1000.0, len(text))
+            for p in self.sessions.values():
+                p.atis_seen.pop(icao, None)     # the new letter goes out again
+                self._offer_atis(p)
+
+    def _offer_atis(self, s: Session):
+        """Send a pilot the ATIS of every frequency they have just tuned."""
+        if s.ai or s.injector:
+            return
+        for icao, a in self.atis.items():
+            if a["owner"] == s.sid:
+                continue
+            if (s.com1 == a["freq"] or s.com2 == a["freq"]) and s.atis_seen.get(icao) != a["letter"]:
+                s.atis_seen[icao] = a["letter"]
+                self._send(s.addr, P.PT_ATIS, s.sid, a["payload"])
+
+    def _broadcast_atc_list(self, now: float):
+        """The stations online and the ATIS frequencies, to everyone. Ordered
+        by session so both servers produce the same bytes."""
+        self._last_atc = now
+        self._atc_dirty = False
+        if not self.sessions:
+            return
+        entries = []
+        for s in sorted(self.sessions.values(), key=lambda x: x.sid):
+            if s.atc:
+                entries.append(P.ATC_ENTRY.pack(s.sid, P.pad(s.callsign, 16), P.pad(P.atc_icao(s.callsign), 8),
+                                                s.com1, P.atc_kind(s.callsign), b"\x00\x00\x00"))
+        for icao in sorted(self.atis):
+            a = self.atis[icao]
+            entries.append(P.ATC_ENTRY.pack(0, P.pad(f"{icao}_ATIS", 16), P.pad(icao, 8), a["freq"], P.ATC_ATIS,
+                                            b"\x00\x00\x00"))
+        entries = entries[:P.MAX_ATC_ENTRIES]
+        body = P.ATC_LIST_HDR.pack(len(entries), 0) + b"".join(entries)
+        for to in list(self.sessions.values()):
+            self._send(to.addr, P.PT_ATC_LIST, to.sid, body)
 
     def _on_text(self, s: Session, payload):
         if len(payload) < P.TEXT_HDR.size:
             return
-        want_freq, _from_sid, _from, text_len, to_raw = P.TEXT_HDR.unpack_from(payload, 0)
+        want_freq, from_sid, _from, text_len, to_raw = P.TEXT_HDR.unpack_from(payload, 0)
         text = payload[P.TEXT_HDR.size:P.TEXT_HDR.size + min(text_len, MAX_TEXT_BYTES)]
         if not text:
             return
+        # v6: an injector speaking as one of its aircraft. Such an aircraft
+        # has no radios of its own to check against, so the frequency named
+        # in the packet is the one it transmits on.
+        s = self._speaker(s, from_sid)
 
         # A message addressed to a callsign is not a transmission: it goes to
         # that one pilot wherever they are, on no frequency at all, and nobody
@@ -336,7 +579,9 @@ class XRadioServer(asyncio.DatagramProtocol):
         # radio the client names -- but only if that radio is really tuned
         # there, so nobody can transmit on a frequency they are not on.
         freq = 0
-        if want_freq and want_freq in (s.com1, s.com2):
+        if s.ai:
+            freq = want_freq
+        elif want_freq and want_freq in (s.com1, s.com2):
             freq = want_freq
         elif want_freq == 0:
             freq = s.tx_freq() or s.com1
@@ -352,16 +597,21 @@ class XRadioServer(asyncio.DatagramProtocol):
     def _on_voice(self, s: Session, payload):
         if len(payload) < P.VOICE_HDR.size:
             return
-        want_freq, _from_sid, seq, opus_len = P.VOICE_HDR.unpack_from(payload, 0)
+        want_freq, from_sid, seq, opus_len = P.VOICE_HDR.unpack_from(payload, 0)
         opus = payload[P.VOICE_HDR.size:P.VOICE_HDR.size + min(opus_len, MAX_VOICE_BYTES)]
         if not opus:
             return
+        s = self._speaker(s, from_sid)
 
         # Same rule as text: the client names the radio it is keying and must
         # really be tuned there. Relying on tx_radio from the last position
         # report would drop the first ~200 ms of every transmission.
         freq = 0
-        if want_freq and want_freq in (s.com1, s.com2):
+        if s.ai:
+            freq = want_freq
+            # so the [TX] flag on the aircraft follows its voice like a pilot's
+            s.com1, s.tx_radio = freq, P.TX_COM1
+        elif want_freq and want_freq in (s.com1, s.com2):
             freq = want_freq
         elif want_freq == 0:
             freq = s.tx_freq()
@@ -388,6 +638,8 @@ class XRadioServer(asyncio.DatagramProtocol):
         for peer in self.sessions.values():
             if peer.sid == sender.sid:
                 continue
+            if sender.ai and peer.sid == sender.owner:
+                continue                # the program driving it said it; it knows
             if not guard and not peer.listening_on(freq_khz):
                 continue
             if sender.has_position and peer.has_position and not in_radio_range(sender, peer):
@@ -405,6 +657,8 @@ class XRadioServer(asyncio.DatagramProtocol):
                 now = time.monotonic()
                 if self._roster_dirty or now - self._last_roster >= ROSTER_INTERVAL_S:
                     self._broadcast_roster(now)
+                if self._atc_dirty or now - self._last_atc >= ATC_LIST_INTERVAL_S:
+                    self._broadcast_atc_list(now)
             except Exception:
                 LOG.exception("traffic loop error")
 
@@ -412,6 +666,8 @@ class XRadioServer(asyncio.DatagramProtocol):
         now = time.monotonic()
         for s in [s for s in self.sessions.values() if now - s.last_seen > SESSION_TIMEOUT_S]:
             self._drop(s, "timeout")
+        for sid in [k for k, a in self.ai.items() if now - a.last_seen > AI_TIMEOUT_S]:
+            del self.ai[sid]
 
     def _on_weather(self, s: Session, payload):
         """One sim decides the sky; the rest are told about it.
@@ -435,6 +691,14 @@ class XRadioServer(asyncio.DatagramProtocol):
         if self._weather_sid == s.sid:
             self._weather_sid = 0      # the next claimant may have it
         self._roster_dirty = True
+        # v6: its aircraft and its ATIS go with it
+        if s.injector:
+            for sid in [k for k, a in self.ai.items() if a.owner == s.sid]:
+                del self.ai[sid]
+        if s.atc:
+            for icao in [k for k, a in self.atis.items() if a["owner"] == s.sid]:
+                del self.atis[icao]
+            self._atc_dirty = True
         LOG.info("drop %s (sid=%d): %s", s.callsign, s.sid, why)
 
     def _broadcast_roster(self, now: float):
@@ -447,7 +711,10 @@ class XRadioServer(asyncio.DatagramProtocol):
         self._roster_dirty = False
         if not self.sessions:
             return
-        everyone = sorted(self.sessions.values(), key=lambda s: s.sid)[:MAX_ENTRIES_TOTAL]
+        # An injector is a program, not a pilot anyone would message; its
+        # aircraft are not in the roster either (they cannot read one).
+        everyone = sorted((s for s in self.sessions.values() if not s.injector),
+                          key=lambda s: s.sid)[:MAX_ENTRIES_TOTAL]
         self._roster_epoch = (self._roster_epoch + 1) & 0xFFFF
         per = P.MAX_ROSTER_ENTRIES
         parts = (len(everyone) + per - 1) // per
@@ -463,10 +730,14 @@ class XRadioServer(asyncio.DatagramProtocol):
     def _broadcast_traffic(self):
         now = time.monotonic()
         live = [s for s in self.sessions.values() if s.has_position]
+        # What can be seen: pilots, and the aircraft injectors drive. An ATC
+        # station is not an aircraft, and an injector does not need its own
+        # aircraft back.
+        visible = [s for s in live if not s.atc] + list(self.ai.values())
         for me in live:
             others = []
-            for other in live:
-                if other.sid == me.sid:
+            for other in visible:
+                if other.sid == me.sid or (other.ai and other.owner == me.sid):
                     continue
                 if distance_nm(me, other) > TRAFFIC_RANGE_NM:
                     continue
@@ -575,12 +846,15 @@ class Dashboard:
                 pos = "-"
             radio = ("voice" if now - p.last_voice < TX_HOLD_S
                      else ("keyed" if p.tx_radio else ""))
+            kind = "ATC" if p.atc else (f"AI x{sum(1 for a in s.ai.values() if a.owner == p.sid)}" if p.injector else p.ac_icao)
             lines.append(
-                f"{p.callsign:<9}{p.ac_icao:<6}{pos:<22}{p.alt_ft:>7.0f} "
+                f"{p.callsign:<9}{kind:<6}{pos:<22}{p.alt_ft:>7.0f} "
                 f"{p.gs_ms * 1.94384:>4.0f}  {self._mhz(p.com1):<8}{self._mhz(p.com2):<8}"
                 f"{p.squawk:04d}  {radio:<6}{now - p.last_seen:>4.0f}s")
         if not s.sessions:
             lines.append("  nobody is connected")
+        if s.atis:
+            lines.append("ATIS: " + "  ".join(f"{k} {v['letter']} on {self._mhz(v['freq'])}" for k, v in sorted(s.atis.items())))
         lines += ["", "recent:"] + [f"  {line}" for line in self.recent.lines]
         lines += ["", "Ctrl-C stops the server"]
 
@@ -626,6 +900,7 @@ async def main():
         LOG.info("a flight password is required to join")
     transport, _ = await loop.create_datagram_endpoint(
         lambda: server, local_addr=(args.host, args.port))
+    disable_udp_reset(transport)
     try:
         if recent is not None:
             await asyncio.gather(server.run_traffic_loop(),

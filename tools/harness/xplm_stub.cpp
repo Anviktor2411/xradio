@@ -412,6 +412,11 @@ void XPLMDebugString(const char* s) {
     }
 }
 
+// What the sim would say out loud, kept so a test can check it was asked to.
+void XPLMSpeakString(const char* s) {
+    harness::g_log.push_back(std::string("speak: ") + (s ? s : ""));
+}
+
 void XPLMGetPrefsPath(char* out) {
     snprintf(out, 1024, "%s/prefs.txt", harness::tempDir().c_str());
 }

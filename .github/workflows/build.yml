@@ -153,13 +153,21 @@ jobs:
           python3 tools/fake_client.py --port 49400 --callsign PEER01 \
             --lat 57.86 --lon 27.03 --talk --parrot > /tmp/peer.log 2>&1 &
           peer=$!
+          # v6: a controller in the flight, publishing an ATIS and answering
+          # flight plans, so the harness can test the ATC side end to end
+          python3 tools/fake_client.py --port 49400 --atc --callsign EETN_TWR \
+            --com1 135905 --lat 57.85 --lon 27.02 --alt-ft 150 \
+            --atis "Tallinn information Charlie, runway 26" --atis-freq 127905 \
+            --atis-letter C --ack-plans 4521 > /tmp/atc.log 2>&1 &
+          atc=$!
           sleep 1
-          XRADIO_UPDATE_URL=http://127.0.0.1:5399/latest \
+          XRADIO_UPDATE_URL=http://127.0.0.1:5399/latest XR_HARNESS_ATC=1 \
             ASAN_OPTIONS=detect_leaks=0 ./build-tests/plugin_harness 127.0.0.1 49400 CIRUN
-          echo "--- server ---"; grep -E "login|voice|text" /tmp/srv.log || true
+          echo "--- server ---"; grep -E "login|voice|text|flight plan|ATIS" /tmp/srv.log || true
           echo "--- peer ---";   grep -E "voice" /tmp/peer.log || true
-          kill "$rel" "$srv" "$peer" 2>/dev/null || true
-          wait "$rel" "$srv" "$peer" 2>/dev/null || true
+          echo "--- atc ---";    cat /tmp/atc.log || true
+          kill "$rel" "$srv" "$peer" "$atc" 2>/dev/null || true
+          wait "$rel" "$srv" "$peer" "$atc" 2>/dev/null || true
 
       # Hosting puts this server on a pilot's home connection, so it gets the
       # same treatment the client gets: malformed packets under ASan/UBSan.

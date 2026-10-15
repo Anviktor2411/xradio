@@ -11,7 +11,7 @@ namespace xr {
 
 // "XRC1" as little-endian bytes.
 static const uint32_t kMagic       = 0x31435258u;
-static const uint16_t kProtoVersion = 5;   // v5: transponders, 121.500 as guard, direct messages
+static const uint16_t kProtoVersion = 6;   // v6: ATC stations, injected AI traffic, flight plans, ATIS
 
 enum PacketType : uint8_t {
     PT_LOGIN     = 1,  // client -> server
@@ -30,6 +30,32 @@ enum PacketType : uint8_t {
     // an unknown type, and one talking to an older server simply never
     // gets one and lists the aircraft it can see instead.
     PT_ROSTER    = 12,
+    // --- v6: air traffic control ---
+    // An ATC program (TowerTrainer) sits on the frequency like any pilot, but
+    // it also drives a whole airport of computer-flown aircraft, takes flight
+    // plans and publishes an ATIS. Four packets carry all of that.
+    //
+    // injector -> server: the aircraft this session drives, TrafficHeader
+    // followed by TrafficEntry records exactly as PT_TRAFFIC carries them.
+    // Each entry's sessionId is the injector's own local number (1..65535);
+    // the server turns it into a flight-wide id (see kAiSidBit) and relays
+    // the aircraft to everyone in range as ordinary traffic. One UDP socket
+    // for sixty aircraft instead of sixty logins.
+    PT_AI_TRAFFIC = 13,
+    // pilot -> server -> every ATC station; ATC -> server -> that pilot (and
+    // the other stations). The same payload both ways: filed, acknowledged,
+    // with a squawk, or cancelled. See FlightPlanPayload.
+    PT_FLIGHTPLAN = 14,
+    // ATC -> server: "this is the ATIS of EETN on 127.905". server -> pilot:
+    // sent when a pilot tunes that frequency and whenever the letter changes,
+    // so the text can sit in the window exactly as the recording would be
+    // heard. See AtisPayload.
+    PT_ATIS      = 15,
+    // server -> everyone: the ATC stations online and the ATIS frequencies,
+    // whenever one joins or leaves and every few seconds besides, like the
+    // roster. What a pilot needs to find a controller: callsign, airport,
+    // frequency. See AtcListHeader / AtcEntry.
+    PT_ATC_LIST  = 16,
 };
 
 // The international emergency frequency, and in XRadio the one place everybody
@@ -43,6 +69,47 @@ inline bool isGuard(uint32_t freqKhz) { return freqKhz == kGuardKhz; }
 
 // LoginPayload.flags
 static const uint16_t LF_WEATHER_SOURCE = 1 << 0;  // "my weather and time are the flight's"
+// v6. An ATC station: not an aircraft, so never drawn as traffic or counted
+// as one, listed in PT_ATC_LIST with its frequency instead. It hears and
+// speaks on its frequencies like anybody else, sees all traffic in range,
+// receives every flight plan, and may publish an ATIS.
+static const uint16_t LF_ATC            = 1 << 1;
+// v6. "I drive aircraft that are not me": the session may send
+// PT_AI_TRAFFIC, and may transmit text and voice on behalf of those aircraft
+// by naming one of their ids as the sender.
+static const uint16_t LF_INJECTOR       = 1 << 2;
+
+// v6. The flight-wide session id of an injected aircraft: the injector's own
+// session id in the high half, its local number in the low half, and this
+// bit on top so it can never collide with a real session. A client needs
+// none of this -- an injected aircraft is just another TrafficEntry -- but
+// a server has to keep the two apart and an injector has to know which id
+// its aircraft got when it wants to speak as one.
+static const uint32_t kAiSidBit = 0x80000000u;
+inline uint32_t aiSid(uint32_t injectorSid, uint16_t localId) {
+    return kAiSidBit | ((injectorSid & 0x7FFFu) << 16) | localId;
+}
+inline bool isAiSid(uint32_t sid) { return (sid & kAiSidBit) != 0; }
+inline uint32_t aiOwner(uint32_t sid) { return (sid >> 16) & 0x7FFFu; }
+// TrafficEntry.reserved bits as used in PT_AI_TRAFFIC (the server clears
+// them before relaying).
+static const uint8_t AI_REMOVE = 1 << 0;   // this aircraft is gone: drop it now
+
+// FlightPlanPayload.rules
+static const uint8_t FP_IFR = 'I', FP_VFR = 'V', FP_Y = 'Y', FP_Z = 'Z';
+// FlightPlanPayload.status
+enum FlightPlanStatus : uint8_t {
+    FP_FILED     = 1,   // pilot -> ATC: here is my plan
+    FP_ACK       = 2,   // ATC -> pilot: received, squawk assigned if non-zero
+    FP_CLEARED   = 3,   // ATC -> pilot: clearance issued (text in remarks)
+    FP_CANCELLED = 4,   // either way
+};
+
+// AtcEntry.kind: which position a station works, from its callsign suffix.
+enum AtcKind : uint8_t {
+    ATC_OTHER = 0, ATC_DEL = 1, ATC_GND = 2, ATC_TWR = 3, ATC_APP = 4, ATC_CTR = 5,
+    ATC_ATIS  = 6,   // not a station: a published ATIS and its frequency
+};
 
 // LoginRejectPayload.reason
 enum RejectReason : uint16_t {
@@ -266,6 +333,55 @@ struct RosterEntry {         // 28 bytes
     char     acIcao[8];
 };
 
+// --- v6 ---
+
+// A flight plan, the same record in every direction. A pilot files it with
+// sessionId 0 and status FP_FILED; the server fills in the pilot's session
+// and hands it to every ATC station. A station answers with the pilot's
+// sessionId, a status, and the squawk it assigned; the server passes that to
+// the pilot and the other stations, and keeps the latest copy so a station
+// that joins later still sees every plan in the flight.
+struct FlightPlanPayload {   // 256 bytes
+    uint32_t sessionId;      // the pilot's session; 0 when the pilot sends it
+    char     callsign[16];
+    char     acIcao[8];
+    uint8_t  rules;          // FP_IFR / FP_VFR / FP_Y / FP_Z
+    uint8_t  status;         // FlightPlanStatus
+    uint16_t squawk;         // assigned by ATC, 0 for none yet
+    char     dep[8];         // ICAO
+    char     dest[8];
+    char     altn[8];
+    uint32_t cruiseFt;
+    char     route[128];
+    char     remarks[64];    // from the pilot: remarks; from ATC: the clearance
+    uint16_t flags;          // reserved
+    uint16_t reserved;
+};
+
+// An ATIS: the recording as text. Followed by textLen UTF-8 bytes.
+struct AtisPayload {         // 16 bytes
+    uint32_t freqKhz;
+    char     icao[8];
+    char     letter;         // 'A'..'Z'
+    uint8_t  reserved;
+    uint16_t textLen;        // at most kMaxAtisBytes
+};
+static const int kMaxAtisBytes = 600;
+
+struct AtcListHeader {       // 4 bytes, followed by `count` AtcEntry
+    uint16_t count;
+    uint16_t reserved;
+};
+
+struct AtcEntry {            // 36 bytes
+    uint32_t sessionId;      // the station's session; 0 for an ATIS entry
+    char     callsign[16];   // EETN_TWR
+    char     icao[8];        // the airport
+    uint32_t freqKhz;
+    uint8_t  kind;           // AtcKind
+    uint8_t  reserved[3];
+};
+
 #pragma pack(pop)
 
 // The whole datagram, header included.
@@ -290,5 +406,10 @@ static const int kMaxTrafficEntries =
 static const int kMaxRosterEntries =
     (kMaxPacket - (int)sizeof(Header) - (int)sizeof(RosterHeader)) /
     (int)sizeof(RosterEntry);
+
+// v6: stations in one ATC list packet.
+static const int kMaxAtcEntries =
+    (kMaxPacket - (int)sizeof(Header) - (int)sizeof(AtcListHeader)) /
+    (int)sizeof(AtcEntry);
 
 }  // namespace xr

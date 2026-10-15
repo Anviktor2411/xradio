@@ -199,7 +199,7 @@ come from the CI run's `XRadio-all-platforms` artifact, not from this zip.
 ```bash
 bash tools/check_portability.sh       # instant: MSVC-only pitfalls
 bash tools/check_windows_build.sh     # ~20s: compile everything for Windows
-python3 tools/test_server.py          # server: protocol and routing
+python3 tools/test_server.py          # server: protocol and routing, ATC (v6) included
 ```
 
 `check_portability.sh` catches the mistakes that pass on Linux and macOS and
@@ -387,6 +387,10 @@ the plugin does not exist.
 
 ### Building with parts switched off
 
+The test executables (`-DXRADIO_BUILD_TESTS=ON`) run under AddressSanitizer
+and UBSan on GCC and Clang. A toolchain that has no sanitizer runtimes --
+MinGW-w64 on Windows, for one -- builds them with `-DXRADIO_SANITIZE=OFF`.
+
 ```bash
 cmake -B build -DXRADIO_USE_XPMP2=OFF -DXPLANE_SDK=<path to SDK>   # no 3D models
 cmake -B build -DXRADIO_USE_VOICE=OFF                             # no voice
@@ -533,7 +537,24 @@ without a version bump: it is a new packet type, which older builds ignore,
 so a flight with mixed builds simply does not share a sky. v4 put the
 transponder on the wire, v5 the addressee that makes `@CALLSIGN` possible --
 both are changes to existing packets, so both refuse an older build outright
-rather than letting it fly with half the behaviour.
+rather than letting it fly with half the behaviour. v6 (XRadio 0.6.0) is air
+traffic control: stations, injected traffic, flight plans and the ATIS, four
+new packets and two login flags, described in [docs/atc.md](docs/atc.md). A
+v0.5.x build meeting a v6 server is told so in its window.
+
+## Air traffic control
+
+A controller can join a flight: a program such as
+[TowerTrainer](https://github.com/Anviktor2411/TowerTrainer) logs in as a
+station (`EETN_TWR`), sees everybody, takes flight plans, publishes an ATIS and
+fills the airport with computer-flown traffic that is drawn, on TCAS and on
+the radio like any pilot. In the XRadio window you get an **ATC online** list
+(click a station to tune COM1, an ATIS to tune COM2), the ATIS text when you
+tune its frequency, and your flight plan's status; **Settings → ATC** files
+the plan and holds the cap on computer-flown aircraft. Calls from a
+controller and private messages are read out by the sim so they are not
+missed with the window shut. The whole of it, for pilots and for programs
+that want to be ATC: [docs/atc.md](docs/atc.md).
 
 ## Configuration
 
@@ -707,6 +728,9 @@ dropouts, the squeal, and the output ceiling.
 
 ## What works today
 
+- ATC stations, computer-flown traffic from an ATC program, flight plans with
+  squawk and clearance back, the ATIS as text, the ATC online list with
+  click-to-tune (v0.6.0, see [docs/atc.md](docs/atc.md))
 - Login, automatic reconnect, session timeouts
 - Own position sent at 5 Hz (location, attitude, speed, gear, flaps, lights)
 - **Other aircraft actually visible** — CSL models, TCAS, map layer, animated

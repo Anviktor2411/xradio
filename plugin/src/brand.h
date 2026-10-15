@@ -14,7 +14,7 @@
 namespace xr {
 namespace brand {
 
-inline const char* version() { return "0.5.7"; }
+inline const char* version() { return "0.6.0"; }
 
 // Width of one character of the fixed-pitch font, asked of X-Plane once.
 inline int charWidth() {

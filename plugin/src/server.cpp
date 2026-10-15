@@ -14,6 +14,7 @@
 
 #include <atomic>
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstring>
@@ -51,6 +52,13 @@ struct Session {
     uint16_t squawk = 1200;          // the four digits as they read on the panel
     uint8_t  xpdrMode = XPDR_ALT;
     uint8_t  xpdrIdent = 0;
+    // v6
+    bool     atc = false;            // an ATC station: never traffic, listed in PT_ATC_LIST
+    bool     injector = false;       // drives aircraft of its own (PT_AI_TRAFFIC)
+    bool     ai = false;             // this record is one of those aircraft, not a client
+    uint32_t owner = 0;              // ...and this is the injector it belongs to
+    std::vector<uint8_t> fp;         // a pilot's latest flight plan, as it will be relayed
+    std::map<std::string, char> atisSeen;   // icao -> letter already sent to this pilot
 
     double altFt() const { return (double)altM * 3.28084; }
 
@@ -114,6 +122,38 @@ bool inRadioRange(const Session& a, const Session& b) {
 
 bool finite(float v) { return std::isfinite(v); }
 
+// v6. EETN_TWR -> EETN: the airport is the head before the first underscore,
+// four alphanumerics or nothing. The same rule as protocol.atc_icao().
+std::string atcIcao(const std::string& callsign) {
+    const size_t us = callsign.find('_');
+    std::string head = us == std::string::npos ? callsign : callsign.substr(0, us);
+    for (char& c : head) c = (char)toupper((unsigned char)c);
+    if (head.size() != 4) return "";
+    for (char c : head) if (!isalnum((unsigned char)c)) return "";
+    return head;
+}
+
+// EETN_TWR -> ATC_TWR: the position is the suffix after the last underscore.
+uint8_t atcKind(const std::string& callsign) {
+    const size_t us = callsign.rfind('_');
+    if (us == std::string::npos) return ATC_OTHER;
+    std::string tail = callsign.substr(us + 1);
+    for (char& c : tail) c = (char)toupper((unsigned char)c);
+    if (tail == "DEL")  return ATC_DEL;
+    if (tail == "GND")  return ATC_GND;
+    if (tail == "TWR")  return ATC_TWR;
+    if (tail == "APP" || tail == "DEP") return ATC_APP;
+    if (tail == "CTR")  return ATC_CTR;
+    if (tail == "ATIS") return ATC_ATIS;
+    return ATC_OTHER;
+}
+
+// Python's str.upper() on the ASCII an ATIS icao is allowed to hold.
+std::string upperAscii(std::string v) {
+    for (char& c : v) c = (char)toupper((unsigned char)c);
+    return v;
+}
+
 // Python's `x % 360.0`: the result always carries the sign of the divisor,
 // unlike C's fmod. 0 - 10 must come out as 350, not -10.
 float wrap360(float v) {
@@ -157,6 +197,14 @@ private:
     void onText(Session& s, const uint8_t* p, int len);
     void onWeather(Session& s, const uint8_t* p, int len);
     void onVoice(Session& s, const uint8_t* p, int len, double now);
+    // v6
+    void onAiTraffic(Session& s, const uint8_t* p, int len, double now);
+    void onFlightPlan(Session& s, const uint8_t* p, int len);
+    void onAtis(Session& s, const uint8_t* p, int len);
+    void offerAtis(Session& s);
+    void broadcastAtcList(double now);
+    Session* speaker(Session& s, uint32_t fromSid);
+    Session* bySid(uint32_t sid);
 
     std::vector<Session*> listeners(const Session& sender, uint32_t freqKhz);
     void reap(double now);
@@ -164,12 +212,26 @@ private:
     void sendTraffic(Session& me, const std::vector<Session*>& others, double now);
     void broadcastRoster(double now);
     void drop(const Peer& peer);
+    void forget(const Session& s);      // what goes with a session: its aircraft, its ATIS
 
     Sink     sink_;
     void*    ctx_;
     std::string password_;              // empty: open to all
     std::map<Peer, Session> sessions_;
     uint32_t nextSid_ = 1;
+    // v6. The aircraft injectors drive, by flight-wide id; the ATIS on the air,
+    // by airport; and whether the ATC list changed since it last went out.
+    std::map<uint32_t, Session> ai_;
+    struct Atis {
+        uint32_t freq = 0;
+        char     letter = 'A';
+        std::string text;
+        uint32_t owner = 0;
+        std::vector<uint8_t> payload;
+    };
+    std::map<std::string, Atis> atis_;
+    bool     atcDirty_ = false;
+    double   lastAtc_ = 0;
     // Whose sky everyone else flies in. The first pilot to claim it keeps it
     // until they leave; two sources would mean the weather flickering between
     // two sims.
@@ -241,8 +303,217 @@ void Core::onPacket(const Peer& from, const uint8_t* data, int len, double now) 
         case PT_VOICE:    onVoice(s, payload, avail, now); break;
         case PT_PING:     send(from, PT_PONG, s.sid); break;
         case PT_WEATHER:  onWeather(s, payload, avail); break;
+        case PT_AI_TRAFFIC: onAiTraffic(s, payload, avail, now); break;
+        case PT_FLIGHTPLAN: onFlightPlan(s, payload, avail); break;
+        case PT_ATIS:     onAtis(s, payload, avail); break;
         case PT_LOGOUT:   drop(from); break;
         default: break;
+    }
+}
+
+Session* Core::bySid(uint32_t sid) {
+    for (auto& kv : sessions_) if (kv.second.sid == sid) return &kv.second;
+    return nullptr;
+}
+
+// Who a text or voice packet is from: the session itself, or -- for an
+// injector naming one of its own aircraft -- that aircraft.
+Session* Core::speaker(Session& s, uint32_t fromSid) {
+    if (s.injector && isAiSid(fromSid)) {
+        auto it = ai_.find(fromSid);
+        if (it != ai_.end() && it->second.owner == s.sid) return &it->second;
+    }
+    return &s;
+}
+
+// The aircraft an injector drives, as TrafficEntry records with the
+// injector's own local numbers in sessionId. Validated exactly like a
+// position report: the renderer at the other end trusts nothing less.
+void Core::onAiTraffic(Session& s, const uint8_t* p, int len, double now) {
+    if (!s.injector || len < (int)sizeof(TrafficHeader)) return;
+    TrafficHeader th{};
+    memcpy(&th, p, sizeof(th));
+    int off = (int)sizeof(th);
+    int mine = 0;
+    for (const auto& kv : ai_) if (kv.second.owner == s.sid) ++mine;
+    for (int i = 0; i < th.count; ++i) {
+        if (off + (int)sizeof(TrafficEntry) > len) break;
+        TrafficEntry e{};
+        memcpy(&e, p + off, sizeof(e));
+        off += (int)sizeof(e);
+        const uint16_t local = (uint16_t)(e.sessionId & 0xFFFFu);
+        if (local == 0) continue;
+        const uint32_t sid = aiSid(s.sid, local);
+        if (e.reserved & AI_REMOVE) {
+            if (ai_.erase(sid)) --mine;
+            continue;
+        }
+        if (!std::isfinite(e.lat) || e.lat < -90.0  || e.lat > 90.0)  continue;
+        if (!std::isfinite(e.lon) || e.lon < -180.0 || e.lon > 180.0) continue;
+        if (!finite(e.altMslM) || e.altMslM < -1000.f || e.altMslM > 40000.f) continue;
+        if (!finite(e.headingTrue) || !finite(e.pitch) || !finite(e.roll) ||
+            !finite(e.gsMs) || !finite(e.gearRatio) || !finite(e.flapRatio) ||
+            !finite(e.trackTrue) || !finite(e.vsMs)) continue;
+        if (e.vsMs < -200.f || e.vsMs > 200.f) continue;
+        if (e.gsMs < 0.f || e.gsMs > 1500.f) continue;
+
+        auto it = ai_.find(sid);
+        if (it == ai_.end()) {
+            if (mine >= kMaxAiPerInjector) continue;
+            Session a;
+            a.sid = sid; a.ai = true; a.owner = s.sid;
+            a.txRadio = TX_NONE; a.rxMask = 0;
+            it = ai_.emplace(sid, a).first;
+            ++mine;
+        }
+        Session& a = it->second;
+        a.callsign = clean(e.callsign, sizeof(e.callsign), 15);
+        if (a.callsign.empty()) a.callsign = "AI" + std::to_string(local);
+        a.acIcao = clean(e.acIcao, sizeof(e.acIcao), 7);
+        if (a.acIcao.empty()) a.acIcao = "ZZZZ";
+        a.lat = e.lat; a.lon = e.lon; a.altM = e.altMslM;
+        a.heading = wrap360(e.headingTrue); a.pitch = e.pitch; a.roll = e.roll; a.gsMs = e.gsMs;
+        a.gear = std::min(1.f, std::max(0.f, e.gearRatio));
+        a.flap = std::min(1.f, std::max(0.f, e.flapRatio));
+        a.lights = e.lights; a.onGround = e.onGround;
+        a.xpdrMode = e.xpdrMode <= XPDR_TA_RA ? e.xpdrMode : (uint8_t)XPDR_OFF;
+        a.timeMs = e.timeMs; a.track = wrap360(e.trackTrue); a.vsMs = e.vsMs;
+        a.livery = clean(e.livery, sizeof(e.livery), 15);
+        a.squawk = validSquawk(e.squawk) ? e.squawk : 0;
+        a.xpdrIdent = e.xpdrIdent ? 1 : 0;
+        a.hasPosition = true;
+        a.lastSeen = now;
+    }
+}
+
+// A pilot files; every station hears. A station answers; the pilot and the
+// other stations hear. The latest copy is kept with the pilot's session so a
+// station that joins later still sees it.
+void Core::onFlightPlan(Session& s, const uint8_t* p, int len) {
+    if (len < (int)sizeof(FlightPlanPayload)) return;
+    FlightPlanPayload fp{};
+    memcpy(&fp, p, sizeof(fp));
+    if (s.atc) {
+        Session* target = bySid(fp.sessionId);
+        if (!target || target->atc || target->ai) return;
+        fp.sessionId = target->sid;
+        padInto(fp.callsign, sizeof(fp.callsign), target->callsign);
+        target->fp.assign((const uint8_t*)&fp, (const uint8_t*)&fp + sizeof(fp));
+        send(target->peer, PT_FLIGHTPLAN, target->sid, &fp, (int)sizeof(fp));
+        for (auto& kv : sessions_) {
+            if (kv.second.atc && kv.second.sid != s.sid)
+                send(kv.first, PT_FLIGHTPLAN, kv.second.sid, &fp, (int)sizeof(fp));
+        }
+        return;
+    }
+    if (s.injector) return;              // computer-flown aircraft do not file
+    fp.sessionId = s.sid;
+    padInto(fp.callsign, sizeof(fp.callsign), s.callsign);   // a pilot files as who they logged in as
+    fp.squawk = 0;                                            // only ATC assigns a squawk
+    if (fp.status != FP_FILED && fp.status != FP_CANCELLED) fp.status = FP_FILED;
+    if (fp.status == FP_CANCELLED) s.fp.clear();
+    else s.fp.assign((const uint8_t*)&fp, (const uint8_t*)&fp + sizeof(fp));
+    for (auto& kv : sessions_) {
+        if (kv.second.atc) send(kv.first, PT_FLIGHTPLAN, kv.second.sid, &fp, (int)sizeof(fp));
+    }
+}
+
+// A station publishes the ATIS of an airport; it is offered to everyone
+// tuned to its frequency, now and when they tune in later.
+void Core::onAtis(Session& s, const uint8_t* p, int len) {
+    if (!s.atc || len < (int)sizeof(AtisPayload)) return;
+    AtisPayload ah{};
+    memcpy(&ah, p, sizeof(ah));
+    const std::string icao = upperAscii(clean(ah.icao, sizeof(ah.icao), 7));
+    int textLen = std::min<int>(ah.textLen, kMaxAtisBytes);
+    textLen = std::min(textLen, len - (int)sizeof(ah));
+    if (textLen < 0) textLen = 0;
+    if (icao.empty() || ah.freqKhz == 0) return;
+    char letter = ah.letter;
+    if (letter < 'A' || letter > 'Z') letter = 'A';
+    const std::string text((const char*)p + sizeof(ah), (size_t)textLen);
+
+    AtisPayload oh{};
+    oh.freqKhz = ah.freqKhz;
+    padInto(oh.icao, sizeof(oh.icao), icao);
+    oh.letter = letter;
+    oh.textLen = (uint16_t)textLen;
+    std::vector<uint8_t> payload((const uint8_t*)&oh, (const uint8_t*)&oh + sizeof(oh));
+    payload.insert(payload.end(), text.begin(), text.end());
+
+    auto old = atis_.find(icao);
+    const bool fresh = old == atis_.end();
+    const bool freqChanged = fresh || old->second.freq != ah.freqKhz;
+    const bool changed = fresh || old->second.letter != letter || old->second.text != text;
+    Atis& a = atis_[icao];
+    a.freq = ah.freqKhz; a.letter = letter; a.text = text; a.owner = s.sid; a.payload = payload;
+    if (freqChanged) atcDirty_ = true;
+    if (changed) {
+        for (auto& kv : sessions_) {
+            kv.second.atisSeen.erase(icao);        // the new letter goes out again
+            offerAtis(kv.second);
+        }
+    }
+}
+
+// Send a pilot the ATIS of every frequency they have just tuned.
+void Core::offerAtis(Session& s) {
+    if (s.ai || s.injector) return;
+    for (auto& kv : atis_) {
+        const Atis& a = kv.second;
+        if (a.owner == s.sid) continue;
+        if (s.com1 != a.freq && s.com2 != a.freq) continue;
+        auto seen = s.atisSeen.find(kv.first);
+        if (seen != s.atisSeen.end() && seen->second == a.letter) continue;
+        s.atisSeen[kv.first] = a.letter;
+        send(s.peer, PT_ATIS, s.sid, a.payload.data(), (int)a.payload.size());
+    }
+}
+
+// The stations online and the ATIS frequencies, to everyone. Ordered by
+// session so both servers produce the same bytes.
+void Core::broadcastAtcList(double now) {
+    lastAtc_ = now;
+    atcDirty_ = false;
+    if (sessions_.empty()) return;
+
+    std::vector<const Session*> stations;
+    for (const auto& kv : sessions_) if (kv.second.atc) stations.push_back(&kv.second);
+    std::sort(stations.begin(), stations.end(),
+              [](const Session* a, const Session* b) { return a->sid < b->sid; });
+
+    uint8_t payload[kMaxPacket];
+    size_t off = sizeof(AtcListHeader);
+    int count = 0;
+    auto put = [&](const AtcEntry& e) {
+        if (count >= kMaxAtcEntries) return;
+        memcpy(payload + off, &e, sizeof(e));
+        off += sizeof(e);
+        ++count;
+    };
+    for (const Session* s : stations) {
+        AtcEntry e{};
+        e.sessionId = s->sid;
+        padInto(e.callsign, sizeof(e.callsign), s->callsign);
+        padInto(e.icao, sizeof(e.icao), atcIcao(s->callsign));
+        e.freqKhz = s->com1;
+        e.kind = atcKind(s->callsign);
+        put(e);
+    }
+    for (const auto& kv : atis_) {                 // std::map: sorted by icao, like Python's sorted()
+        AtcEntry e{};
+        e.sessionId = 0;
+        padInto(e.callsign, sizeof(e.callsign), kv.first + "_ATIS");
+        padInto(e.icao, sizeof(e.icao), kv.first);
+        e.freqKhz = kv.second.freq;
+        e.kind = ATC_ATIS;
+        put(e);
+    }
+    AtcListHeader lh{};
+    lh.count = (uint16_t)count;
+    memcpy(payload, &lh, sizeof(lh));
+    for (const auto& kv : sessions_) {
+        send(kv.first, PT_ATC_LIST, kv.second.sid, payload, (int)off);
     }
 }
 
@@ -286,6 +557,8 @@ void Core::onLogin(const Peer& from, const uint8_t* p, int len, double now) {
     s.acIcao   = acIcao.empty() ? "ZZZZ" : acIcao;
     s.livery   = livery;
     s.weatherSource = (lp.flags & LF_WEATHER_SOURCE) != 0;
+    s.atc      = (lp.flags & LF_ATC) != 0;
+    s.injector = (lp.flags & LF_INJECTOR) != 0;
     s.lastSeen = now;
     const uint32_t sid = s.sid;
     sessions_[from] = s;
@@ -296,6 +569,15 @@ void Core::onLogin(const Peer& from, const uint8_t* p, int len, double now) {
     ack.serverTimeMs = (uint32_t)((now - t0_) * 1000.0);
     send(from, PT_LOGIN_ACK, sid, &ack, (int)sizeof(ack));
     rosterDirty_ = true;
+    atcDirty_ = true;
+    // A station that joins late still gets every plan in the flight.
+    if (s.atc) {
+        for (const auto& kv : sessions_) {
+            const Session& p = kv.second;
+            if (!p.fp.empty() && p.sid != sid)
+                send(from, PT_FLIGHTPLAN, sid, p.fp.data(), (int)p.fp.size());
+        }
+    }
 }
 
 void Core::onPosition(Session& s, const uint8_t* p, int len) {
@@ -321,6 +603,7 @@ void Core::onPosition(Session& s, const uint8_t* p, int len) {
     s.gsMs = pp.gsMs;
     s.gear = std::min(1.f, std::max(0.f, pp.gearRatio));
     s.flap = std::min(1.f, std::max(0.f, pp.flapRatio));
+    if (s.atc && s.com1 != pp.com1Khz) atcDirty_ = true;   // a station retuned: the list says its frequency
     s.com1 = pp.com1Khz; s.com2 = pp.com2Khz;
     s.lights = pp.lights; s.onGround = pp.onGround;
     s.txRadio = pp.txRadio; s.rxMask = pp.rxMask;
@@ -333,9 +616,10 @@ void Core::onPosition(Session& s, const uint8_t* p, int len) {
     s.xpdrMode = pp.xpdrMode <= XPDR_TA_RA ? pp.xpdrMode : (uint8_t)XPDR_OFF;
     s.xpdrIdent = pp.xpdrIdent ? 1 : 0;
     s.hasPosition = true;
+    offerAtis(s);
 }
 
-void Core::onText(Session& s, const uint8_t* p, int len) {
+void Core::onText(Session& client, const uint8_t* p, int len) {
     if (len < (int)sizeof(TextHeader)) return;
     TextHeader th{};
     memcpy(&th, p, sizeof(th));
@@ -345,6 +629,10 @@ void Core::onText(Session& s, const uint8_t* p, int len) {
     textLen = std::min(textLen, kMaxTextBytes);
     textLen = std::min(textLen, avail);
     if (textLen <= 0) return;
+    // v6: an injector speaking as one of its aircraft. Such an aircraft has
+    // no radios of its own to check against, so the frequency named in the
+    // packet is the one it transmits on.
+    Session& s = *speaker(client, th.fromSession);
 
     // A message addressed to a callsign is not a transmission: it goes to
     // that one pilot wherever they are, on no frequency at all, and nobody
@@ -383,7 +671,9 @@ void Core::onText(Session& s, const uint8_t* p, int len) {
     // client names -- but only if that radio is really tuned there, so nobody
     // can transmit on a frequency they are not on.
     uint32_t freq = 0;
-    if (th.freqKhz && (th.freqKhz == s.com1 || th.freqKhz == s.com2)) {
+    if (s.ai) {
+        freq = th.freqKhz;
+    } else if (th.freqKhz && (th.freqKhz == s.com1 || th.freqKhz == s.com2)) {
         freq = th.freqKhz;
     } else if (th.freqKhz == 0) {
         freq = s.txFreq();
@@ -406,7 +696,7 @@ void Core::onText(Session& s, const uint8_t* p, int len) {
     }
 }
 
-void Core::onVoice(Session& s, const uint8_t* p, int len, double now) {
+void Core::onVoice(Session& client, const uint8_t* p, int len, double now) {
     if (len < (int)sizeof(VoiceHeader)) return;
     VoiceHeader vh{};
     memcpy(&vh, p, sizeof(vh));
@@ -416,11 +706,16 @@ void Core::onVoice(Session& s, const uint8_t* p, int len, double now) {
     opusLen = std::min(opusLen, kMaxVoiceBytes);
     opusLen = std::min(opusLen, avail);
     if (opusLen <= 0) return;
+    Session& s = *speaker(client, vh.fromSession);
 
     // Same rule as text. Relying on txRadio from the last position report
     // would drop the first ~200 ms of every transmission.
     uint32_t freq = 0;
-    if (vh.freqKhz && (vh.freqKhz == s.com1 || vh.freqKhz == s.com2)) {
+    if (s.ai) {
+        freq = vh.freqKhz;
+        // so the [TX] flag on the aircraft follows its voice like a pilot's
+        s.com1 = freq; s.txRadio = TX_COM1;
+    } else if (vh.freqKhz && (vh.freqKhz == s.com1 || vh.freqKhz == s.com2)) {
         freq = vh.freqKhz;
     } else if (vh.freqKhz == 0) {
         freq = s.txFreq();
@@ -453,6 +748,7 @@ std::vector<Session*> Core::listeners(const Session& sender, uint32_t freqKhz) {
     for (auto& kv : sessions_) {
         Session& peer = kv.second;
         if (peer.sid == sender.sid) continue;
+        if (sender.ai && peer.sid == sender.owner) continue;   // the program driving it said it; it knows
         if (!guard && !peer.listeningOn(freqKhz)) continue;
         if (sender.hasPosition && peer.hasPosition && !inRadioRange(sender, peer)) {
             continue;
@@ -475,10 +771,28 @@ void Core::onWeather(Session& s, const uint8_t* p, int len) {
     }
 }
 
+// v6: what goes with a session when it goes -- its aircraft, its ATIS.
+void Core::forget(const Session& s) {
+    if (s.injector) {
+        for (auto it = ai_.begin(); it != ai_.end();) {
+            if (it->second.owner == s.sid) it = ai_.erase(it);
+            else ++it;
+        }
+    }
+    if (s.atc) {
+        for (auto it = atis_.begin(); it != atis_.end();) {
+            if (it->second.owner == s.sid) it = atis_.erase(it);
+            else ++it;
+        }
+        atcDirty_ = true;
+    }
+}
+
 void Core::drop(const Peer& peer) {
     auto it = sessions_.find(peer);
     if (it == sessions_.end()) return;
     if (it->second.sid == weatherSid_) weatherSid_ = 0;
+    forget(it->second);
     sessions_.erase(it);
     rosterDirty_ = true;
 }
@@ -487,9 +801,14 @@ void Core::reap(double now) {
     for (auto it = sessions_.begin(); it != sessions_.end();) {
         if (now - it->second.lastSeen > kSessionTimeoutS) {
             if (it->second.sid == weatherSid_) weatherSid_ = 0;
+            forget(it->second);
             it = sessions_.erase(it);
             rosterDirty_ = true;
         }
+        else ++it;
+    }
+    for (auto it = ai_.begin(); it != ai_.end();) {
+        if (now - it->second.lastSeen > kAiTimeoutS) it = ai_.erase(it);
         else ++it;
     }
 }
@@ -502,6 +821,7 @@ void Core::tick(double now) {
     reap(now);
     broadcastTraffic(now);
     if (rosterDirty_ || now - lastRoster_ >= kRosterIntervalS) broadcastRoster(now);
+    if (atcDirty_ || now - lastAtc_ >= kAtcListIntervalS) broadcastAtcList(now);
 }
 
 // Everyone in the flight, to everyone in the flight -- the receiver included,
@@ -512,8 +832,10 @@ void Core::broadcastRoster(double now) {
     rosterDirty_ = false;
     if (sessions_.empty()) return;
 
+    // An injector is a program, not a pilot anyone would message; its
+    // aircraft are not in the roster either (they cannot read one).
     std::vector<const Session*> all;
-    for (const auto& kv : sessions_) all.push_back(&kv.second);
+    for (const auto& kv : sessions_) if (!kv.second.injector) all.push_back(&kv.second);
     std::sort(all.begin(), all.end(),
               [](const Session* a, const Session* b) { return a->sid < b->sid; });
     if ((int)all.size() > kMaxEntriesTotal) all.resize((size_t)kMaxEntriesTotal);
@@ -553,10 +875,16 @@ void Core::broadcastTraffic(double now) {
     for (auto& kv : sessions_) {
         if (kv.second.hasPosition) live.push_back(&kv.second);
     }
+    // What can be seen: pilots, and the aircraft injectors drive. An ATC
+    // station is not an aircraft, and an injector does not need its own
+    // aircraft back.
+    std::vector<Session*> visible;
+    for (Session* s : live) if (!s->atc) visible.push_back(s);
+    for (auto& kv : ai_) visible.push_back(&kv.second);
     for (Session* me : live) {
         std::vector<Session*> others;
-        for (Session* other : live) {
-            if (other->sid == me->sid) continue;
+        for (Session* other : visible) {
+            if (other->sid == me->sid || (other->ai && other->owner == me->sid)) continue;
             if (distanceNm(*me, *other) > kTrafficRangeNm) continue;
             others.push_back(other);
         }

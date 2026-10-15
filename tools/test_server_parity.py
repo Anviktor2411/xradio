@@ -60,10 +60,10 @@ class Client:
                          self.dest)
 
     def login(self, proto=P.PROTO_VERSION, callsign=None, ac=None, livery="",
-              password=""):
+              password="", flags=0):
         self.send(P.PT_LOGIN, P.LOGIN.pack(
             P.pad(callsign if callsign is not None else self.callsign, 16),
-            P.pad(ac if ac is not None else self.ac, 8), proto, 0,
+            P.pad(ac if ac is not None else self.ac, 8), proto, flags,
             P.pad(livery, 16), P.pad(password, 32)), sid=0)
         self.rejected = None
         pkt = self.recv(None)
@@ -814,8 +814,123 @@ def scenario_big_roster(port):
     return out
 
 
+def atc_list_of(packets):
+    """The newest ATC list in a burst, as (callsign, icao, freq, kind) rows."""
+    rows = []
+    for payload in packets:
+        if len(payload) < P.ATC_LIST_HDR.size:
+            continue
+        count, _ = P.ATC_LIST_HDR.unpack_from(payload, 0)
+        off, cur = P.ATC_LIST_HDR.size, []
+        for _ in range(count):
+            if off + P.ATC_ENTRY.size > len(payload):
+                break
+            e = P.ATC_ENTRY.unpack_from(payload, off)
+            off += P.ATC_ENTRY.size
+            cur.append((P.cstr(e[1]), P.cstr(e[2]), e[3], e[4]))
+        rows = cur
+    return rows
+
+
+def scenario_atc_v6(port):
+    """v6: a station, an injector and its aircraft, flight plans, the ATIS."""
+    twr = Client(port, "EETN_TWR", 57.85, 27.02, alt_ft=150.0, ac="ATC")
+    inj = Client(port, "TTRAIN_AI", 57.85, 27.02, ac="ZZZZ", com1=0)
+    a = Client(port, "ESNA12", 57.85, 27.02)
+    b = Client(port, "ESNB34", 57.86, 27.03, ac="A20N")
+    out = {}
+    out["sid_twr"] = twr.login(flags=P.LF_ATC)
+    out["sid_inj"] = inj.login(flags=P.LF_INJECTOR)
+    out["sid_a"] = a.login()
+    out["sid_b"] = b.login()
+    mine = ("ESNA12", "ESNB34", "EETN_TWR", "TTRAIN_AI", "FIN", "BTI", "GHOST")
+
+    def ai_entry(local, cs, lat, lon, flags=0):
+        return P.TRAFFIC_ENTRY.pack(local, P.pad(cs, 16), P.pad("A320", 8), lat, lon, 500.0, 90.0, 0.0, 0.0,
+                                    70.0, 1.0, 0.0, 0, 0, 0, P.XPDR_ALT, 4242, 90.0, 0.0, P.pad("", 16),
+                                    4521, 0, flags)
+
+    def inject(entries):
+        inj.send(P.PT_AI_TRAFFIC, P.TRAFFIC_HDR.pack(len(entries), 0) + b"".join(entries))
+
+    bad = P.TRAFFIC_ENTRY.pack(7, P.pad("GHOST", 16), P.pad("A320", 8), 500.0, 27.0, 500.0, 90.0, 0.0, 0.0,
+                               70.0, 1.0, 0.0, 0, 0, 0, P.XPDR_ALT, 0, 90.0, 0.0, P.pad("", 16), 4521, 0, 0)
+    for _ in range(4):
+        a.position(); b.position(); twr.position(); inj.position()
+        inject([ai_entry(1, "FIN321", 57.86, 27.03), ai_entry(2, "BTI101", 57.87, 27.04), bad])
+        time.sleep(0.12)
+    out["a_sees"] = traffic_set(wait_traffic(a, want="FIN321"), mine)
+    out["twr_sees"] = traffic_set(wait_traffic(twr, want="FIN321"), mine)
+    out["inj_sees"] = traffic_set(inj.drain(0.4)[P.PT_TRAFFIC], mine)
+    out["atc_list"] = atc_list_of(a.drain(0.3).get(P.PT_ATC_LIST, []))
+
+    # the injector speaks as its aircraft, and as a ghost it does not drive
+    aisid = P.ai_sid(inj.sid, 1)
+    msg = b"Finnair 321, established"
+    inj.send(P.PT_TEXT, P.TEXT_HDR.pack(FREQ, aisid, P.pad("FIN321", 16), len(msg), P.pad("", 16)) + msg)
+    inj.send(P.PT_TEXT, P.TEXT_HDR.pack(FREQ, P.ai_sid(inj.sid, 9), P.pad("GHOST", 16), 5, P.pad("", 16)) + b"ghost")
+    inj.send(P.PT_VOICE, P.VOICE_HDR.pack(FREQ, aisid, 3, 4) + b"\x01\x02\x03\x04")
+    time.sleep(0.3)
+    got_b = b.drain(0.4)
+    out["b_texts"] = [(f, n, body, sid == aisid) for (f, n, body), sid in
+                      zip(texts(got_b[P.PT_TEXT]), [P.TEXT_HDR.unpack_from(p, 0)[1] for p in sorted(got_b[P.PT_TEXT])])]
+    out["b_voices"] = voices(got_b[P.PT_VOICE])
+    out["twr_texts"] = texts(twr.drain(0.3)[P.PT_TEXT])
+    out["inj_texts"] = texts(inj.drain(0.3)[P.PT_TEXT])
+
+    # flight plans: filed, acknowledged, cancelled; a late station
+    a.send(P.PT_FLIGHTPLAN, P.flightplan("SPOOF", "C172", "EETN", "EFHK", "DCT", rules="V", cruise_ft=3500, squawk=7777))
+    inj.send(P.PT_FLIGHTPLAN, P.flightplan("TTRAIN_AI", "ZZZZ", "EETN", "EFHK"))
+    time.sleep(0.3)
+    fp_twr = [P.unpack_flightplan(p) for p in twr.drain(0.3).get(P.PT_FLIGHTPLAN, [])]
+    out["fp_at_station"] = sorted((d["callsign"], d["session_id"] == a.sid, d["status"], d["squawk"], d["dest"], d["route"]) for d in fp_twr)
+    twr.send(P.PT_FLIGHTPLAN, P.flightplan("ESNA12", "C172", "EETN", "EFHK", "DCT", status=P.FP_ACK, squawk=4521,
+                                           session_id=a.sid, remarks="cleared as filed"))
+    time.sleep(0.3)
+    fp_a = [P.unpack_flightplan(p) for p in a.drain(0.3).get(P.PT_FLIGHTPLAN, [])]
+    out["fp_ack"] = sorted((d["status"], d["squawk"], d["remarks"]) for d in fp_a)
+    out["fp_b"] = len(b.drain(0.2).get(P.PT_FLIGHTPLAN, []))
+    gnd = Client(port, "EETN_GND", 57.85, 27.02, alt_ft=150.0, ac="ATC", com1=OTHER_FREQ)
+    out["sid_gnd"] = gnd.login(flags=P.LF_ATC)
+    late = [P.unpack_flightplan(p) for p in gnd.drain(0.4).get(P.PT_FLIGHTPLAN, [])]
+    out["fp_late"] = sorted((d["callsign"], d["squawk"], d["status"]) for d in late)
+
+    # the ATIS: offered on tuning, once per letter, again on a new letter
+    twr.send(P.PT_ATIS, P.atis(127905, "EETN", "C", "Tallinn information Charlie"))
+    a.send(P.PT_ATIS, P.atis(127905, "EETN", "Z", "not a station"))
+    time.sleep(0.3)
+    b.com2 = 127905
+    b.position(rx=P.RX_COM1 | P.RX_COM2)
+    b.position(rx=P.RX_COM1 | P.RX_COM2)
+    time.sleep(0.3)
+    got = b.drain(0.3)
+    out["atis_b"] = sorted((P.ATIS_HDR.unpack_from(p, 0)[2], p[P.ATIS_HDR.size:]) for p in got.get(P.PT_ATIS, []))
+    out["atis_a"] = len(a.drain(0.2).get(P.PT_ATIS, []))
+    twr.send(P.PT_ATIS, P.atis(127905, "EETN", "D", "Tallinn information Delta"))
+    time.sleep(0.3)
+    out["atis_b2"] = sorted(P.ATIS_HDR.unpack_from(p, 0)[2] for p in b.drain(0.3).get(P.PT_ATIS, []))
+    out["atc_list2"] = atc_list_of(a.drain(0.5).get(P.PT_ATC_LIST, []))
+
+    # removal, and what leaves with the injector. Packets already queued at
+    # the client from before the change are drained away first: the sample
+    # has to be what the server sends after, not what was in flight.
+    inject([ai_entry(1, "FIN321", 57.86, 27.03), ai_entry(2, "BTI101", 57.87, 27.04, flags=P.AI_REMOVE)])
+    a.drain(0.5)
+    out["after_remove"] = traffic_set(a.drain(0.4)[P.PT_TRAFFIC], ("FIN", "BTI"))
+    inj.send(P.PT_LOGOUT)
+    a.drain(0.5)
+    out["after_injector_left"] = traffic_set(a.drain(0.4)[P.PT_TRAFFIC], ("FIN", "BTI"))
+    twr.send(P.PT_LOGOUT)
+    a.drain(0.3)
+    out["atc_list3"] = atc_list_of(a.drain(0.5).get(P.PT_ATC_LIST, []))
+    for c in (twr, inj, a, b, gnd):
+        c.close()
+    return out
+
+
 SCENARIOS = [
     ("login and traffic", scenario_login_and_traffic),
+    ("atc v6", scenario_atc_v6),
     ("login validation", scenario_bad_login),
     ("position validation", scenario_position_validation),
     ("text routing", scenario_text_routing),

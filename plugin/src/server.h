@@ -37,6 +37,12 @@ constexpr int    kMaxEntriesTotal  = 60;
 constexpr double kRosterIntervalS  = 5.0;
 constexpr int    kMaxTextBytes     = 200;
 constexpr int    kMaxVoiceBytes    = 512;
+// v6. An injected aircraft its injector stopped refreshing is gone; one
+// injector may drive as many aircraft as one client's traffic set holds; the
+// ATC list goes out like the roster.
+constexpr double kAiTimeoutS       = 5.0;
+constexpr int    kMaxAiPerInjector = kMaxEntriesTotal;
+constexpr double kAtcListIntervalS = kRosterIntervalS;
 
 struct Status {
     bool        running = false;

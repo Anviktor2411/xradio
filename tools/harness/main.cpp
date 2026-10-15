@@ -270,6 +270,88 @@ int main(int argc, char** argv) {
         printf("the window offers the update\n");
     }
 
+    // ---- v6: ATC. With XR_HARNESS_ATC set, a station (tools/fake_client.py
+    // --atc ... --atis ... --ack-plans 4521) is on the server: the window must
+    // list it, a click on it must tune COM1, the ATIS must show once its
+    // frequency is tuned, and a flight plan filed on the ATC tab must come
+    // back acknowledged with the squawk -- and be read out. ----
+    bool atcOk = true;
+    if (getenv("XR_HARNESS_ATC")) {
+        const unsigned twrKhz = 135905, atisKhz = 127905;
+        bool listed = false;
+        for (int i = 0; i < 50 && !listed; ++i) {          // the list comes every 5 s at the latest
+            harness::tick(0.2f);
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            listed = harness::drawnContains(harness::draw(), "EETN_TWR");
+        }
+        if (!listed) { fprintf(stderr, "FAIL: the ATC station never appeared in the window\n"); atcOk = false; }
+        int rx = 0, ry = 0;
+        if (listed && harness::drawnAt("  EETN_TWR", &rx, &ry)) {
+            harness::click(1, rx + 20, ry + 2);
+            harness::tick(0.1f);
+            const unsigned com1 = (unsigned)harness::get("sim/cockpit2/radios/actuators/com1_frequency_hz_833");
+            if (com1 != twrKhz) { fprintf(stderr, "FAIL: clicking the station did not tune COM1 (%u)\n", com1); atcOk = false; }
+            else printf("atc: clicking EETN_TWR tuned COM1 to %u\n", com1);
+        } else if (listed) { fprintf(stderr, "FAIL: no clickable row for EETN_TWR\n"); atcOk = false; }
+
+        harness::set("sim/cockpit2/radios/actuators/com2_frequency_hz_833", atisKhz);
+        bool atis = false;
+        for (int i = 0; i < 40 && !atis; ++i) {
+            harness::tick(0.2f);
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            atis = harness::drawnContains(harness::draw(), "ATIS EETN information");
+        }
+        if (!atis) { fprintf(stderr, "FAIL: the ATIS never showed after tuning its frequency\n"); atcOk = false; }
+        else printf("atc: ATIS shown after tuning COM2 to it\n");
+
+        // File a plan through the settings window's ATC tab, the way a pilot does.
+        harness::menu(1);
+        harness::drawWindow(2);
+        int tx = 0, ty = 0;
+        if (harness::drawnAt("ATC", &tx, &ty)) { harness::click(2, tx + 5, ty + 2); harness::drawWindow(2); }
+        int wtop = 0, wleft = 0;
+        harness::windowTop(2, &wtop, &wleft);
+        auto typeInto = [&](const char* label, const char* value) {
+            harness::drawWindow(2);
+            int lx = 0, ly = 0;
+            if (!harness::drawnAt(label, &lx, &ly)) return false;
+            harness::click(2, wleft + 200, ly);
+            harness::drawWindow(2);
+            for (int i = 0; i < 20; ++i) harness::pressVk(2, 0x08);
+            harness::typeText(2, value);
+            harness::drawWindow(2);
+            return true;
+        };
+        if (!typeInto("Departure (ICAO)", "EETN") || !typeInto("Destination", "EFHK")) {
+            fprintf(stderr, "FAIL: the flight plan fields were not found on the ATC tab\n"); atcOk = false;
+        }
+        int bx = 0, by = 0;
+        if (harness::drawnAt("File flight plan", &bx, &by)) { harness::click(2, bx + 10, by + 2); harness::drawWindow(2); }
+        else { fprintf(stderr, "FAIL: no 'File flight plan' button on the ATC tab\n"); atcOk = false; }
+        auto sw2 = harness::drawWindow(2);
+        if (!harness::drawnContains(sw2, "Flight plan filed")) {
+            fprintf(stderr, "FAIL: filing the plan gave no confirmation\n");
+            for (auto& l : sw2) fprintf(stderr, "   %s\n", l.c_str());
+            atcOk = false;
+        }
+        harness::pressVk(2, 0x1B);                             // Escape closes the window
+        harness::drawWindow(2);
+        bool acked = false;
+        for (int i = 0; i < 40 && !acked; ++i) {
+            harness::tick(0.2f);
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            acked = harness::drawnContains(harness::draw(), "squawk 4521");
+        }
+        if (!acked) { fprintf(stderr, "FAIL: the station's acknowledgement (squawk 4521) never showed\n"); atcOk = false; }
+        else printf("atc: flight plan acknowledged with squawk 4521\n");
+        bool spoken = false;
+        for (const auto& l : harness::log())
+            if (l.rfind("speak: ", 0) == 0 && l.find("4521") != std::string::npos) spoken = true;
+        if (!spoken) { fprintf(stderr, "FAIL: the acknowledgement was not read out\n"); atcOk = false; }
+        printf("\n--- the window with ATC in the flight ---\n");
+        for (const auto& l : harness::draw()) printf("  %s\n", l.c_str());
+    }
+
     XPluginDisable();
     XPluginStop();
 
@@ -277,6 +359,7 @@ int main(int argc, char** argv) {
     if (!sawTraffic) { fprintf(stderr, "FAIL: never saw traffic\n"); return 1; }
     if (!sawChat)    { fprintf(stderr, "FAIL: never received a radio message\n"); return 1; }
     if (!voiceOk)    { fprintf(stderr, "FAIL: voice round trip\n"); return 1; }
+    if (!atcOk)      { fprintf(stderr, "FAIL: ATC\n"); return 1; }
     printf("harness OK\n");
     return 0;
 }

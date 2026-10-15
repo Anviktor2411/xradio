@@ -74,6 +74,26 @@ struct Settings {
     // that search.
     std::string cslPath = "";
 
+    // --- ATC (v6) ---
+    // Computer-flown aircraft an ATC program drives (TowerTrainer's traffic)
+    // arrive as ordinary traffic. They can be a lot of aircraft at a busy
+    // airport, so they get a cap of their own, nearest first, and can be left
+    // out of the traffic list while still being drawn.
+    bool        showAiTraffic = true;      // list them (tagged "AI")
+    float       aiMax = 40.f;              // how many to draw at once
+    // A call from a controller, or a message meant only for you, is read out
+    // by the sim so it is not missed with the window shut.
+    bool        atcSoundCue = true;
+    // The flight plan, as it will be filed: a pilot types it once and files
+    // it with the button on the ATC tab; it is kept for the next flight.
+    std::string fpRules   = "V";           // I, V, Y or Z
+    std::string fpDep;                     // ICAO
+    std::string fpDest;
+    std::string fpAltn;
+    std::string fpCruise  = "3500";        // feet
+    std::string fpRoute   = "DCT";
+    std::string fpRemarks;
+
     int         port_i() const { return atoi(port.c_str()); }
     int         hostPort_i() const { return atoi(hostPort.c_str()); }
 
@@ -153,6 +173,17 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"hosting",     "Host a flight here", Kind::Bool, 3, &s.hostEnabled},
         {"hostport",    "Port to host on",    Kind::Text, 3, &s.hostPort, 0,0,"",0, 5, true},
         {"hostupnp",    "Ask the router to open it", Kind::Bool, 3, &s.hostUpnp},
+
+        {"showai",      "List computer-flown aircraft (AI)", Kind::Bool, 4, &s.showAiTraffic},
+        {"aimax",       "Computer-flown aircraft drawn", Kind::Slider, 4, &s.aiMax, 0.f, 60.f, "", 0},
+        {"atccue",      "Read out ATC calls and messages", Kind::Bool, 4, &s.atcSoundCue},
+        {"fprules",     "Flight rules (I, V, Y, Z)", Kind::Text, 4, &s.fpRules, 0,0,"",0, 1},
+        {"fpdep",       "Departure (ICAO)", Kind::Text, 4, &s.fpDep,   0,0,"",0, 7},
+        {"fpdest",      "Destination",    Kind::Text, 4, &s.fpDest,  0,0,"",0, 7},
+        {"fpaltn",      "Alternate",      Kind::Text, 4, &s.fpAltn,  0,0,"",0, 7},
+        {"fpcruise",    "Cruise altitude, ft", Kind::Text, 4, &s.fpCruise, 0,0,"",0, 5, true},
+        {"fproute",     "Route",          Kind::Text, 4, &s.fpRoute, 0,0,"",0, 127},
+        {"fpremarks",   "Remarks",        Kind::Text, 4, &s.fpRemarks, 0,0,"",0, 63},
     };
 }
 
@@ -161,10 +192,11 @@ inline const char* tabName(int i) {
         case 0:  return "Connection";
         case 1:  return "Audio";
         case 2:  return "Traffic";
-        default: return "Hosting";
+        case 3:  return "Hosting";
+        default: return "ATC";
     }
 }
-inline constexpr int kNumTabs = 4;
+inline constexpr int kNumTabs = 5;
 
 // The name of an X-Plane virtual key, for the window. Letters and digits are
 // their ASCII; the rest are the handful people actually bind.

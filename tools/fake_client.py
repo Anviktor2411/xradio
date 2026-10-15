@@ -25,8 +25,10 @@ def run(args):
     sock.settimeout(0.2)
     dest = (args.server, args.port)
 
+    flags = (P.LF_ATC if args.atc else 0) | (P.LF_INJECTOR if args.inject else 0)
     sock.sendto(P.pack(P.PT_LOGIN, 0,
-                       P.login(args.callsign, args.actype, password=args.password)), dest)
+                       P.login(args.callsign, "ATC" if args.atc else args.actype,
+                               password=args.password, flags=flags)), dest)
 
     sid = 0
     deadline = time.time() + 3.0
@@ -43,6 +45,16 @@ def run(args):
               "it want a password (--password)?")
         return
     print(f"logged in as {args.callsign}, sid={sid}")
+
+    # v6: file a flight plan straight after logging in ("EETN EFHK DCT ...")
+    if args.file_plan:
+        parts = args.file_plan.split()
+        dep, dst = (parts + ["", ""])[:2]
+        route = " ".join(parts[2:])
+        sock.sendto(P.pack(P.PT_FLIGHTPLAN, sid, P.flightplan(
+            args.callsign, args.actype, dep, dst, route, rules=args.rules,
+            cruise_ft=args.cruise, remarks=args.remarks)), dest)
+        print(f"filed flight plan {dep} -> {dst} {route}".rstrip())
 
     stop = threading.Event()
     voice_rx = [0]
@@ -90,8 +102,57 @@ def run(args):
                     voice_tx[0] += 1
                     sock.sendto(P.pack(P.PT_VOICE, sid, P.VOICE_HDR.pack(
                         args.com1, sid, voice_tx[0] & 0xFFFF, len(opus)) + opus), dest)
+            # --- v6 ---
+            elif ptype == P.PT_ATC_LIST:
+                count, _ = P.ATC_LIST_HDR.unpack_from(payload, 0)
+                off, names = P.ATC_LIST_HDR.size, []
+                for _ in range(count):
+                    e = P.ATC_ENTRY.unpack_from(payload, off)
+                    off += P.ATC_ENTRY.size
+                    kind = {P.ATC_DEL: "DEL", P.ATC_GND: "GND", P.ATC_TWR: "TWR", P.ATC_APP: "APP",
+                            P.ATC_CTR: "CTR", P.ATC_ATIS: "ATIS"}.get(e[4], "ATC")
+                    names.append(f"{P.cstr(e[1])} {e[3] / 1000:.3f} ({kind})")
+                line = "  atc: " + (", ".join(names) if names else "nobody")
+                if line != atc_last[0]:
+                    atc_last[0] = line
+                    print(line, flush=True)
+            elif ptype == P.PT_ATIS:
+                freq, icao, letter, _r, tlen = P.ATIS_HDR.unpack_from(payload, 0)
+                text = payload[P.ATIS_HDR.size:P.ATIS_HDR.size + tlen].decode("utf-8", "replace")
+                print(f"  ATIS {P.cstr(icao)} information {letter.decode()} on {freq / 1000:.3f}: {text}", flush=True)
+            elif ptype == P.PT_FLIGHTPLAN:
+                d = P.unpack_flightplan(payload)
+                if d:
+                    st = {P.FP_FILED: "filed", P.FP_ACK: "acknowledged", P.FP_CLEARED: "cleared",
+                          P.FP_CANCELLED: "cancelled"}.get(d["status"], str(d["status"]))
+                    print(f"  flight plan {d['callsign']} {d['dep']}->{d['dest']} {d['route']}: {st}"
+                          f"{', squawk %04d' % d['squawk'] if d['squawk'] else ''}"
+                          f"{' -- ' + d['remarks'] if d['remarks'] else ''}", flush=True)
+                    # a station standing in for a controller: every filed plan is
+                    # acknowledged with a squawk, so a client can be tested end to end
+                    if args.atc and args.ack_plans and d["status"] == P.FP_FILED and d["session_id"]:
+                        sock.sendto(P.pack(P.PT_FLIGHTPLAN, sid, P.flightplan(
+                            d["callsign"], d["ac_icao"], d["dep"], d["dest"], d["route"], rules=d["rules"],
+                            cruise_ft=d["cruise_ft"], altn=d["altn"], status=P.FP_ACK, squawk=args.ack_plans,
+                            session_id=d["session_id"], remarks=f"cleared to {d['dest']} as filed")), dest)
+                        print(f"  acknowledged {d['callsign']} with squawk {args.ack_plans:04d}", flush=True)
+            elif ptype == P.PT_WEATHER:
+                if len(payload) == P.WEATHER.size:
+                    w = P.WEATHER.unpack_from(payload, 0)
+                    n_cloud = 4 * P.CLOUD_LAYERS
+                    wind_spd = w[10 + n_cloud + P.AIR_LAYERS]
+                    wind_dir = w[10 + n_cloud + 2 * P.AIR_LAYERS]
+                    print(f"  weather: vis {w[3]:.1f} sm, QNH {w[4] / 100:.0f} hPa, {w[5]:.0f} C, "
+                          f"wind {wind_dir:.0f}/{wind_spd * 1.94384:.0f} kt", flush=True)
 
+    atc_last = [""]
     threading.Thread(target=receiver, daemon=True).start()
+
+    if args.direct:
+        to, _, body = args.direct.partition(" ")
+        body = (body or "hello").encode()
+        sock.sendto(P.pack(P.PT_TEXT, sid, P.TEXT_HDR.pack(
+            0, sid, P.pad(args.callsign, 16), len(body), P.pad(to.upper(), 16)) + body), dest)
 
     lat, lon = args.lat, args.lon
     alt_m = args.alt_ft / 3.28084
@@ -109,17 +170,35 @@ def run(args):
             sock.sendto(P.pack(P.PT_POSITION, sid, P.POSITION.pack(
                 lat, lon,                                   # 2d
                 alt_m, args.heading, 0.0, 0.0, gs_ms, 0.0, 0.0,   # 7f
-                args.com1, 0,                               # 2I: com1, com2
+                args.com1, args.com2,                       # 2I: com1, com2
                 0,                                          # lights
-                0,                                          # onGround
+                1 if args.atc else 0,                       # onGround
                 P.TX_COM1 if args.talk else P.TX_NONE,      # txRadio
-                P.RX_COM1,                                  # rxMask
+                P.RX_COM1 | (P.RX_COM2 if args.com2 else 0),   # rxMask
                 int(time.monotonic() * 1000) & 0xFFFFFFFF,  # timeMs
                 args.heading,                               # trackTrue
                 0.0,                                        # vsMs
                 args.squawk,                                # squawk
                 args.xpdr,                                  # xpdrMode
                 0)), dest)                                  # xpdrIdent
+
+            # v6: an injector drives a row of aircraft east of itself
+            if args.inject:
+                entries = []
+                for i in range(1, args.inject + 1):
+                    entries.append(P.TRAFFIC_ENTRY.pack(
+                        i, P.pad(f"AI{i:03d}", 16), P.pad("A320", 8), lat, lon + 0.01 * i, alt_m + 100.0 * i,
+                        args.heading, 0.0, 0.0, gs_ms, 1.0, 0.0, 0, 0, 0, P.XPDR_ALT,
+                        int(time.monotonic() * 1000) & 0xFFFFFFFF, args.heading, 0.0, P.pad("", 16),
+                        2000 + i, 0, 0))
+                    if len(entries) == P.MAX_TRAFFIC_ENTRIES or i == args.inject:
+                        sock.sendto(P.pack(P.PT_AI_TRAFFIC, sid, P.TRAFFIC_HDR.pack(len(entries), 0)
+                                           + b"".join(entries)), dest)
+                        entries = []
+            # v6: a station publishes its ATIS every few seconds
+            if args.atis and args.atc and time.time() >= next_text - 2.0:
+                sock.sendto(P.pack(P.PT_ATIS, sid, P.atis(args.atis_freq, args.callsign.split("_")[0],
+                                                          args.atis_letter, args.atis)), dest)
 
             # Text names its own frequency and does not need the PTT held.
             if args.talk and time.time() >= next_text:
@@ -157,4 +236,22 @@ if __name__ == "__main__":
     ap.add_argument("--talk", action="store_true", help="send a text message every 5 s")
     ap.add_argument("--parrot", action="store_true",
                     help="re-transmit any voice frames received, for loopback tests")
+    # v6
+    ap.add_argument("--com2", type=int, default=0, help="kHz on COM2 (e.g. an ATIS frequency)")
+    ap.add_argument("--atc", action="store_true",
+                    help="log in as an ATC station (callsign like EETN_TWR, listed with COM1 as its frequency)")
+    ap.add_argument("--atis", default="", help="with --atc: publish this ATIS text")
+    ap.add_argument("--ack-plans", type=int, default=0, metavar="SQUAWK",
+                    help="with --atc: acknowledge every filed flight plan with this squawk")
+    ap.add_argument("--atis-freq", type=int, default=127905)
+    ap.add_argument("--atis-letter", default="A")
+    ap.add_argument("--inject", type=int, default=0,
+                    help="log in as an injector driving this many computer-flown aircraft")
+    ap.add_argument("--file-plan", default="", metavar="'DEP DEST ROUTE'",
+                    help="file a flight plan after logging in, e.g. 'EETN EFHK DCT'")
+    ap.add_argument("--rules", default="V", help="flight plan rules: I, V, Y or Z")
+    ap.add_argument("--cruise", type=int, default=3500, help="flight plan cruise altitude, ft")
+    ap.add_argument("--remarks", default="")
+    ap.add_argument("--direct", default="", metavar="'CALLSIGN message'",
+                    help="send one direct message after logging in")
     run(ap.parse_args())

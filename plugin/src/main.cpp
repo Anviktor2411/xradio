@@ -382,10 +382,65 @@ struct Remote {
     uint8_t     xpdrMode = 0;   // xr::XpdrMode, as their transponder answers
     uint8_t     xpdrIdent = 0;
     float       lastSeen = 0;   // seconds since plugin start
+    bool        ai = false;     // v6: driven by an ATC program, not a pilot
+    bool        drawn = true;   // false: over the AI cap, listed but not in the sky
 };
 
 std::map<uint32_t, Remote> g_remote;
 int g_rejected = 0;   // traffic entries dropped as implausible
+
+// ---------------------------------------------------------------------------
+// v6: air traffic control -- stations online, the ATIS, our flight plan
+// ---------------------------------------------------------------------------
+struct AtcStation {
+    uint32_t    sid = 0;
+    std::string callsign, icao;
+    uint32_t    freqKhz = 0;
+    uint8_t     kind = 0;       // xr::AtcKind
+};
+std::vector<AtcStation> g_atcList;          // the last list the server sent
+float                   g_atcListAt = -1000.f;
+struct AtisText {
+    std::string icao, text;
+    char        letter = 'A';
+    uint32_t    freqKhz = 0;
+    float       at = 0.f;
+};
+std::map<uint32_t, AtisText> g_atis;        // by frequency
+// Our flight plan, as far as ATC has taken it.
+struct FlightPlanState {
+    bool        filed = false;
+    float       filedAt = -1000.f;
+    uint8_t     status = 0;     // xr::FlightPlanStatus, 0 before any answer
+    uint16_t    squawk = 0;
+    std::string dep, dest, remarks;
+};
+FlightPlanState g_fp;
+// Rows of the ATC list as the draw put them, for the click test: a click
+// tunes the station's frequency.
+struct AtcRow { int y; uint32_t freqKhz; int radio; std::string callsign; };
+std::vector<AtcRow> g_atcRows;
+
+// Defined further down, with the roster and the settings window.
+std::string asCallsign(const std::string& raw);
+std::string upper(std::string v);
+
+const char* atcKindName(uint8_t k) {
+    switch (k) {
+        case xr::ATC_DEL:  return "Delivery";
+        case xr::ATC_GND:  return "Ground";
+        case xr::ATC_TWR:  return "Tower";
+        case xr::ATC_APP:  return "Approach";
+        case xr::ATC_CTR:  return "Centre";
+        case xr::ATC_ATIS: return "ATIS";
+        default:           return "ATC";
+    }
+}
+
+bool isAtcStation(const std::string& callsign) {
+    for (const auto& s : g_atcList) if (s.callsign == callsign) return true;
+    return false;
+}
 
 // Defined with the hosting and settings code further down; the main window
 // needs them.
@@ -776,6 +831,7 @@ void handleTraffic(const uint8_t* payload, int len) {
 
         Remote& r   = g_remote[e.sessionId];
         r.sid       = e.sessionId;
+        r.ai        = xr::isAiSid(e.sessionId);
         r.callsign  = cs.empty() ? std::string("?") : cs;
         r.acIcao    = ic;
         r.livery    = lv;
@@ -825,6 +881,10 @@ void handleTraffic(const uint8_t* payload, int len) {
         st.xpdrMode = xr::xpdrTransmitting(ownXpdrMode()) ? r.xpdrMode
                                                           : (uint8_t)xr::XPDR_STANDBY;
         st.xpdrIdent = r.xpdrIdent != 0;
+        // Computer-flown aircraft over the cap are kept in the list but not
+        // in the sky; the cap is applied below, nearest first, once the
+        // whole packet is in.
+        if (r.ai && !r.drawn) continue;
         xr::csl::upsert(st);
     }
 
@@ -837,6 +897,176 @@ void handleTraffic(const uint8_t* payload, int len) {
             ++it;
         }
     }
+
+    // v6: the cap on computer-flown aircraft, nearest first. A busy airport
+    // can mean sixty of them; the CSL budget belongs to the nearest.
+    {
+        std::vector<Remote*> ai;
+        for (auto& kv : g_remote) if (kv.second.ai) ai.push_back(&kv.second);
+        const double myLat = dd(g_ref.lat), myLon = dd(g_ref.lon);
+        std::sort(ai.begin(), ai.end(), [&](const Remote* a, const Remote* b) {
+            return distanceNm(myLat, myLon, a->lat, a->lon) < distanceNm(myLat, myLon, b->lat, b->lon);
+        });
+        const int cap = (int)(g_cfg.aiMax + 0.5f);
+        for (size_t i = 0; i < ai.size(); ++i) {
+            const bool draw = (int)i < cap;
+            if (ai[i]->drawn && !draw) xr::csl::remove(ai[i]->sid);
+            ai[i]->drawn = draw;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v6: the ATC list, the ATIS, flight plans
+// ---------------------------------------------------------------------------
+void handleAtcList(const uint8_t* payload, int len) {
+    if (len < (int)sizeof(xr::AtcListHeader)) return;
+    xr::AtcListHeader lh{};
+    memcpy(&lh, payload, sizeof(lh));
+    if (lh.count > xr::kMaxAtcEntries) return;
+    if (len != (int)(sizeof(lh) + lh.count * sizeof(xr::AtcEntry))) return;
+
+    std::vector<AtcStation> list;
+    int off = (int)sizeof(lh);
+    for (int i = 0; i < lh.count; ++i) {
+        xr::AtcEntry e{};
+        memcpy(&e, payload + off, sizeof(e));
+        off += (int)sizeof(e);
+        AtcStation s;
+        s.sid      = e.sessionId;
+        s.callsign = asCallsign(sanitizeText(e.callsign, sizeof(e.callsign)));
+        s.icao     = sanitizeText(e.icao, sizeof(e.icao));
+        s.freqKhz  = e.freqKhz;
+        s.kind     = e.kind;
+        if (!s.callsign.empty()) list.push_back(s);
+    }
+    // A station that was not in the last list is news worth a line: the
+    // pilot may have been waiting for exactly that controller.
+    for (const auto& s : list) {
+        if (s.kind == xr::ATC_ATIS) continue;
+        bool known = false;
+        for (const auto& o : g_atcList) known = known || o.sid == s.sid;
+        if (!known && g_atcListAt > 0.f) {
+            char line[160];
+            snprintf(line, sizeof(line), "%s (%s) is online on %s -- click it in the XRadio window to tune",
+                     s.callsign.c_str(), atcKindName(s.kind), freqLabel(s.freqKhz).c_str());
+            addChat(line);
+            pushNotice(line, 2);
+        }
+    }
+    g_atcList = list;
+    g_atcListAt = g_elapsed;
+}
+
+void handleAtis(const uint8_t* payload, int len) {
+    if (len < (int)sizeof(xr::AtisPayload)) return;
+    xr::AtisPayload ah{};
+    memcpy(&ah, payload, sizeof(ah));
+    int textLen = std::min<int>(ah.textLen, len - (int)sizeof(ah));
+    textLen = std::min(textLen, xr::kMaxAtisBytes);
+    if (textLen < 0 || ah.freqKhz == 0) return;
+    AtisText& a = g_atis[ah.freqKhz];
+    const bool fresh = a.letter != ah.letter || a.icao.empty();
+    a.icao    = sanitizeText(ah.icao, sizeof(ah.icao));
+    a.letter  = (ah.letter >= 'A' && ah.letter <= 'Z') ? ah.letter : 'A';
+    a.text    = sanitizeText(reinterpret_cast<const char*>(payload + sizeof(ah)), (size_t)textLen);
+    a.freqKhz = ah.freqKhz;
+    a.at      = g_elapsed;
+    if (fresh) {
+        char line[120];
+        snprintf(line, sizeof(line), "ATIS %s information %c on %s", a.icao.c_str(), a.letter,
+                 freqLabel(a.freqKhz).c_str());
+        addChat(line);
+        pushNotice(line, 0);
+    }
+}
+
+void handleFlightPlan(const uint8_t* payload, int len) {
+    if (len < (int)sizeof(xr::FlightPlanPayload)) return;
+    xr::FlightPlanPayload fp{};
+    memcpy(&fp, payload, sizeof(fp));
+    if (fp.sessionId != g_sessionId.load()) return;      // another pilot's plan: not for us
+    g_fp.status  = fp.status;
+    g_fp.squawk  = xr::validSquawk(fp.squawk) ? fp.squawk : 0;
+    g_fp.remarks = sanitizeText(fp.remarks, sizeof(fp.remarks));
+    g_fp.dep     = sanitizeText(fp.dep, sizeof(fp.dep));
+    g_fp.dest    = sanitizeText(fp.dest, sizeof(fp.dest));
+    char line[240];
+    if (fp.status == xr::FP_CANCELLED) {
+        snprintf(line, sizeof(line), "ATC cancelled your flight plan%s%s",
+                 g_fp.remarks.empty() ? "" : ": ", g_fp.remarks.c_str());
+        g_fp.filed = false;
+    } else if (fp.status == xr::FP_CLEARED) {
+        snprintf(line, sizeof(line), "Clearance: %s%s%s", g_fp.remarks.c_str(),
+                 g_fp.squawk ? "  -- squawk " : "", g_fp.squawk ? std::to_string(g_fp.squawk).c_str() : "");
+    } else {
+        snprintf(line, sizeof(line), "ATC has your flight plan %s -> %s%s%04u%s",
+                 g_fp.dep.c_str(), g_fp.dest.c_str(),
+                 g_fp.squawk ? ", squawk " : "", (unsigned)g_fp.squawk,
+                 g_fp.squawk ? " -- set it on the transponder" : "");
+    }
+    addChat(line);
+    pushNotice(line, 1);
+    if (g_cfg.atcSoundCue) XPLMSpeakString(line);
+}
+
+// File the plan on the ATC tab. Returns what went wrong, or "".
+std::string sendFlightPlan() {
+    if (!g_connected) return "not connected";
+    std::string dep = upper(trim(g_cfg.fpDep)), dest = upper(trim(g_cfg.fpDest));
+    if (dep.size() < 3 || dest.size() < 3) return "departure and destination are needed (ICAO codes)";
+    xr::FlightPlanPayload fp{};
+    fp.sessionId = 0;
+    strncpy(fp.callsign, g_cfg.callsign.c_str(), sizeof(fp.callsign) - 1);
+    strncpy(fp.acIcao, effectiveIcao().c_str(), sizeof(fp.acIcao) - 1);
+    const std::string rules = upper(trim(g_cfg.fpRules));
+    fp.rules  = (uint8_t)(rules.empty() ? 'V' : rules[0]);
+    if (fp.rules != 'I' && fp.rules != 'V' && fp.rules != 'Y' && fp.rules != 'Z') fp.rules = 'V';
+    fp.status = xr::FP_FILED;
+    strncpy(fp.dep,  dep.c_str(),  sizeof(fp.dep)  - 1);
+    strncpy(fp.dest, dest.c_str(), sizeof(fp.dest) - 1);
+    strncpy(fp.altn, upper(trim(g_cfg.fpAltn)).c_str(), sizeof(fp.altn) - 1);
+    fp.cruiseFt = (uint32_t)atoi(g_cfg.fpCruise.c_str());
+    strncpy(fp.route,   trim(g_cfg.fpRoute).c_str(),   sizeof(fp.route)   - 1);
+    strncpy(fp.remarks, trim(g_cfg.fpRemarks).c_str(), sizeof(fp.remarks) - 1);
+    uint8_t buf[sizeof(xr::Header) + sizeof(fp)];
+    int off = writeHeader(buf, xr::PT_FLIGHTPLAN, (uint16_t)sizeof(fp));
+    memcpy(buf + off, &fp, sizeof(fp));
+    g_sock.send(buf, off + (int)sizeof(fp));
+    g_fp = FlightPlanState{};
+    g_fp.filed = true; g_fp.filedAt = g_elapsed; g_fp.dep = dep; g_fp.dest = dest;
+    char line[120];
+    snprintf(line, sizeof(line), "Flight plan filed: %s -> %s %c", dep.c_str(), dest.c_str(), (char)fp.rules);
+    addChat(line);
+    return "";
+}
+
+void cancelFlightPlan() {
+    if (!g_connected || !g_fp.filed) return;
+    xr::FlightPlanPayload fp{};
+    strncpy(fp.callsign, g_cfg.callsign.c_str(), sizeof(fp.callsign) - 1);
+    fp.status = xr::FP_CANCELLED;
+    uint8_t buf[sizeof(xr::Header) + sizeof(fp)];
+    int off = writeHeader(buf, xr::PT_FLIGHTPLAN, (uint16_t)sizeof(fp));
+    memcpy(buf + off, &fp, sizeof(fp));
+    g_sock.send(buf, off + (int)sizeof(fp));
+    g_fp = FlightPlanState{};
+    addChat("Flight plan cancelled");
+}
+
+// Tune a radio from the ATC list: COM1 for a station, COM2 for an ATIS. The
+// 8.33 kHz dataref takes kHz; the older 25 kHz one takes units of 10 kHz.
+void tuneRadio(int which, uint32_t khz) {
+    if (khz == 0) return;
+    XPLMDataRef fine   = (which == 2) ? g_ref.com2   : g_ref.com1;
+    XPLMDataRef coarse = (which == 2) ? g_ref.com2Hz : g_ref.com1Hz;
+    if (fine)        XPLMSetDatai(fine, (int)khz);
+    else if (coarse) XPLMSetDatai(coarse, (int)(khz / 10u));
+    else return;
+    char line[96];
+    snprintf(line, sizeof(line), "COM%d tuned to %s", which, freqLabel(khz).c_str());
+    addChat(line);
+    if (g_connected) sendPosition();      // the server learns the new frequency at once
 }
 
 void handleText(const uint8_t* payload, int len) {
@@ -861,16 +1091,29 @@ void handleText(const uint8_t* payload, int len) {
     // tell them apart at a glance: an ordinary call on a frequency, a call on
     // guard that everybody heard, and a message meant only for them.
     char line[360];
+    const bool fromAtc = isAtcStation(from);
     if (!to.empty()) {
         snprintf(line, sizeof(line), "[direct] %s: %s", from.c_str(), msg.c_str());
+    } else if (fromAtc) {
+        snprintf(line, sizeof(line), "[%s] ATC %s: %s", freqLabel(th.freqKhz).c_str(),
+                 from.c_str(), msg.c_str());
     } else {
         snprintf(line, sizeof(line), "[%s] %s: %s", freqLabel(th.freqKhz).c_str(),
                  from.c_str(), msg.c_str());
     }
     addChat(line);
-    // Amber for the two that were aimed at getting your attention, white for
-    // ordinary chatter on a frequency you are already listening to.
-    pushNotice(line, (!to.empty() || xr::isGuard(th.freqKhz)) ? 1 : 0);
+    // Amber for the two that were aimed at getting your attention, green for
+    // a controller, white for ordinary chatter on a frequency you are already
+    // listening to.
+    pushNotice(line, (!to.empty() || xr::isGuard(th.freqKhz)) ? 1 : (fromAtc ? 2 : 0));
+    // v6: a call from ATC, or a message meant only for you, is read out so it
+    // is not missed with the window shut -- the sim's own voice, which every
+    // pilot already knows as the one that says "autopilot disengaged".
+    if (g_cfg.atcSoundCue && (fromAtc || !to.empty())) {
+        char cue[300];
+        snprintf(cue, sizeof(cue), "%s%s: %s", fromAtc ? "" : "Message from ", from.c_str(), msg.c_str());
+        XPLMSpeakString(cue);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1172,7 +1415,11 @@ void pumpNetwork() {
                         ? "this flight needs a password (Settings > Connection)"
                         : "wrong flight password";
                 } else if (rj.reason == xr::RJ_VERSION) {
-                    g_loginProblem = "the server runs a different XRadio version";
+                    char why[160];
+                    snprintf(why, sizeof(why),
+                             "the server runs another XRadio version (this is v%s, protocol %u) -- everyone must be on the same one",
+                             xr::brand::version(), (unsigned)xr::kProtoVersion);
+                    g_loginProblem = why;
                 } else {
                     g_loginProblem = "login refused";
                 }
@@ -1184,6 +1431,9 @@ void pumpNetwork() {
             case xr::PT_TEXT:    handleText(payload, h.payloadLen);    break;
             case xr::PT_WEATHER: handleWeather(payload, h.payloadLen); break;
             case xr::PT_ROSTER:  handleRoster(payload, h.payloadLen);  break;
+            case xr::PT_ATC_LIST:   handleAtcList(payload, h.payloadLen);    break;
+            case xr::PT_ATIS:       handleAtis(payload, h.payloadLen);       break;
+            case xr::PT_FLIGHTPLAN: handleFlightPlan(payload, h.payloadLen); break;
             case xr::PT_PONG:    break;
             default:             break;
         }
@@ -1596,7 +1846,64 @@ void drawWindow(XPLMWindowID win, void*) {
         drawFit(!rx.empty() ? green : (ok ? white : amber), x, y, r, line,
                 xplmFont_Basic);
     }
-    y -= 22;
+    y -= 16;
+
+    // v6: the controllers online, one per row, each a click away from being
+    // tuned; the ATIS of a frequency we have tuned; and where our flight
+    // plan stands. Only drawn when there is something to say.
+    g_atcRows.clear();
+    if (g_connected && !g_atcList.empty()) {
+        drawFit(white, x, y, r, "ATC online  (click a station: COM1, an ATIS: COM2)",
+                xplmFont_Proportional);
+        y -= 15;
+        const uint32_t c1 = comKhz(1), c2 = comKhz(2);
+        for (const auto& s : g_atcList) {
+            if (y < b + 120) break;
+            const bool tuned = s.freqKhz && (s.freqKhz == c1 || s.freqKhz == c2);
+            char row[160];
+            snprintf(row, sizeof(row), "  %-10s %-8s %s%s", s.callsign.c_str(), atcKindName(s.kind),
+                     freqLabel(s.freqKhz).c_str(), tuned ? "   <- tuned" : "");
+            drawFit(tuned ? green : white, x, y, r, row, xplmFont_Basic);
+            g_atcRows.push_back({y, s.freqKhz, s.kind == xr::ATC_ATIS ? 2 : 1, s.callsign});
+            y -= 14;
+        }
+        y -= 4;
+    }
+    for (const auto& kv : g_atis) {
+        const AtisText& a = kv.second;
+        if (a.freqKhz != comKhz(1) && a.freqKhz != comKhz(2)) continue;
+        if (g_elapsed - a.at > 600.f) continue;        // a station that went quiet
+        if (y < b + 120) break;
+        char head[96];
+        snprintf(head, sizeof(head), "ATIS %s information %c:", a.icao.c_str(), a.letter);
+        drawFit(amber, x, y, r, head, xplmFont_Proportional);
+        y -= 14;
+        // The text is long; two lines of it is what fits, the rest is in the
+        // radio log where it arrived.
+        const size_t perLine = (size_t)std::max(20, (r - x - 8) / 7);
+        for (size_t at = 0; at < a.text.size() && y >= b + 120; at += perLine) {
+            drawFit(white, x + 10, y, r, a.text.substr(at, perLine), xplmFont_Basic);
+            y -= 14;
+            if (at + perLine < a.text.size() && at + 2 * perLine >= a.text.size() + perLine) break;
+        }
+        y -= 4;
+    }
+    if (g_connected && (g_fp.filed || g_fp.status)) {
+        char line[200];
+        const char* st = g_fp.status == xr::FP_ACK ? "acknowledged by ATC" :
+                         g_fp.status == xr::FP_CLEARED ? "cleared" :
+                         g_fp.status == xr::FP_CANCELLED ? "cancelled" : "filed, waiting for ATC";
+        if (g_fp.squawk)
+            snprintf(line, sizeof(line), "Flight plan %s -> %s: %s, squawk %04u%s", g_fp.dep.c_str(),
+                     g_fp.dest.c_str(), st, (unsigned)g_fp.squawk,
+                     ownSquawk() == g_fp.squawk ? "" : "  (not set yet)");
+        else
+            snprintf(line, sizeof(line), "Flight plan %s -> %s: %s", g_fp.dep.c_str(), g_fp.dest.c_str(), st);
+        drawFit(g_fp.status == xr::FP_ACK || g_fp.status == xr::FP_CLEARED ? green : grey, x, y, r, line,
+                xplmFont_Basic);
+        y -= 16;
+    }
+    y -= 6;
 
     // What TCAS can actually see, which is not the same as who is out there.
     // An aircraft answers an interrogation only with its transponder above
@@ -1607,8 +1914,10 @@ void drawWindow(XPLMWindowID win, void*) {
     const bool    myXpdrUp = xr::xpdrTransmitting(myXpdr);
     std::vector<const Remote*> contacts;
     if (myXpdrUp) {
-        for (const auto& kv : g_remote)
+        for (const auto& kv : g_remote) {
+            if (kv.second.ai && !g_cfg.showAiTraffic) continue;      // listed only if wanted
             if (xr::xpdrTransmitting(kv.second.xpdrMode)) contacts.push_back(&kv.second);
+        }
     }
 
     char ownXpdrText[40];
@@ -1660,10 +1969,11 @@ void drawWindow(XPLMWindowID win, void*) {
         else
             snprintf(alt, sizeof(alt), "  no alt");
         char line[200];
-        snprintf(line, sizeof(line), "%-8s %-5s %s  %5.1f nm  %3.0f kt  %04u%s%s",
+        snprintf(line, sizeof(line), "%-8s %-5s %s  %5.1f nm  %3.0f kt  %04u%s%s%s",
                  rm.callsign.c_str(), rm.acIcao.c_str(), alt,
                  distanceNm(myLat, myLon, rm.lat, rm.lon), rm.gsMs * 1.94384f,
                  (unsigned)rm.squawk, rm.xpdrIdent ? " ID" : "",
+                 rm.ai ? (rm.drawn ? "  AI" : "  AI (not drawn)") : "",
                  rm.txActive ? "  <<TX" : "");
         const bool emergency = rm.squawk == 7500 || rm.squawk == 7600 ||
                                rm.squawk == 7700;
@@ -1796,6 +2106,13 @@ int mainWindowClick(XPLMWindowID win, int x, int y, XPLMMouseStatus status, void
             atComplete(g_atShown[i]);
             g_chatFocus = true;
             XPLMTakeKeyboardFocus(win);
+            return 1;
+        }
+    }
+    // v6: a station in the ATC list tunes a radio to it.
+    for (const AtcRow& row : g_atcRows) {
+        if (y >= row.y - 4 && y <= row.y + 11) {
+            tuneRadio(row.radio, row.freqKhz);
             return 1;
         }
     }
@@ -2047,6 +2364,9 @@ void reconnect() {
     g_sessionId.store(0);
     g_remote.clear();
     xr::csl::removeAll();
+    g_atcList.clear(); g_atcListAt = -1000.f;   // another server, another set of controllers
+    g_atis.clear();
+    g_fp = FlightPlanState{};
     // A new connection knows nothing about who holds the sky, so offer again
     // rather than staying quiet on the strength of the old flight's answer.
     g_lastWeatherRx  = -1000.f;
@@ -2386,6 +2706,40 @@ void drawSettings(XPLMWindowID win, void*) {
                 if (!g_copyNote.empty() && g_elapsed - g_copyNoteAt < 8.f)
                     xr::ui::text(g_ui, g_copyNote.c_str(), g_copyOk ? 2 : 3);
             }
+        }
+    }
+
+    // v6: the ATC tab files the plan typed above, and says where it stands.
+    if (g_tab == 4) {
+        g_ui.nextRow();
+        static const char* fpBtns[] = {"File flight plan", "Cancel flight plan"};
+        const int hit = xr::ui::buttons(g_ui, fpBtns, 2);
+        if (hit == 0) {
+            // What is typed is what gets filed, saved or not.
+            g_cfg.fpRules = g_edit.fpRules; g_cfg.fpDep = g_edit.fpDep; g_cfg.fpDest = g_edit.fpDest;
+            g_cfg.fpAltn = g_edit.fpAltn; g_cfg.fpCruise = g_edit.fpCruise;
+            g_cfg.fpRoute = g_edit.fpRoute; g_cfg.fpRemarks = g_edit.fpRemarks;
+            const std::string problem = sendFlightPlan();
+            g_settingsNote = problem.empty() ? "Flight plan filed -- ATC answers in the XRadio window" : "Not filed: " + problem;
+        } else if (hit == 1) {
+            cancelFlightPlan();
+            g_settingsNote = "Flight plan cancelled";
+        }
+        if (!g_atcList.empty()) {
+            std::string who = "Online:";
+            for (const auto& s : g_atcList) who += " " + s.callsign + " " + freqLabel(s.freqKhz);
+            xr::ui::text(g_ui, who.c_str(), 2);
+        } else {
+            xr::ui::text(g_ui, g_connected ? "No ATC station online in this flight" : "Not connected", 1);
+        }
+        if (g_fp.filed || g_fp.status) {
+            char line[160];
+            snprintf(line, sizeof(line), "Plan %s -> %s: %s%s%04u", g_fp.dep.c_str(), g_fp.dest.c_str(),
+                     g_fp.status == xr::FP_ACK ? "acknowledged" : g_fp.status == xr::FP_CLEARED ? "cleared" :
+                     g_fp.status == xr::FP_CANCELLED ? "cancelled" : "filed",
+                     g_fp.squawk ? ", squawk " : "", (unsigned)g_fp.squawk);
+            if (!g_fp.squawk) line[strlen(line) - 4] = '\0';   // no ", squawk 0000"
+            xr::ui::text(g_ui, line, 0);
         }
     }
 
