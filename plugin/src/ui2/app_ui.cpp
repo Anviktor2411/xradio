@@ -265,15 +265,42 @@ void drawMessages(Model& m, const Actions& a) {
 // ---------------------------------------------------------------- Flight plan
 void drawFlightPlan(Model& m, const Actions& a) {
     const Palette& p = palette();
-    if (!g_st.fpLoaded) { g_st.fpEdit = m.fp; g_st.fpLoaded = true; }
+    if (!g_st.fpLoaded || g_st.fpSerial != m.fp.ofpSerial) { g_st.fpEdit = m.fp; g_st.fpLoaded = true; g_st.fpSerial = m.fp.ofpSerial; }
     FlightPlanView& f = g_st.fpEdit;
     auto field = [](const char* label, std::string& v, float w, const char* hint = "") {
         char buf[256]; snprintf(buf, sizeof buf, "%s", v.c_str());
         ImGui::SetNextItemWidth(w);
         if (ImGui::InputTextWithHint(label, hint, buf, sizeof buf)) v = buf;
     };
-    if (ImGui::Button(tr("Import from SimBrief")) && a.importSimbrief) { a.importSimbrief(); g_st.fpLoaded = false; }
-    ImGui::SameLine(); if (!m.fp.simbriefSummary.empty()) muted(m.fp.simbriefSummary.c_str()); else muted("latest OFP via the server (Settings in TowerTrainer) or XRadio's own fetch");
+    // SimBrief: the official fetch of the latest OFP (only when pressed), and the official page for a new plan.
+    ImGui::BeginDisabled(m.fp.fetching);
+    if (ImGui::Button(m.fp.fetching ? tr("fetching...") : tr("Import from SimBrief")) && a.importSimbrief) a.importSimbrief();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (ImGui::Button(tr("Plan on SimBrief")) && a.openUrl) a.openUrl(kSimbriefNewFlightUrl);
+    ImGui::SameLine();
+    if (!m.fp.simbriefSummary.empty()) muted(m.fp.simbriefSummary.c_str());
+    else if (m.settings.simbriefUser.empty()) ImGui::TextColored(p.warn, "%s", tr("enter your SimBrief username or pilot ID in Settings > SimBrief"));
+    else muted(tr("no OFP imported yet"));
+    if (m.fp.ofp.present) {
+        const OfpView& o = m.fp.ofp;
+        ImGui::PushStyleColor(ImGuiCol_ChildBg, p.panelAlt);
+        ImGui::BeginChild("ofp", ImVec2(0, ImGui::GetTextLineHeightWithSpacing() * 6.2f + ImGui::GetFrameHeightWithSpacing()), ImGuiChildFlags_AlwaysUseWindowPadding);
+        ImGui::PopStyleColor();
+        heading("OFP"); ImGui::SameLine(); ImGui::Text("%s   %s   %s", o.callsign.c_str(), o.type.c_str(), o.reg.c_str()); ImGui::SameLine(); badge(o.units.c_str(), p.ai);
+        ImGui::Text("%s %s%s  >  %s %s%s", o.dep.c_str(), o.depRwy.empty() ? "" : tr("rwy "), o.depRwy.c_str(), o.dest.c_str(), o.destRwy.empty() ? "" : tr("rwy "), o.destRwy.c_str());
+        if (!o.altn.empty()) { ImGui::SameLine(); muted(tr("alternate")); ImGui::SameLine(); ImGui::TextUnformatted(o.altn.c_str()); }
+        muted("SID"); ImGui::SameLine(); ImGui::TextUnformatted(o.sid.empty() ? "-" : o.sid.c_str()); ImGui::SameLine(); muted("STAR"); ImGui::SameLine(); ImGui::TextUnformatted(o.star.empty() ? "-" : o.star.c_str());
+        ImGui::SameLine(); muted(tr("cruise")); ImGui::SameLine(); ImGui::Text("%s  TAS %s  %s", o.cruise.c_str(), o.tas.c_str(), o.mach.c_str());
+        muted(tr("route")); ImGui::SameLine(); ImGui::TextWrapped("%s", o.route.c_str());
+        muted("EOBT"); ImGui::SameLine(); ImGui::TextUnformatted(o.eobt.c_str()); ImGui::SameLine(); muted("ETD"); ImGui::SameLine(); ImGui::TextUnformatted(o.etd.c_str());
+        ImGui::SameLine(); muted("ETA"); ImGui::SameLine(); ImGui::TextUnformatted(o.eta.c_str());
+        ImGui::SameLine(); muted(tr("fuel block / trip")); ImGui::SameLine(); ImGui::Text("%s / %s %s", o.block.c_str(), o.trip.c_str(), o.units.c_str());
+        muted("ZFW / TOW / LDW"); ImGui::SameLine(); ImGui::Text("%s / %s / %s %s", o.zfw.c_str(), o.tow.c_str(), o.ldw.c_str(), o.units.c_str());
+        if (!o.pdfUrl.empty()) { if (ImGui::Button(tr("Open OFP (PDF)")) && a.openUrl) a.openUrl(o.pdfUrl); ImGui::SameLine(); }
+        if (ImGui::Button(tr("Write X-Plane .fms")) && a.writeFms) setNote(a.writeFms(), m.elapsed);
+        ImGui::EndChild();
+    }
     ImGui::Separator();
     field(tr("Rules"), f.rules, 50, "I"); ImGui::SameLine(); field(tr("Callsign"), f.callsign, 110); ImGui::SameLine(); field(tr("Type"), f.type, 80, "A320");
     field(tr("Departure"), f.dep, 80, "EETN"); ImGui::SameLine(); field(tr("Destination"), f.dest, 80, "EVRA"); ImGui::SameLine(); field(tr("Alternate"), f.altn, 80, "EYVI");
@@ -288,25 +315,20 @@ void drawFlightPlan(Model& m, const Actions& a) {
     ImGui::SameLine();
     if (ImGui::Button(tr("Cancel plan")) && a.cancelFlightPlan) a.cancelFlightPlan();
     ImGui::SameLine();
-    if (ImGui::Button(tr("Write X-Plane .fms")) && a.writeFms) setNote(a.writeFms(), m.elapsed);
     const char* st = m.fp.status == 1 ? tr("filed, waiting for ATC") : m.fp.status == 2 ? tr("acknowledged by ATC") : m.fp.status == 3 ? tr("cleared") : m.fp.status == 4 ? tr("cancelled") : tr("not filed");
     ImGui::TextColored(m.fp.status == 2 || m.fp.status == 3 ? p.ok : p.muted, "%s", st);
     if (m.fp.status >= 1) {
         ImGui::Separator();
         heading(tr("Received clearance"));
+        if (!m.fp.clearance.empty()) ImGui::TextWrapped("%s", m.fp.clearance.c_str());
         if (ImGui::BeginTable("clr", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp)) {
             ImGui::TableSetupColumn(""); ImGui::TableSetupColumn(tr("Plan")); ImGui::TableSetupColumn("ATC"); ImGui::TableHeadersRow();
-            auto row = [&](const char* what, const std::string& plan, const std::string& atc) {
-                const bool diff = !atc.empty() && !plan.empty() && upperTrim(plan) != upperTrim(atc);
-                ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted(what);
-                ImGui::TableNextColumn(); ImGui::TextUnformatted(plan.empty() ? "-" : plan.c_str());
-                ImGui::TableNextColumn(); ImGui::TextColored(diff ? p.warn : (atc.empty() ? p.muted : p.ok), "%s%s", atc.empty() ? "-" : atc.c_str(), diff ? "  !" : "");
-            };
-            char sq[8] = ""; if (m.fp.squawk) snprintf(sq, sizeof sq, "%04u", m.fp.squawk);
-            row(tr("Squawk"), "", sq);
-            row("SID", m.fp.route.substr(0, m.fp.route.find(' ')), m.fp.clearedSid);
-            row("Level", m.fp.cruise, m.fp.clearedLevel);
-            row(tr("Destination"), m.fp.dest, "");
+            for (const ClearanceRow& r : clearanceRows(m.fp)) {
+                ImGui::TableNextRow(); ImGui::TableNextColumn(); ImGui::TextUnformatted(tr(r.what.c_str()));
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(r.plan.empty() ? "-" : r.plan.c_str());
+                ImGui::TableNextColumn(); ImGui::TextColored(r.differs ? p.warn : (r.atc.empty() ? p.muted : p.ok), "%s%s", r.atc.empty() ? "-" : r.atc.c_str(), r.differs ? "  !" : "");
+                if (r.differs && ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("differs from the plan"));
+            }
             ImGui::EndTable();
         }
     }
@@ -422,8 +444,8 @@ void drawSettings(Model& m, const Actions& a) {
     const Palette& p = palette();
     if (!g_st.editLoaded) { g_st.edit = m.settings; g_st.editLoaded = true; }
     Settings& e = g_st.edit;
-    const char* groups[6] = {tr("Audio"), tr("Controls"), tr("Display"), tr("Traffic"), tr("Language"), tr("Tower")};
-    for (int i = 0; i < 6; ++i) { if (i) ImGui::SameLine(); if (ImGui::RadioButton(groups[i], g_st.settingsGroup == i)) g_st.settingsGroup = i; }
+    const char* groups[7] = {tr("Audio"), tr("Controls"), tr("Display"), tr("Traffic"), tr("Language"), tr("Tower"), "SimBrief"};
+    for (int i = 0; i < 7; ++i) { if (i) ImGui::SameLine(); if (ImGui::RadioButton(groups[i], g_st.settingsGroup == i)) g_st.settingsGroup = i; }
     ImGui::Separator();
     ImGui::BeginChild("fields", ImVec2(0, -ImGui::GetFrameHeightWithSpacing() * 1.4f));
     auto fields = describe(e);
@@ -454,8 +476,12 @@ void drawSettings(Model& m, const Actions& a) {
         if (ImGui::RadioButton(tr("English"), e.uiLang != "et")) { e.uiLang = "en"; g_st.editDirty = true; }
         ImGui::SameLine(); if (ImGui::RadioButton(tr("Estonian"), e.uiLang == "et")) { e.uiLang = "et"; g_st.editDirty = true; }
         muted("The radio itself stays English.");
-    } else {
+    } else if (g == 5) {
         for (auto& f : fields) if (f.tab == 5) drawField(f, m, a);
+    } else {
+        for (auto& f : fields) if (std::string(f.key) == "simbriefuser") drawField(f, m, a);
+        muted(tr("Kept only in XRadio's settings file. The latest OFP is fetched through SimBrief's official API, and only when you press Import."));
+        if (ImGui::Button(tr("Plan on SimBrief")) && a.openUrl) a.openUrl(kSimbriefNewFlightUrl);
     }
     ImGui::EndChild();
     ImGui::BeginDisabled(!g_st.editDirty);

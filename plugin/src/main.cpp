@@ -23,6 +23,7 @@
 #include "weather.h"
 #include "xpmp_bridge.h"
 #include "tower.h"
+#include "simbrief.h"
 #ifdef XRADIO_UI_IMGUI
 #  include "ui2/host.h"
 #endif
@@ -420,6 +421,19 @@ struct FlightPlanState {
     std::string dep, dest, remarks;
 };
 FlightPlanState g_fp;
+// S3: the pilot's latest SimBrief OFP once imported, and the "press again to overwrite" window for the .fms.
+xr::simbrief::Ofp g_ofp;
+float g_ofpAt = -1000.f;
+int   g_ofpSerial = 0;
+float g_fmsConfirmUntil = -1.f;
+void applyOfp(const xr::simbrief::Ofp& o);
+std::string xplaneRoot() {
+    char p[1024] = {0};
+    XPLMGetSystemPath(p);
+    std::string s = p;
+    while (!s.empty() && (s.back() == '/' || s.back() == '\\')) s.pop_back();
+    return s;
+}
 // Rows of the ATC list as the draw put them, for the click test: a click
 // tunes the station's frequency.
 struct AtcRow { int y; uint32_t freqKhz; int radio; std::string callsign; };
@@ -605,6 +619,22 @@ void pushNotice(const std::string& text, int colour) {
     if (!g_cfg.popUps || text.empty()) return;
     g_notices.push_back({text, g_elapsed, colour});
     if (g_notices.size() > kMaxNotices) g_notices.erase(g_notices.begin());
+}
+
+// Fetch the latest OFP (official API, only when the pilot asks); the result lands in flightLoop().
+void importSimbrief() {
+    if (xr::simbrief::busy()) return;
+    if (g_cfg.simbriefUser.empty()) { pushNotice("SimBrief: enter your username or pilot ID in Settings first", 1); return; }
+    xr::simbrief::fetchAsync(g_cfg.simbriefUser);
+    pushNotice("Fetching your latest OFP from SimBrief...", 0);
+}
+// Write the OFP route as Output/FMS plans/<DEP><DEST>.fms; an existing file is only replaced on a second press.
+std::string writeOfpFms() {
+    if (!g_ofp.ok) return "import an OFP first";
+    std::string path;
+    const std::string note = xr::simbrief::writeFms(g_ofp, xplaneRoot(), g_elapsed < g_fmsConfirmUntil, &path);
+    g_fmsConfirmUntil = note.rfind("exists", 0) == 0 ? g_elapsed + 20.f : -1.f;
+    return note;
 }
 
 // ---------------------------------------------------------------------------
@@ -1512,6 +1542,22 @@ float g_lastAircraftCheck = 0.f;
 float flightLoop(float elapsedSinceLast, float, int, void*) {
     g_elapsed += elapsedSinceLast;
     xr::tower::tick(elapsedSinceLast, g_elapsed);
+    {   // S3: a finished SimBrief fetch lands here, on the main thread
+        xr::simbrief::Ofp o;
+        if (xr::simbrief::poll(&o)) {
+            if (o.ok) {
+                g_ofp = o; g_ofpAt = g_elapsed; ++g_ofpSerial;
+                applyOfp(o);
+                pushNotice("SimBrief OFP: " + o.summary(), 2);
+                addChat(("SimBrief OFP imported: " + o.summary() + " -- check the flight plan and press File").c_str());
+                if (!o.callsign.empty() && upper(trim(g_cfg.callsign)) != upper(trim(o.callsign)))
+                    pushNotice("The OFP is for " + o.callsign + ", you fly as " + g_cfg.callsign + " -- the plan is filed under your callsign", 1);
+            } else {
+                pushNotice(o.error, 3);
+                addChat(o.error.c_str());
+            }
+        }
+    }
 #ifdef XRADIO_UI_IMGUI
     xr::ui2::host::update(buildModel());
 #endif
@@ -2426,6 +2472,27 @@ void reconnect() {
 // whole thing is a list of strings the test harness can read back.
 XPLMWindowID g_settingsWin = nullptr;
 Settings     g_edit;               // working copy while the window is open
+
+// S3: the OFP becomes the typed flight plan -- editable before filing. The callsign stays the pilot's own.
+void applyOfp(const xr::simbrief::Ofp& o) {
+    g_cfg.fpRules = "I";
+    g_cfg.fpDep = o.dep; g_cfg.fpDest = o.dest; g_cfg.fpAltn = o.altn;
+    g_cfg.fpCruise = std::to_string(o.cruiseFt);
+    std::string route = o.routeAtc.empty() ? o.route : o.routeAtc;
+    if (!o.sid.empty() && route.find(o.sid) == std::string::npos) route = o.sid + " " + route;
+    if (!o.star.empty() && route.find(o.star) == std::string::npos) route += " " + o.star;
+    g_cfg.fpRoute = route.substr(0, 127);
+    // What the 64-byte remarks can carry for the controller: TowerTrainer reads EOBT/TAS/REG/EQPT and the SIMBRIEF mark.
+    std::string rem = "SIMBRIEF";
+    if (!o.eobt.empty()) rem += " EOBT/" + o.eobt;
+    if (o.tas) rem += " TAS/" + std::to_string(o.tas);
+    if (!o.reg.empty()) rem += " REG/" + o.reg;
+    if (!o.equip.empty()) rem += " EQPT/" + o.equip;
+    g_cfg.fpRemarks = rem.substr(0, 63);
+    g_edit.fpRules = g_cfg.fpRules; g_edit.fpDep = g_cfg.fpDep; g_edit.fpDest = g_cfg.fpDest; g_edit.fpAltn = g_cfg.fpAltn;
+    g_edit.fpCruise = g_cfg.fpCruise; g_edit.fpRoute = g_cfg.fpRoute; g_edit.fpRemarks = g_cfg.fpRemarks;
+    xr::saveSettings(g_cfg, g_cfgPath);
+}
 int          g_tab = 0;
 std::string  g_settingsNote;       // one-line feedback under the buttons
 bool         g_captureKey = false; // the PTT-key row is waiting for a key press
@@ -2769,6 +2836,13 @@ void drawSettings(XPLMWindowID win, void*) {
             cancelFlightPlan();
             g_settingsNote = "Flight plan cancelled";
         }
+        g_ui.nextRow();
+        static const char* sbBtns[] = {"Import from SimBrief"};
+        if (xr::ui::buttons(g_ui, sbBtns, 1) == 0) {
+            importSimbrief();
+            g_settingsNote = g_cfg.simbriefUser.empty() ? "Enter your SimBrief username or pilot ID above first" : "Fetching your latest OFP from SimBrief...";
+        }
+        if (g_ofp.ok) xr::ui::text(g_ui, ("OFP: " + g_ofp.summary()).c_str(), 2);
         if (!g_atcList.empty()) {
             std::string who = "Online:";
             for (const auto& s : g_atcList) who += " " + s.callsign + " " + freqLabel(s.freqKhz);
@@ -3094,8 +3168,8 @@ xr::ui2::Actions makeActions() {
     a.toggleTower = []() { xr::tower::toggle(); };
     a.keyPtt = [](bool down) { setPtt(down); };
     a.openUrl = [](const std::string& url) { xr::ui2::openUrlNative(url); };
-    a.importSimbrief = []() { pushNotice("SimBrief import arrives with the flight-plan tab update (S3)", 1); };
-    a.writeFms = []() { return std::string("writing .fms files arrives with S3"); };
+    a.importSimbrief = []() { importSimbrief(); };
+    a.writeFms = []() { return writeOfpFms(); };
     a.checkUpdate = []() {};
     return a;
 }
@@ -3176,6 +3250,26 @@ xr::ui2::Model buildModel() {
     m.fp.route = g_cfg.fpRoute; m.fp.cruise = g_cfg.fpCruise; m.fp.remarks = g_cfg.fpRemarks;
     m.fp.status = g_fp.status == xr::FP_ACK ? 2 : g_fp.status == xr::FP_CLEARED ? 3 : g_fp.status == xr::FP_CANCELLED ? 4 : g_fp.filed ? 1 : 0;
     m.fp.squawk = g_fp.squawk;
+    m.fp.fetching = xr::simbrief::busy();
+    m.fp.ofpSerial = g_ofpSerial;
+    if (g_ofp.ok) {   // S3: the OFP numbers, as text
+        const xr::simbrief::Ofp& o = g_ofp;
+        xr::ui2::OfpView& v = m.fp.ofp;
+        v.present = true; v.callsign = o.callsign; v.type = o.acType; v.reg = o.reg; v.dep = o.dep; v.dest = o.dest; v.altn = o.altn;
+        v.depRwy = o.depRwy; v.destRwy = o.destRwy; v.sid = o.sid; v.star = o.star; v.route = o.routeAtc.empty() ? o.route : o.routeAtc;
+        v.cruise = xr::ui2::levelText(o.cruiseFt); v.tas = std::to_string(o.tas);
+        char mb[16]; snprintf(mb, sizeof mb, "M%.2f", o.mach); v.mach = o.mach > 0 ? mb : "";
+        v.eobt = o.eobt; v.etd = o.etd; v.eta = o.eta; v.block = std::to_string(o.blockFuel); v.trip = std::to_string(o.tripFuel);
+        v.zfw = std::to_string(o.zfw); v.tow = std::to_string(o.tow); v.ldw = std::to_string(o.ldw); v.units = o.units; v.pdfUrl = o.pdfUrl;
+        m.fp.tas = v.tas; m.fp.eobt = o.eobt; m.fp.equip = o.equip;
+        char sum[160]; snprintf(sum, sizeof sum, "OFP %s %s-%s %s (%d min ago)", o.callsign.c_str(), o.dep.c_str(), o.dest.c_str(), v.cruise.c_str(), (int)((g_elapsed - g_ofpAt) / 60.f));
+        m.fp.simbriefAvailable = true; m.fp.simbriefSummary = sum;
+    }
+    if (g_fp.status == xr::FP_ACK || g_fp.status == xr::FP_CLEARED) {
+        unsigned sq = 0;
+        xr::ui2::parseClearance(g_fp.remarks, &m.fp.clearedSid, &m.fp.clearedLevel, &sq);
+        m.fp.clearedDest = g_fp.dest; m.fp.clearance = g_fp.remarks;
+    }
     {
         const xr::relay::Status st = xr::relay::status();
         const xr::upnp::Result u = xr::upnp::latest();
@@ -3244,7 +3338,7 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
         xr::tower::Hooks th;
         th.log = [](const std::string& s) { logMsg("%s", s.c_str()); };
         th.xradioConnected = [] { return g_connected; };
-        th.xplaneRoot = [] { char p[1024] = {0}; XPLMGetSystemPath(p); std::string s = p; while (!s.empty() && (s.back() == '/' || s.back() == '\\')) s.pop_back(); return s; };
+        th.xplaneRoot = [] { return xplaneRoot(); };
         th.pttDown = [] { return g_pttDown; };
         xr::tower::init(th);
     }
@@ -3351,6 +3445,7 @@ PLUGIN_API void XPluginStop(void) {
     }
     xr::ui2::host::shutdown();
 #endif
+    xr::simbrief::shutdown();
     xr::tower::shutdown();
     netStop();
     xr::relay::stop();

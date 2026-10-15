@@ -47,16 +47,20 @@ The light theme: ![radio light](ui/radio-light.png)
   light, AI / emergency badges; filter and hide-AI; click a pilot to message them.
 * **Messages** — the log, chat-style: ATC calls badged green, private messages amber, guard red, your own
   muted; unread count on the tab; quick replies (wilco, roger, say again, unable); `@CALLSIGN` completion.
-* **Flight plan** — import from SimBrief (S3), editable fields, the checks before filing, *File* (sends
-  `PT_FLIGHTPLAN`), cancel, write an X-Plane `.fms`, and the plan next to what ATC answered (squawk, SID,
-  level) with differences marked.
+* **Flight plan** — *Import from SimBrief* (the latest OFP through SimBrief's documented fetch API, username
+  or Pilot ID from Settings > SimBrief, only when pressed), the OFP panel (runways, SID/STAR, route, cruise,
+  TAS/Mach, EOBT/ETD/ETA, fuel, weights, *Open OFP (PDF)*, *Write X-Plane .fms* into `Output/FMS plans`
+  with a second press to overwrite), the editable fields, the checks before filing, *File* (sends
+  `PT_FLIGHTPLAN`), cancel, and the plan next to what ATC answered: the clearance text, squawk, SID,
+  level and destination, with a difference marked. *Plan on SimBrief* opens SimBrief's new-flight page.
 * **Host / Connect** — host a flight (port, password, router/UPnP, the address or join code to share with
   a Copy button, who is connected), join by address or join code, reconnect, and the connection: status,
   last packet, packets per second, pilots and AI counts, the server's protocol version with a clear line
   when it is another XRadio version, and the update notice.
 * **Settings** — grouped: Audio (devices, mic test with a level meter, cockpit noise, squelch, radio
   effect), Controls (the PTT key and the Tower-mode key, captured by pressing a key), Display (scale,
-  theme, overlay, corner notices), Traffic (CSL folder, labels, AI), Language (English / Eesti), Tower.
+  theme, overlay, corner notices), Traffic (CSL folder, labels, AI), Language (English / Eesti), Tower,
+  SimBrief (username or Pilot ID).
 * **Tower** — enter or leave TowerTrainer's tower cab (`docs/tower-mode.md`).
 
 ## First run

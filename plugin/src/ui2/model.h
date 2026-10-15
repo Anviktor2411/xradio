@@ -50,14 +50,30 @@ struct Message {
     bool        atc = false, priv = false, mine = false, guard = false, system = false;
 };
 
+// The numbers of the imported SimBrief OFP (S3), as text ready to show.
+struct OfpView {
+    bool        present = false;
+    std::string callsign, type, reg, dep, dest, altn, depRwy, destRwy, sid, star, route;
+    std::string cruise, tas, mach, eobt, etd, eta, block, trip, zfw, tow, ldw, units, pdfUrl;
+};
+
 struct FlightPlanView {
     std::string rules = "I", dep, dest, altn, type, callsign, route, cruise, tas, eobt, equip, remarks;
     int         status = 0;           // 0 none, 1 filed, 2 acknowledged, 3 cleared, 4 cancelled
     unsigned    squawk = 0;
-    std::string clearedSid, clearedLevel;   // what ATC answered, when known
+    std::string clearedSid, clearedLevel, clearedDest, clearance;   // what ATC answered, when known
     bool        simbriefAvailable = false;  // S3: an OFP was imported
     std::string simbriefSummary;
+    bool        fetching = false;           // S3: a fetch is running
+    int         ofpSerial = 0;              // bumps on every import, so the editable form reloads
+    OfpView     ofp;
 };
+
+// The official page for planning a new flight; the plugin never scrapes it.
+constexpr const char* kSimbriefNewFlightUrl = "https://www.simbrief.com/system/dispatch.php?newflight=1";
+
+// One line of the plan-versus-clearance table.
+struct ClearanceRow { std::string what, plan, atc; bool differs = false; };
 
 struct HostInfo {
     bool        running = false, mapped = false, upnpBusy = false, doubleNat = false, upnpAsked = true;
@@ -169,6 +185,12 @@ struct Wizard {
 
 // The flight plan form's checks before filing.
 std::vector<std::string> flightPlanProblems(const FlightPlanView& fp);
+std::string levelText(int ft);                           // 36000 -> "FL360", 5000 -> "5000 ft", 0 -> ""
+int         levelFeet(const std::string& s);             // "FL360" / "flight level 360" / "5000 ft" -> feet, 0 if none
+// What a clearance text says: the SID ident, the level and the squawk ("cleared to Riga via ULGOT1G, climb 5000 feet, squawk 4521").
+void        parseClearance(const std::string& text, std::string* sid, std::string* level, unsigned* squawk);
+// The plan next to what ATC answered: squawk, SID, level, destination; `differs` only where both sides are known and disagree.
+std::vector<ClearanceRow> clearanceRows(const FlightPlanView& fp);
 
 }  // namespace ui2
 }  // namespace xr

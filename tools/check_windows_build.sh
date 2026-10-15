@@ -45,13 +45,13 @@ fi
 if [ -f lib/miniaudio/miniaudio.h ] && [ -d lib/opus/include ]; then
     FLAGS+=(-DXRADIO_USE_VOICE=1 -Ilib/miniaudio -Ilib/opus/include)
     SOURCES="plugin/src/clipboard.cpp plugin/src/main.cpp plugin/src/net.cpp
-             plugin/src/server.cpp plugin/src/ui.cpp plugin/src/upnp.cpp
+             plugin/src/server.cpp plugin/src/simbrief.cpp plugin/src/ui.cpp plugin/src/upnp.cpp
              plugin/src/voice.cpp plugin/src/xpmp_bridge.cpp plugin/src/tcp.cpp plugin/src/tower.cpp
              tools/server_main.cpp $UI2"
 else
     echo "  note  Opus/miniaudio not fetched -- skipping voice.cpp"
     SOURCES="plugin/src/clipboard.cpp plugin/src/main.cpp plugin/src/net.cpp
-             plugin/src/server.cpp plugin/src/ui.cpp plugin/src/upnp.cpp
+             plugin/src/server.cpp plugin/src/simbrief.cpp plugin/src/ui.cpp plugin/src/upnp.cpp
              plugin/src/xpmp_bridge.cpp tools/server_main.cpp"
 fi
 

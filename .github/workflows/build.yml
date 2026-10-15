@@ -202,6 +202,11 @@ jobs:
           XR_TOWER_PORT=48781 XR_TOWER_LOG=/tmp/tower_rx.txt ASAN_OPTIONS=detect_leaks=0 ./build-tests/tower_test
           kill "$tw" 2>/dev/null || true
 
+      # SimBrief (S3): the OFP parser, the .fms writer, and a live fetch through the
+      # plugin's own HTTP client against a stand-in for the official fetch endpoint.
+      - name: SimBrief import against a fake SimBrief
+        run: ASAN_OPTIONS=detect_leaks=0 bash tools/check_simbrief.sh build-tests
+
   # ---------------------------------------------------------------------------
   build:
     strategy:

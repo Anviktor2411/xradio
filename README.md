@@ -200,6 +200,7 @@ come from the CI run's `XRadio-all-platforms` artifact, not from this zip.
 bash tools/check_portability.sh       # instant: MSVC-only pitfalls
 bash tools/check_windows_build.sh     # ~20s: compile everything for Windows
 python3 tools/test_server.py          # server: protocol and routing, ATC (v6) included
+bash tools/check_simbrief.sh          # SimBrief: parser, .fms writer, a live fetch against tools/fake_simbrief.py
 ```
 
 `check_portability.sh` catches the mistakes that pass on Linux and macOS and
@@ -573,6 +574,26 @@ theme, language English / Eesti) and Tower -- plus a compact cockpit overlay wit
 first-run wizard. Drawn with Dear ImGui (MIT) in X-Plane's own windows: pop-out, VR and HiDPI like any
 other. Screenshots of every tab and the details are in `docs/ui.md`; the earlier text-only window remains
 as the fallback build (`-DXRADIO_UI_IMGUI=OFF`).
+
+## SimBrief: your flight plan from the OFP
+
+![the Flight plan tab](docs/ui/flightplan.png)
+
+Settings → SimBrief: your SimBrief username or Pilot ID (kept only in XRadio's settings file). Then, on
+the Flight plan tab, **Import from SimBrief** fetches your latest OFP through SimBrief's documented
+fetch API (`xml.fetcher.php?username=…&json=1`, or `userid=` for a Pilot ID) -- only when you press the
+button, never on its own -- and fills departure, destination, alternate, route (SID, airways, STAR),
+cruise level, TAS, EOBT and equipment. You can edit everything before **File** sends it to the
+controller as `PT_FLIGHTPLAN`; the OFP numbers stay on the tab (runways, fuel, weights, times, a link
+to the PDF), **Write X-Plane .fms** puts the route into `Output/FMS plans/<DEP><DEST>.fms` for the
+FMS (an existing file is only replaced on a second press), and once ATC answers, the clearance is
+shown next to the plan with squawk, SID, level and destination -- a difference is marked. HTTP 400
+means SimBrief does not know the user or no flight has been planned yet; **Plan on SimBrief** opens
+SimBrief's own new-flight page in the browser. Nothing is scraped and no login is touched; the plugin
+holds no SimBrief API key.
+
+In TowerTrainer the filed plan lands on the pilot's strip with the route, RFL, alternate, EOBT and
+equipment, and goes into EuroScope's `$FP` with the `SIMBRIEF` remark.
 
 ## Tower mode: control from the tower in X-Plane
 

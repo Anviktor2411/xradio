@@ -93,6 +93,7 @@ struct Settings {
     std::string fpCruise  = "3500";        // feet
     std::string fpRoute   = "DCT";
     std::string fpRemarks;
+    std::string simbriefUser;              // SimBrief username or pilot ID (S3); local only, never sent anywhere but SimBrief
 
     // --- Tower mode (TowerTrainer) ---
     std::string towerHost = "127.0.0.1";
@@ -207,6 +208,7 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"fpcruise",    "Cruise altitude, ft", Kind::Text, 4, &s.fpCruise, 0,0,"",0, 5, true},
         {"fproute",     "Route",          Kind::Text, 4, &s.fpRoute, 0,0,"",0, 127},
         {"fpremarks",   "Remarks",        Kind::Text, 4, &s.fpRemarks, 0,0,"",0, 63},
+        {"simbriefuser", "SimBrief username or pilot ID", Kind::Text, 4, &s.simbriefUser, 0,0,"",0, 63},
 
         {"towerhost",   "TowerTrainer address", Kind::Text, 5, &s.towerHost, 0,0,"",0, 63},
         {"towerport",   "Tower link port", Kind::Text, 5, &s.towerPort, 0,0,"",0, 5, true},

@@ -17,6 +17,13 @@ on screen ("the server runs another XRadio version").
   connection quality; grouped settings with a mic test and key capture; English or Estonian; dark and
   light themes; a compact cockpit overlay with toasts; a first-run wizard. Pops out and works in VR.
   Screenshots in `docs/ui.md`. The old text window stays as a build option.
+- **SimBrief.** Flight plan → *Import from SimBrief* fetches your latest OFP through SimBrief's
+  documented fetch API (username or Pilot ID in Settings → SimBrief; only when you press the button)
+  and fills the plan -- route with SID and STAR, cruise level, TAS, EOBT, equipment, alternate -- for you
+  to edit and *File*. The OFP's runways, fuel, weights, times and PDF link stay on the tab, *Write
+  X-Plane .fms* saves the route for the FMS (never overwriting without a second press), and the
+  clearance ATC answers with is shown next to the plan with differences marked. HTTP 400 (unknown user
+  or no flight planned yet) is explained in plain words; *Plan on SimBrief* opens SimBrief's own page.
 - **Tower mode.** Plugins → XRadio → *Tower mode* (`xradio/tower/toggle`): the camera moves to the
   tower cab of the airport TowerTrainer is running (the `apt.dat` viewpoint, else the OpenStreetMap
   tower), your aircraft is frozen and restored exactly on leaving, and five windows show the trainer's

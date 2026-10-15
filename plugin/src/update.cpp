@@ -88,13 +88,18 @@ bool fetch(const std::string& u, std::string* out, std::string* err) {
             if (WinHttpSendRequest(req, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
                                    WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
                 WinHttpReceiveResponse(req, nullptr)) {
+                DWORD code = 0, codeLen = sizeof(code);
+                WinHttpQueryHeaders(req, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                    WINHTTP_HEADER_NAME_BY_INDEX, &code, &codeLen, WINHTTP_NO_HEADER_INDEX);
                 DWORD got = 0;
                 char buf[4096];
                 while (WinHttpReadData(req, buf, sizeof(buf), &got) && got > 0) {
                     out->append(buf, got);
-                    if (out->size() > 64 * 1024) break;   // a release blob is ~2 KB
+                    if (out->size() > 512 * 1024) break;   // a release blob is ~2 KB, an OFP a few hundred KB
                 }
-                ok = !out->empty();
+                // The body stays in *out on an error too: SimBrief says why in it.
+                if (code >= 400) *err = "HTTP " + std::to_string(code);
+                else ok = !out->empty();
             }
             WinHttpCloseHandle(req);
         }
@@ -108,7 +113,9 @@ bool fetch(const std::string& u, std::string* out, std::string* err) {
 // curl is part of macOS and of every Linux X-Plane runs on, and it brings
 // the TLS this needs -- which the plugin itself has no business carrying.
 bool fetch(const std::string& u, std::string* out, std::string* err) {
-    std::string cmd = "curl -fsS --max-time 6 -A XRadio ";
+    // The status code rides on the last line of the output, so a 400 from SimBrief
+    // (unknown user / no flight yet) can be told apart from no connection at all.
+    std::string cmd = "curl -sS --max-time 10 -A XRadio -w '\\n%{http_code}' ";
     cmd += "'" + u + "' 2>/dev/null";          // safeUrl() has excluded quotes
     FILE* p = popen(cmd.c_str(), "r");
     if (!p) { *err = "could not run curl"; return false; }
@@ -116,13 +123,17 @@ bool fetch(const std::string& u, std::string* out, std::string* err) {
     size_t n;
     while ((n = fread(buf, 1, sizeof(buf), p)) > 0) {
         out->append(buf, n);
-        if (out->size() > 64 * 1024) break;
+        if (out->size() > 512 * 1024) break;
     }
     const int rc = pclose(p);
-    if (rc != 0 || out->empty()) {
+    const size_t nl = out->rfind('\n');
+    const int code = nl == std::string::npos ? 0 : atoi(out->c_str() + nl + 1);
+    if (nl != std::string::npos) out->erase(nl);
+    if (rc != 0 || out->empty() || code == 0) {
         *err = "could not reach the update site";
         return false;
     }
+    if (code >= 400) { *err = "HTTP " + std::to_string(code); return false; }
     return true;
 }
 #endif
@@ -197,6 +208,11 @@ void work(std::string current) {
 }
 
 }  // namespace
+
+bool httpGet(const std::string& url, std::string* out, std::string* err) {
+    if (!safeUrl(url)) { if (err) *err = "bad address"; return false; }
+    return fetch(url, out, err);
+}
 
 bool isNewer(const std::string& current, const std::string& candidate) {
     const std::vector<int> a = parts(current), b = parts(candidate);

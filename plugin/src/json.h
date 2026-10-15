@@ -196,7 +196,7 @@ struct Parser {
 
 // Parses `text` into `out`. Trailing whitespace is fine, trailing garbage is not.
 inline bool parse(const std::string& text, Value* out, std::string* err = nullptr) {
-    detail::Parser ps{text.data(), text.data() + text.size()};
+    detail::Parser ps{text.data(), text.data() + text.size(), {}};
     Value v;
     bool ok = ps.value(v);
     if (ok) { ps.ws(); if (ps.p != ps.end) ok = ps.fail("trailing characters"); }

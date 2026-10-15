@@ -73,6 +73,31 @@ int main() {
     auto pr = flightPlanProblems(fp);
     check(pr.size() == 3, "destination, rules and cruise are checked");
 
+    // S3: the clearance text versus the plan
+    check(levelText(36000) == "FL360" && levelText(5000) == "5000 ft" && levelText(0).empty(), "levelText");
+    check(levelFeet("FL360") == 36000 && levelFeet("flight level 70") == 7000 && levelFeet("5000 ft") == 5000 && levelFeet("") == 0, "levelFeet");
+    {
+        std::string sid, lvl; unsigned sq = 0;
+        parseClearance("TTR123, cleared to Riga via ULGOT1G departure, climb 5000 feet, squawk 4521", &sid, &lvl, &sq);
+        check(sid == "ULGOT1G" && lvl == "5000 ft" && sq == 4521, "parseClearance: SID, initial climb, squawk");
+        parseClearance("FIN321 cleared EVRA ABETI2A departure flight level 360 squawk 1234", &sid, &lvl, &sq);
+        check(sid == "ABETI2A" && lvl == "FL360" && sq == 1234, "parseClearance: flight level, a callsign with digits is not a SID");
+        parseClearance("roger, squawk 7000", &sid, &lvl, &sq);
+        check(sid.empty() && lvl.empty() && sq == 7000, "parseClearance: nothing invented");
+    }
+    {
+        FlightPlanView c;
+        c.dest = "EVRA"; c.cruise = "36000"; c.route = "ULGOT1G ULGOT N746 ABETI"; c.squawk = 4521;
+        c.clearedSid = "ULGOT1G"; c.clearedLevel = "5000 ft"; c.clearedDest = "EVRA";
+        auto rows = clearanceRows(c);
+        check(rows.size() == 4 && rows[0].atc == "4521" && rows[1].plan == "ULGOT1G" && !rows[1].differs && !rows[2].differs && !rows[3].differs, "clearanceRows: a matching clearance has no differences");
+        c.clearedSid = "ULGOT2W"; c.clearedLevel = "FL340"; c.clearedDest = "EYVI";
+        rows = clearanceRows(c);
+        check(rows[1].differs && rows[2].differs && rows[3].differs, "clearanceRows: another SID, cruise level and destination are marked");
+        c.ofp.present = true; c.ofp.sid = "ULGOT2W"; rows = clearanceRows(c);
+        check(!rows[1].differs && rows[1].plan == "ULGOT2W", "clearanceRows: the OFP's SID wins over the route's first token");
+    }
+
     printf(fails ? "%d FAILED\n" : "ui_logic_test OK\n", fails);
     return fails ? 1 : 0;
 }

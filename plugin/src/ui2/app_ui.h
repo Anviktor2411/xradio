@@ -34,6 +34,7 @@ struct UiState {
     bool        micTest = false;
     FlightPlanView fpEdit;                  // the flight plan form
     bool        fpLoaded = false;
+    int         fpSerial = -1;              // the OFP import the form was loaded from
     Fonts       fonts;
     bool        wantSettingsTab = false;
 };

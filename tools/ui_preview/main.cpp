@@ -87,7 +87,12 @@ xr::ui2::Model sampleModel(double t) {
                   {t - 110, "EETN_TWR", "ESXYZ, hold position, traffic on short final", "3:40", 135905, true, false, false, false, false},
                   {t - 40, "SAS123", "did you see the weather over Riga?", "4:50", 135905, false, true, false, false, false}};
     m.fp.rules = "I"; m.fp.dep = "EETN"; m.fp.dest = "EVRA"; m.fp.altn = "EYVI"; m.fp.type = "C172"; m.fp.callsign = "ESXYZ"; m.fp.route = "ULGOT N746 ABETI"; m.fp.cruise = "5000"; m.fp.tas = "110"; m.fp.eobt = "0730"; m.fp.equip = "SDFGY/S"; m.fp.remarks = "PBN/B2 SIMBRIEF";
-    m.fp.status = 2; m.fp.squawk = 4521; m.fp.clearedSid = "ULGOT1G"; m.fp.clearedLevel = "5000"; m.fp.simbriefSummary = "OFP TTR123 EETN-EVRA FL360 (fetched 2 min ago)";
+    m.fp.status = 2; m.fp.squawk = 4521; m.fp.clearedSid = "ULGOT1G"; m.fp.clearedLevel = "5000 ft"; m.fp.clearedDest = "EVRA"; m.fp.simbriefSummary = "OFP TTR123 EETN-EVRA FL360 (2 min ago)";
+    m.fp.clearance = "ESXYZ, cleared to Riga via ULGOT1G departure, climb 5000 feet, squawk 4521";
+    m.fp.ofp.present = true; m.fp.ofp.callsign = "TTR123"; m.fp.ofp.type = "A320"; m.fp.ofp.reg = "ESTTR"; m.fp.ofp.dep = "EETN"; m.fp.ofp.dest = "EVRA"; m.fp.ofp.altn = "EYVI";
+    m.fp.ofp.depRwy = "08"; m.fp.ofp.destRwy = "18"; m.fp.ofp.sid = "ULGOT1G"; m.fp.ofp.star = "ABETI2A"; m.fp.ofp.route = "ULGOT1G ULGOT N746 ABETI ABETI2A"; m.fp.ofp.cruise = "FL360"; m.fp.ofp.tas = "447"; m.fp.ofp.mach = "M0.78";
+    m.fp.ofp.eobt = "0730"; m.fp.ofp.etd = "0745"; m.fp.ofp.eta = "0836"; m.fp.ofp.block = "4600"; m.fp.ofp.trip = "2100"; m.fp.ofp.zfw = "56000"; m.fp.ofp.tow = "60500"; m.fp.ofp.ldw = "58400"; m.fp.ofp.units = "kg"; m.fp.ofp.pdfUrl = "https://www.simbrief.com/ofp/flightplans/xml/TTR123.pdf";
+    m.settings.simbriefUser = "tester";
     m.host.running = true; m.host.port = 49100; m.host.clients = 3; m.host.address = "203.0.113.17:49100"; m.host.joinCode = "K7M2Q-X4PB9"; m.host.lanAddress = "192.168.1.20:49100"; m.host.mapped = true; m.host.router = "UPnP"; m.host.callsigns = {"FIN321", "SAS123", "DLH5KM"};
     m.voice.available = true; m.voice.haveMic = true; m.voice.status = "OK  mic: Headset Microphone"; m.voice.micLevel = 0.45f; m.voice.micDevices = {"Headset Microphone", "Webcam"}; m.voice.outDevices = {"Headset", "Speakers"};
     m.update.current = "0.6.0"; m.update.newer = false;

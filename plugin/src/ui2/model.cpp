@@ -149,5 +149,74 @@ std::vector<std::string> flightPlanProblems(const FlightPlanView& fp) {
     return out;
 }
 
+std::string levelText(int ft) {
+    if (ft <= 0) return "";
+    char b[16];
+    if (ft >= 6000 && ft % 100 == 0) snprintf(b, sizeof b, "FL%03d", ft / 100);
+    else snprintf(b, sizeof b, "%d ft", ft);
+    return b;
+}
+
+int levelFeet(const std::string& s) {
+    const std::string u = upperTrim(s);   // "FLIGHT LEVEL 360" -> "FLIGHTLEVEL360"
+    size_t p = u.find("FLIGHTLEVEL");
+    if (p != std::string::npos) return atoi(u.c_str() + p + 11) * 100;
+    p = u.find("FL");
+    if (p != std::string::npos && p + 2 < u.size() && isdigit((unsigned char)u[p + 2])) return atoi(u.c_str() + p + 2) * 100;
+    for (size_t i = 0; i < u.size(); ++i) if (isdigit((unsigned char)u[i])) return atoi(u.c_str() + i);
+    return 0;
+}
+
+void parseClearance(const std::string& text, std::string* sid, std::string* level, unsigned* squawk) {
+    if (sid) sid->clear();
+    if (level) level->clear();
+    if (squawk) *squawk = 0;
+    std::vector<std::string> tok;
+    std::string cur;
+    for (char c : text) {
+        if (isalnum((unsigned char)c)) cur.push_back((char)toupper((unsigned char)c));
+        else { if (!cur.empty()) tok.push_back(cur); cur.clear(); }
+    }
+    if (!cur.empty()) tok.push_back(cur);
+    for (size_t i = 0; i < tok.size(); ++i) {
+        const std::string& t = tok[i];
+        if (sid && sid->empty() && t.size() >= 4 && t.size() <= 7) {
+            // a SID/STAR ident: 3-5 letters, a digit, at most one letter (ULGOT1G, ABETI2A, OSKUR1); a callsign has more digits
+            size_t L = 0;
+            while (L < t.size() && isalpha((unsigned char)t[L])) ++L;
+            if (L >= 3 && L <= 5 && L < t.size() && isdigit((unsigned char)t[L]) &&
+                (L + 1 == t.size() || (L + 2 == t.size() && isalpha((unsigned char)t[L + 1])))) *sid = t;
+        }
+        if (squawk && t == "SQUAWK" && i + 1 < tok.size() && tok[i + 1].size() == 4 && isdigit((unsigned char)tok[i + 1][0])) *squawk = (unsigned)atoi(tok[i + 1].c_str());
+        if (level && level->empty()) {
+            const bool num = isdigit((unsigned char)t[0]) != 0;
+            if (t == "FLIGHT" && i + 2 < tok.size() && tok[i + 1] == "LEVEL" && isdigit((unsigned char)tok[i + 2][0])) *level = levelText(atoi(tok[i + 2].c_str()) * 100);
+            else if (t.size() > 2 && t[0] == 'F' && t[1] == 'L' && isdigit((unsigned char)t[2])) *level = levelText(atoi(t.c_str() + 2) * 100);
+            else if (num && i + 1 < tok.size() && (tok[i + 1] == "FEET" || tok[i + 1] == "FT")) *level = levelText(atoi(t.c_str()));
+            else if ((t == "CLIMB" || t == "MAINTAIN" || t == "ALTITUDE") && i + 1 < tok.size() && isdigit((unsigned char)tok[i + 1][0]) && tok[i + 1].size() >= 3 && tok[i + 1].size() <= 5) *level = levelText(atoi(tok[i + 1].c_str()));
+        }
+    }
+}
+
+std::vector<ClearanceRow> clearanceRows(const FlightPlanView& fp) {
+    std::vector<ClearanceRow> rows;
+    char sq[8] = "";
+    if (fp.squawk) snprintf(sq, sizeof sq, "%04u", fp.squawk);
+    rows.push_back({"Squawk", "", sq, false});
+    std::string planSid = fp.ofp.present ? fp.ofp.sid : "";
+    if (planSid.empty()) {   // the first token of the route, when it looks like a SID
+        std::string first = fp.route.substr(0, fp.route.find(' '));
+        parseClearance(first, &planSid, nullptr, nullptr);
+    }
+    rows.push_back({"SID", planSid, fp.clearedSid, !planSid.empty() && !fp.clearedSid.empty() && upperTrim(planSid) != upperTrim(fp.clearedSid)});
+    const int planFt = atoi(fp.cruise.c_str()), atcFt = levelFeet(fp.clearedLevel);
+    // a "climb 5000 feet" is the initial climb, not the cruise level: only a flight level is compared with the plan
+    const bool lvlDiff = atcFt > 0 && planFt > 0 && fp.clearedLevel.rfind("FL", 0) == 0 && atcFt != planFt;
+    rows.push_back({"Level", levelText(planFt), fp.clearedLevel, lvlDiff});
+    const std::string d1 = upperTrim(fp.dest), d2 = upperTrim(fp.clearedDest);
+    rows.push_back({"Destination", d1, d2, !d1.empty() && !d2.empty() && d1 != d2});
+    return rows;
+}
+
 }  // namespace ui2
 }  // namespace xr

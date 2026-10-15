@@ -43,6 +43,18 @@ if(XRADIO_USE_XPMP2)
     endif()
     # XPMP2 finds the SDK through this cache variable.
     set(XPlaneSDK_DIR "${XPLANE_SDK}" CACHE PATH "" FORCE)
+    if(MINGW AND NOT TARGET mingw_stdthreads)
+        # MinGW-w64 GCC 13+ has std::thread / std::future of its own; XPMP2's bundled
+        # mingw-std-threads then redefines them and its precompiled header fails. An empty
+        # target of that name keeps XPMP2's target_link_libraries() happy and leaves the
+        # compiler's own threads in use.
+        include(CheckCXXSourceCompiles)
+        check_cxx_source_compiles("#include <future>
+int main() { auto f = std::async([] { return 1; }); return f.get() - 1; }" XR_NATIVE_STD_THREADS)
+        if(XR_NATIVE_STD_THREADS)
+            add_library(mingw_stdthreads INTERFACE)
+        endif()
+    endif()
     add_subdirectory(lib/XPMP2 EXCLUDE_FROM_ALL)
 endif()
 
@@ -75,6 +87,7 @@ set(XR_PLUGIN_SOURCES
     plugin/src/natpmp.cpp
     plugin/src/net.cpp
     plugin/src/server.cpp
+    plugin/src/simbrief.cpp
     plugin/src/tcp.cpp
     plugin/src/tower.cpp
     plugin/src/ui.cpp
@@ -191,6 +204,11 @@ endif()
 
 if(XRADIO_USE_XPMP2)
     target_link_libraries(XRadio PRIVATE XPMP2)
+    if(MINGW)
+        # XPMP2's Network.cpp uses Winsock; MSVC pulls ws2_32 in with a #pragma, GNU ld
+        # needs it named after the archive that references it.
+        target_link_libraries(XRadio PRIVATE ws2_32 iphlpapi)
+    endif()
     target_compile_definitions(XRadio PRIVATE XRADIO_USE_XPMP2=1)
 endif()
 
@@ -335,6 +353,16 @@ if(XRADIO_BUILD_TESTS)
     if(WIN32)
         target_link_libraries(update_test PRIVATE winhttp)
         target_compile_definitions(update_test PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    endif()
+
+    # S3: the SimBrief OFP parser, the .fms writer and (with tools/check_simbrief.sh) a live fetch
+    # through the plugin's own HTTP client against tools/fake_simbrief.py.
+    add_executable(simbrief_test tools/harness/simbrief_test.cpp plugin/src/simbrief.cpp plugin/src/update.cpp)
+    target_include_directories(simbrief_test PRIVATE plugin/src)
+    target_link_libraries(simbrief_test PRIVATE Threads::Threads)
+    if(WIN32)
+        target_link_libraries(simbrief_test PRIVATE winhttp)
+        target_compile_definitions(simbrief_test PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
     endif()
     target_include_directories(upnp_test PRIVATE plugin/src)
     target_link_libraries(upnp_test PRIVATE Threads::Threads)

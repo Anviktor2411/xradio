@@ -33,6 +33,8 @@ bool isNewer(const std::string& current, const std::string& candidate);
 void checkAsync(const std::string& current);
 
 Info latest();
+// A plain HTTPS GET with the platform's own client (WinHTTP / curl), for SimBrief; blocks, so call it off the main thread.
+bool httpGet(const std::string& url, std::string* out, std::string* err);
 void shutdown();            // join the worker; call before unload
 
 }  // namespace update
