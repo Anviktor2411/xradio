@@ -9,6 +9,15 @@ on screen ("the server runs another XRadio version").
 
 ### New
 
+- **Tower mode.** Plugins → XRadio → *Tower mode* (`xradio/tower/toggle`): the camera moves to the
+  tower cab of the airport TowerTrainer is running (the `apt.dat` viewpoint, else the OpenStreetMap
+  tower), your aircraft is frozen and restored exactly on leaving, and five windows show the trainer's
+  radar as text, the strips (ACCEPT incoming handoffs), the Delivery list, your frequency with a command
+  line, and ATIS / operations (LVP, runway, stop bars, light gun). Look around by dragging, binoculars
+  with the wheel, follow an aircraft, a view from the apron; all bindable commands under `xradio/tower/`.
+  Works standalone against TowerTrainer's `server.py` (its traffic drawn as CSL models) or together with
+  an XRadio flight. Settings → Tower. See `docs/tower-mode.md`.
+
 - **ATC stations.** A controller program -- [TowerTrainer](https://github.com/Anviktor2411/TowerTrainer)
   is the first -- logs in with the `LF_ATC` flag: it is not an aircraft, so it is
   not drawn and not on anyone's TCAS, but it hears and speaks on its frequency,

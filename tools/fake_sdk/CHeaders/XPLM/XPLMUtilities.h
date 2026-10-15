@@ -10,3 +10,5 @@ int  XPLMEnableFeature(const char*, int);
 XPLMCommandRef XPLMCreateCommand(const char*, const char*);
 void XPLMRegisterCommandHandler(XPLMCommandRef, int (*)(XPLMCommandRef, XPLMCommandPhase, void*), int, void*);
 void XPLMUnregisterCommandHandler(XPLMCommandRef, int (*)(XPLMCommandRef, XPLMCommandPhase, void*), int, void*);
+
+void XPLMGetSystemPath(char* outSystemPath);   // the X-Plane folder (the harness's temp dir)

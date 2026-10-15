@@ -1,6 +1,7 @@
 #pragma once
 #include <string>
 #include <vector>
+#include "XPLMCamera.h"
 
 namespace harness {
 
@@ -27,6 +28,7 @@ void setProbeWorks(bool works);
 void tick(float dt);                      // run one flight-loop callback
 std::vector<std::string> draw();          // run the window draw, capture its text
 void ptt(bool down);                      // press / release the PTT command
+int  command(const std::string& name, int phase);   // any registered command by name (xplm_CommandBegin/Continue/End); -1 if none
 int  simKey(int vk, bool down);           // a key with no window focused (key sniffer)
 void menu(int item);                      // click a plugin menu item
 
@@ -60,6 +62,10 @@ void        setEnv(const char* name, const char* value);   // setenv / _putenv_s
 bool drawnAt(const std::string& needle, int* x, int* y);
 const std::vector<Drawn>& drawnPositions();
 const std::vector<std::string>& log();
+
+// Tower mode: whether the plugin holds the camera, and where it puts it (runs the plugin's callback).
+bool cameraControlled();
+XPLMCameraPosition_t camera();
 
 extern bool g_verbose;
 

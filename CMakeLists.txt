@@ -72,6 +72,8 @@ set(XR_PLUGIN_SOURCES
     plugin/src/natpmp.cpp
     plugin/src/net.cpp
     plugin/src/server.cpp
+    plugin/src/tcp.cpp
+    plugin/src/tower.cpp
     plugin/src/ui.cpp
     plugin/src/update.cpp
     plugin/src/upnp.cpp
@@ -266,6 +268,7 @@ if(XRADIO_BUILD_TESTS)
     xradio_test_exe(voice_test     tools/harness/voice_test.cpp)
     xradio_test_exe(settings_test  tools/harness/settings_test.cpp)
     xradio_test_exe(hosting_test   tools/harness/hosting_test.cpp)
+    xradio_test_exe(tower_test     tools/harness/tower_test.cpp)
     # Not a test: renders a WAV through the radio chain so it can be listened to.
     xradio_test_exe(radio_demo     tools/harness/radio_demo.cpp)
 

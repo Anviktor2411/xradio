@@ -20,8 +20,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "server"))
 import protocol as P  # noqa: E402
 
 
+
+def _disable_udp_reset(sock):
+    """Windows: a datagram to a port nobody listens on yet (the server still starting) must not raise
+    WinError 10054 on the next recvfrom -- the same SIO_UDP_CONNRESET switch the servers use."""
+    import os
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        ws2 = ctypes.windll.ws2_32
+        ws2.WSAIoctl.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p, ctypes.c_ulong, ctypes.c_void_p,
+                                 ctypes.c_ulong, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        off, ret = ctypes.c_ulong(0), ctypes.c_ulong(0)
+        ws2.WSAIoctl(sock.fileno(), 0x9800000C, ctypes.byref(off), 4, None, 0, ctypes.byref(ret), None, None)
+    except Exception:
+        pass
+
+
 def run(args):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    _disable_udp_reset(sock)
     sock.settimeout(0.2)
     dest = (args.server, args.port)
 

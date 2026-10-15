@@ -429,9 +429,30 @@ void XPLMExtractFileAndPath(char* path) {
 
 int XPLMEnableFeature(const char*, int) { return 1; }
 
-XPLMCommandRef XPLMCreateCommand(const char*, const char*) { return (XPLMCommandRef)1; }
-void XPLMRegisterCommandHandler(XPLMCommandRef, XPLMCommandCallback_f h, int, void*) {
-    harness::g_pttHandler = h;
+namespace harness {
+std::map<std::string, int>            g_cmdIds;        // name -> ref id (1 = xradio/ptt, created first)
+std::map<int, XPLMCommandCallback_f>  g_cmdHandlers;
+std::map<int, void*>                  g_cmdRefcons;
+int command(const std::string& name, int phase) {
+    auto it = g_cmdIds.find(name);
+    if (it == g_cmdIds.end()) return -1;
+    auto h = g_cmdHandlers.find(it->second);
+    if (h == g_cmdHandlers.end() || !h->second) return -1;
+    return h->second((XPLMCommandRef)(intptr_t)it->second, (XPLMCommandPhase)phase, g_cmdRefcons[it->second]);
+}
+}  // namespace harness
+XPLMCommandRef XPLMCreateCommand(const char* name, const char*) {
+    auto it = harness::g_cmdIds.find(name ? name : "");
+    if (it != harness::g_cmdIds.end()) return (XPLMCommandRef)(intptr_t)it->second;
+    const int id = (int)harness::g_cmdIds.size() + 1;
+    harness::g_cmdIds[name ? name : ""] = id;
+    return (XPLMCommandRef)(intptr_t)id;
+}
+void XPLMRegisterCommandHandler(XPLMCommandRef r, XPLMCommandCallback_f h, int, void* ref) {
+    const int id = (int)(intptr_t)r;
+    harness::g_cmdHandlers[id] = h;
+    harness::g_cmdRefcons[id] = ref;
+    for (const auto& kv : harness::g_cmdIds) if (kv.second == id && kv.first == "xradio/ptt") harness::g_pttHandler = h;
 }
 void XPLMUnregisterCommandHandler(XPLMCommandRef, XPLMCommandCallback_f, int, void*) {}
 
@@ -476,3 +497,39 @@ XPLMProbeResult XPLMProbeTerrainXYZ(XPLMProbeRef probe, float x, float, float z,
     out->is_wet    = 0;
     return xplm_ProbeHitTerrain;
 }
+
+// ---------------------------------------------------------------- Tower mode (v0.6.0)
+#include "XPLMCamera.h"
+namespace harness {
+XPLMCameraControl_f  g_camFunc = nullptr;
+void*                g_camRef  = nullptr;
+XPLMCameraPosition_t g_camPos{};
+bool cameraControlled() { return g_camFunc != nullptr; }
+XPLMCameraPosition_t camera() {
+    if (g_camFunc) { XPLMCameraPosition_t p{}; if (g_camFunc(&p, 0, g_camRef)) g_camPos = p; }
+    return g_camPos;
+}
+}  // namespace harness
+
+void XPLMControlCamera(XPLMCameraControlDuration, XPLMCameraControl_f f, void* ref) { harness::g_camFunc = f; harness::g_camRef = ref; }
+void XPLMDontControlCamera(void) {
+    if (harness::g_camFunc) { XPLMCameraPosition_t p{}; harness::g_camFunc(&p, 1, harness::g_camRef); }
+    harness::g_camFunc = nullptr; harness::g_camRef = nullptr;
+}
+int  XPLMIsCameraBeingControlled(XPLMCameraControlDuration* d) { if (d) *d = xplm_ControlCameraUntilViewChanges; return harness::g_camFunc ? 1 : 0; }
+void XPLMReadCameraPosition(XPLMCameraPosition_t* out) { if (out) *out = harness::camera(); }
+void XPLMSetDatad(XPLMDataRef r, double v) { harness::set(refName(r), v); }
+int  XPLMGetDatavi(XPLMDataRef r, int* out, int inOffset, int inMax) {
+    const std::vector<float>& v = harness::getArray(refName(r));
+    if (!out) return (int)v.size();
+    int n = 0;
+    for (int i = 0; i < inMax && inOffset + i < (int)v.size(); ++i) { out[i] = (int)v[(size_t)(inOffset + i)]; ++n; }
+    return n;
+}
+void XPLMSetDatavi(XPLMDataRef r, int* in, int inOffset, int inCount) {
+    std::vector<float> v = harness::getArray(refName(r));
+    if ((int)v.size() < inOffset + inCount) v.resize((size_t)(inOffset + inCount), 0.f);
+    for (int i = 0; i < inCount; ++i) v[(size_t)(inOffset + i)] = (float)in[i];
+    harness::setArray(refName(r), v);
+}
+void XPLMGetSystemPath(char* out) { if (out) { const std::string d = harness::tempDir() + "/"; strncpy(out, d.c_str(), 511); out[511] = 0; } }

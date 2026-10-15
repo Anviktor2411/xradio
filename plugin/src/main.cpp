@@ -22,6 +22,7 @@
 #include "voice.h"
 #include "weather.h"
 #include "xpmp_bridge.h"
+#include "tower.h"
 
 #include "XPLMDataAccess.h"
 #include "XPLMDisplay.h"
@@ -449,6 +450,7 @@ std::string shareAddressPlain();
 void openSettings();
 void reconnect();
 void setPtt(bool down);
+xr::tower::Config towerConfig();
 float g_lastWeatherSend = -1000.f;   // see sendWeather()
 // When somebody else's sky last arrived. The server awards the weather claim
 // to the first pilot who asks for it, and does not tell the losers -- but a
@@ -1477,6 +1479,7 @@ float g_lastAircraftCheck = 0.f;
 
 float flightLoop(float elapsedSinceLast, float, int, void*) {
     g_elapsed += elapsedSinceLast;
+    xr::tower::tick(elapsedSinceLast, g_elapsed);
 
     if (!g_sockReady.load()) {
         // Not open yet: either still resolving, or it failed and the thread
@@ -2428,6 +2431,7 @@ void applyLiveSettings() {
     xr::csl::setTrafficVisible(g_cfg.showTraffic);
     xr::csl::setLabels(g_cfg.showLabels, g_cfg.labelDistNm);
     g_sendInterval = 1.0f / (g_cfg.reportHz < 1.f ? 1.f : g_cfg.reportHz);
+    xr::tower::applyConfig(towerConfig());
 }
 
 void openSettings() {
@@ -2973,6 +2977,46 @@ void resetWindowPositions() {
     logMsg("window positions reset");
 }
 
+// Tower mode (v0.6.0): the commands a pilot binds, and the settings the module gets
+xr::tower::Config towerConfig() {
+    xr::tower::Config c;
+    c.host = g_cfg.towerHost; c.port = g_cfg.towerPort; c.code = g_cfg.towerCode; c.position = g_cfg.towerPos; c.name = g_cfg.towerName;
+    c.park = g_cfg.towerPark; c.syncWeather = g_cfg.towerWeather; c.cabHeightM = g_cfg.towerHeight; c.draw3d = g_cfg.tower3d; c.showWindows = g_cfg.towerWindows;
+    return c;
+}
+int towerCmdHandler(XPLMCommandRef, XPLMCommandPhase phase, void* ref) {
+    const int which = (int)(intptr_t)ref;
+    const bool begin = phase == xplm_CommandBegin, held = phase != xplm_CommandEnd;
+    switch (which) {
+        case 0: if (begin) xr::tower::toggle(); break;
+        case 1: if (held) xr::tower::look(-1.5f, 0.f); break;
+        case 2: if (held) xr::tower::look(1.5f, 0.f); break;
+        case 3: if (held) xr::tower::look(0.f, 1.f); break;
+        case 4: if (held) xr::tower::look(0.f, -1.f); break;
+        case 5: if (held) xr::tower::zoom(1.04f); break;
+        case 6: if (held) xr::tower::zoom(0.96f); break;
+        case 7: if (begin) xr::tower::groundView(); break;
+        case 8: if (begin) xr::tower::towerView(); break;
+        case 9: if (begin) xr::tower::nextTarget(); break;
+        case 10: if (begin) xr::tower::setWindowsVisible(!xr::tower::windowsVisible()); break;
+        default: break;
+    }
+    return 0;
+}
+const struct { const char* name; const char* desc; } kTowerCmds[] = {
+    {"xradio/tower/toggle",      "XRadio: tower mode on / off (TowerTrainer)"},
+    {"xradio/tower/look_left",   "XRadio tower: look left"},
+    {"xradio/tower/look_right",  "XRadio tower: look right"},
+    {"xradio/tower/look_up",     "XRadio tower: look up"},
+    {"xradio/tower/look_down",   "XRadio tower: look down"},
+    {"xradio/tower/zoom_in",     "XRadio tower: binoculars in"},
+    {"xradio/tower/zoom_out",    "XRadio tower: binoculars out"},
+    {"xradio/tower/ground_view", "XRadio tower: view from the apron"},
+    {"xradio/tower/tower_view",  "XRadio tower: back to the cab"},
+    {"xradio/tower/next_target", "XRadio tower: follow the next aircraft"},
+    {"xradio/tower/windows",     "XRadio tower: show / hide the tower windows"},
+};
+
 void menuHandler(void*, void* item) {
     intptr_t which = (intptr_t)item;
     if (which == 0 && g_window) {
@@ -2986,6 +3030,14 @@ void menuHandler(void*, void* item) {
         resetWindowPositions();
     } else if (which == 4) {
         sendText("Hello from " + g_cfg.callsign);
+    } else if (which == 5) {
+        xr::tower::toggle();
+    } else if (which == 6) {
+        xr::tower::setWindowsVisible(!xr::tower::windowsVisible());
+    } else if (which == 7) {
+        xr::tower::groundView();
+    } else if (which == 8) {
+        xr::tower::towerView();
     }
 }
 
@@ -3004,12 +3056,21 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
 
     loadConfig();
     findRefs();
+    {
+        xr::tower::Hooks th;
+        th.log = [](const std::string& s) { logMsg("%s", s.c_str()); };
+        th.xradioConnected = [] { return g_connected; };
+        th.xplaneRoot = [] { char p[1024] = {0}; XPLMGetSystemPath(p); std::string s = p; while (!s.empty() && (s.back() == '/' || s.back() == '\\')) s.pop_back(); return s; };
+        th.pttDown = [] { return g_pttDown; };
+        xr::tower::init(th);
+    }
     xr::weather::init();
     createWindow();
     createSettingsWindow();
     // Third, deliberately: the test harness numbers windows in creation order
     // and two suites already know the settings window as number two.
     createNoticeWindow();
+    xr::tower::createWindows();     // windows 4..8 in the harness's numbering
 
     std::string cslErr;
     if (!xr::csl::init(pluginRootDir(), effectiveIcao(), g_cfg.cslPath, &cslErr)) {
@@ -3033,6 +3094,10 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     g_cmdPtt = XPLMCreateCommand("xradio/ptt", "XRadio: push to talk");
     XPLMRegisterCommandHandler(g_cmdPtt, pttHandler, 1, nullptr);
     XPLMRegisterKeySniffer(pttKeySniffer, 0 /* after windows */, nullptr);
+    for (size_t i = 0; i < sizeof(kTowerCmds) / sizeof(kTowerCmds[0]); ++i) {
+        XPLMCommandRef r = XPLMCreateCommand(kTowerCmds[i].name, kTowerCmds[i].desc);
+        XPLMRegisterCommandHandler(r, towerCmdHandler, 1, (void*)(intptr_t)i);
+    }
 
     int idx = XPLMAppendMenuItem(XPLMFindPluginsMenu(), "XRadio", nullptr, 0);
     g_menu = XPLMCreateMenu("XRadio", XPLMFindPluginsMenu(), idx, menuHandler, nullptr);
@@ -3041,6 +3106,10 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     XPLMAppendMenuItem(g_menu, "Reconnect",            (void*)2, 0);
     XPLMAppendMenuItem(g_menu, "Reset window position", (void*)3, 0);
     XPLMAppendMenuItem(g_menu, "Send test message",    (void*)4, 0);
+    XPLMAppendMenuItem(g_menu, "Tower mode (TowerTrainer)", (void*)5, 0);
+    XPLMAppendMenuItem(g_menu, "Tower: show / hide windows", (void*)6, 0);
+    XPLMAppendMenuItem(g_menu, "Tower: view from the apron", (void*)7, 0);
+    XPLMAppendMenuItem(g_menu, "Tower: back to the cab",    (void*)8, 0);
 
     XPLMCreateFlightLoop_t fl{};
     fl.structSize   = sizeof(fl);
@@ -3068,6 +3137,7 @@ PLUGIN_API int XPluginEnable(void) {
 }
 
 PLUGIN_API void XPluginDisable(void) {
+    xr::tower::leave();
     xr::voice::setTransmitting(false);
     xr::voice::releaseMicrophone();      // a disabled plugin holds nothing
     netStop();
@@ -3081,6 +3151,7 @@ PLUGIN_API void XPluginDisable(void) {
 }
 
 PLUGIN_API void XPluginStop(void) {
+    xr::tower::shutdown();
     netStop();
     xr::relay::stop();
     xr::upnp::releaseAsync();      // give the router's port back if we can

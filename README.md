@@ -556,6 +556,21 @@ controller and private messages are read out by the sim so they are not
 missed with the window shut. The whole of it, for pilots and for programs
 that want to be ATC: [docs/atc.md](docs/atc.md).
 
+## Tower mode: control from the tower in X-Plane
+
+Plugins → XRadio → *Tower mode* (command `xradio/tower/toggle`) puts you in the tower cab of the airport
+[TowerTrainer](https://github.com/Anviktor2411/TowerTrainer) is running, with its traffic in the sky and on
+the taxiways: the camera goes to the viewpoint the scenery's `apt.dat` gives (row 14; the trainer's
+OpenStreetMap tower or the apron centre otherwise), your own aircraft is frozen where it stands and put
+back exactly when you leave, and five windows open -- a character radar, the strips with ACCEPT for
+incoming handoffs, the Delivery list, your frequency's log with a command line, and ATIS / operations
+(LVP, runway, stop bars, light gun). What you type is what you would type in the trainer; the trainer
+stays the authority. The plugin talks to the trainer's *tower link* (`server.py --tower-port`, JSON lines
+over TCP, `docs/tower-mode.md`) as a remote controller of its session, so it works with XRadio connected
+to a flight (the traffic then also arrives through the injector) and standalone against `server.py`
+alone, when it draws the trainer's traffic as CSL models itself. Settings → Tower: address, port, session
+code (`TOWER`), position, nickname, freeze, weather and time sync, cab height, 3D traffic, windows.
+
 ## Configuration
 
 Easiest way: the **Settings** button at the top of the XRadio window, or

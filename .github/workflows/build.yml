@@ -192,6 +192,16 @@ jobs:
           tail -1 /tmp/fuzz.log
           kill %1 2>/dev/null || true
 
+      # Tower mode (v0.6.0): the camera, the frozen aircraft, the windows and the
+      # messages, against a stand-in for TowerTrainer's tower link.
+      - name: Tower mode against a fake TowerTrainer
+        run: |
+          python3 tools/fake_towertrainer.py --port 48781 --log /tmp/tower_rx.txt > /tmp/tower.log 2>&1 &
+          tw=$!
+          sleep 1
+          XR_TOWER_PORT=48781 XR_TOWER_LOG=/tmp/tower_rx.txt ASAN_OPTIONS=detect_leaks=0 ./build-tests/tower_test
+          kill "$tw" 2>/dev/null || true
+
   # ---------------------------------------------------------------------------
   build:
     strategy:

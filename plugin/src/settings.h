@@ -94,6 +94,18 @@ struct Settings {
     std::string fpRoute   = "DCT";
     std::string fpRemarks;
 
+    // --- Tower mode (TowerTrainer) ---
+    std::string towerHost = "127.0.0.1";
+    std::string towerPort = "8781";
+    std::string towerCode = "TOWER";
+    std::string towerPos  = "TWR";
+    std::string towerName = "X-Plane";
+    bool        towerPark = true;
+    bool        towerWeather = false;
+    float       towerHeight = 0.f;         // metres; 0 = apt.dat / 30 m
+    bool        tower3d = true;
+    bool        towerWindows = true;
+
     int         port_i() const { return atoi(port.c_str()); }
     int         hostPort_i() const { return atoi(hostPort.c_str()); }
 
@@ -184,6 +196,17 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"fpcruise",    "Cruise altitude, ft", Kind::Text, 4, &s.fpCruise, 0,0,"",0, 5, true},
         {"fproute",     "Route",          Kind::Text, 4, &s.fpRoute, 0,0,"",0, 127},
         {"fpremarks",   "Remarks",        Kind::Text, 4, &s.fpRemarks, 0,0,"",0, 63},
+
+        {"towerhost",   "TowerTrainer address", Kind::Text, 5, &s.towerHost, 0,0,"",0, 63},
+        {"towerport",   "Tower link port", Kind::Text, 5, &s.towerPort, 0,0,"",0, 5, true},
+        {"towercode",   "Session code",   Kind::Text, 5, &s.towerCode, 0,0,"",0, 12},
+        {"towerpos",    "Position (TWR, GND...)", Kind::Text, 5, &s.towerPos, 0,0,"",0, 3},
+        {"towername",   "My nickname there", Kind::Text, 5, &s.towerName, 0,0,"",0, 23},
+        {"towerpark",   "Freeze my aircraft", Kind::Bool, 5, &s.towerPark},
+        {"towerweather", "Weather and time from it", Kind::Bool, 5, &s.towerWeather},
+        {"towerheight", "Cab height, m (0 = scenery)", Kind::Slider, 5, &s.towerHeight, 0.f, 120.f, "m", 0},
+        {"tower3d",     "Its traffic as 3D models", Kind::Bool, 5, &s.tower3d},
+        {"towerwindows", "Open the tower windows", Kind::Bool, 5, &s.towerWindows},
     };
 }
 
@@ -193,10 +216,11 @@ inline const char* tabName(int i) {
         case 1:  return "Audio";
         case 2:  return "Traffic";
         case 3:  return "Hosting";
-        default: return "ATC";
+        case 4:  return "ATC";
+        default: return "Tower";
     }
 }
-inline constexpr int kNumTabs = 5;
+inline constexpr int kNumTabs = 6;
 
 // The name of an X-Plane virtual key, for the window. Letters and digits are
 // their ASCII; the rest are the handful people actually bind.
