@@ -204,6 +204,11 @@ jobs:
 
       # SimBrief (S3): the OFP parser, the .fms writer, and a live fetch through the
       # plugin's own HTTP client against a stand-in for the official fetch endpoint.
+      # The new window's logic -- formatting, validation, unread counts, toasts, the wizard,
+      # the clearance against the plan -- without ImGui or X-Plane.
+      - name: The window's logic
+        run: ASAN_OPTIONS=detect_leaks=0 ./build-tests/ui_logic_test
+
       - name: SimBrief import against a fake SimBrief
         run: ASAN_OPTIONS=detect_leaks=0 bash tools/check_simbrief.sh build-tests
 
@@ -235,6 +240,11 @@ jobs:
       - name: Fetch dependencies
         shell: bash
         run: bash tools/fetch_deps.sh
+
+      # The window (Dear ImGui) draws with OpenGL: Linux needs the GL headers and libGL to link against.
+      - name: OpenGL headers (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libgl-dev
 
       - name: Configure
         shell: bash

@@ -23,13 +23,6 @@ void popFont(void* f) { if (f) ImGui::PopFont(); }
 
 void setNote(const std::string& s, double now) { g_st.note = s; g_st.noteAt = now; }
 
-std::string timeText(double t) {
-    char b[16];
-    const int s = (int)t;
-    snprintf(b, sizeof b, "%02d:%02d", (s / 60) % 100, s % 60);
-    return b;
-}
-
 void muted(const char* s) { ImGui::TextColored(palette().muted, "%s", s); }
 void heading(const char* s) { pushFont(g_st.fonts.heading); ImGui::TextUnformatted(s); popFont(g_st.fonts.heading); }
 

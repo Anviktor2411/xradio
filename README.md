@@ -339,7 +339,7 @@ ESNA12's text message.
 COM1 (with `{squawk}`, `{climb}`, `{fl}`, `{rwy}`, `{sid}` filled from the last text received),
 `waitfor REGEX [seconds]`, `com1 KHZ`, `pos LAT LON ALT_FT GS_KT HDG ground|air`, `squawk NNNN`,
 `plan DEP DEST ROUTE`, `wait S`, `end`. TowerTrainer's `tests/aiatc.test.mjs` flies one from a stand
-at EETN to the airspace boundary under its AI controllers this way.
+at EETN to a stand at EVRA under its AI controllers this way.
 
 ## Building the plugin
 

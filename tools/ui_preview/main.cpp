@@ -137,9 +137,9 @@ int main(int argc, char** argv) {
     ImFontAtlas atlas;
     ImFontConfig cfg; cfg.OversampleH = 2;
     static const ImWchar ranges[] = {0x0020, 0x00FF, 0x0100, 0x017F, 0x2010, 0x2027, 0x2190, 0x21FF, 0x2500, 0x25FF, 0};
-    atlas.AddFontFromMemoryCompressedBase85TTF(InterRegular_compressed_data_base85, 15.f, &cfg, ranges);
-    atlas.AddFontFromMemoryCompressedBase85TTF(InterSemiBold_compressed_data_base85, 17.f, &cfg, ranges);
-    atlas.AddFontFromMemoryCompressedBase85TTF(InterSemiBold_compressed_data_base85, 26.f, &cfg, ranges);
+    atlas.AddFontFromMemoryCompressedTTF(InterRegular_compressed_data, (int)InterRegular_compressed_size, 15.f, &cfg, ranges);
+    atlas.AddFontFromMemoryCompressedTTF(InterSemiBold_compressed_data, (int)InterSemiBold_compressed_size, 17.f, &cfg, ranges);
+    atlas.AddFontFromMemoryCompressedTTF(InterSemiBold_compressed_data, (int)InterSemiBold_compressed_size, 26.f, &cfg, ranges);
     unsigned char* pixels = nullptr; int tw = 0, th = 0;
     atlas.GetTexDataAsRGBA32(&pixels, &tw, &th);
     std::vector<unsigned char> tex(pixels, pixels + (size_t)tw * th * 4);

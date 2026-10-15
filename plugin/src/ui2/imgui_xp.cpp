@@ -31,7 +31,7 @@ FontSet      g_fonts;
 int          g_fontTex = 0;
 float        g_scale = 1.f;
 bool         g_texUploaded = false;
-XPLMDataRef  g_vrEnabled = nullptr, g_fbW = nullptr, g_fbH = nullptr;
+XPLMDataRef  g_fbW = nullptr;
 
 const ImWchar* glyphRanges() {
     static const ImWchar ranges[] = {
@@ -94,9 +94,9 @@ void rebuildFonts(float scale) {
     ImFontConfig cfg;
     cfg.OversampleH = 2; cfg.OversampleV = 1; cfg.PixelSnapH = false;
     const float body = 15.f * scale;
-    g_fonts.body = g_atlas->AddFontFromMemoryCompressedBase85TTF(InterRegular_compressed_data_base85, body, &cfg, glyphRanges());
-    g_fonts.heading = g_atlas->AddFontFromMemoryCompressedBase85TTF(InterSemiBold_compressed_data_base85, 17.f * scale, &cfg, glyphRanges());
-    g_fonts.big = g_atlas->AddFontFromMemoryCompressedBase85TTF(InterSemiBold_compressed_data_base85, 26.f * scale, &cfg, glyphRanges());
+    g_fonts.body = g_atlas->AddFontFromMemoryCompressedTTF(InterRegular_compressed_data, (int)InterRegular_compressed_size, body, &cfg, glyphRanges());
+    g_fonts.heading = g_atlas->AddFontFromMemoryCompressedTTF(InterSemiBold_compressed_data, (int)InterSemiBold_compressed_size, 17.f * scale, &cfg, glyphRanges());
+    g_fonts.big = g_atlas->AddFontFromMemoryCompressedTTF(InterSemiBold_compressed_data, (int)InterSemiBold_compressed_size, 26.f * scale, &cfg, glyphRanges());
     g_fonts.mono = g_fonts.body;
     g_atlas->Build();
     g_texUploaded = false;

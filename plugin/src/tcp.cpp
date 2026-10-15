@@ -26,6 +26,11 @@
 #  define XR_TCP_CLOSE(f) ::close((int)(f))
 #  define XR_TCP_ERR errno
 #  define XR_TCP_INPROGRESS (errno == EINPROGRESS)
+   // A send() to a link the other side closed raises SIGPIPE, which would take X-Plane down with it:
+   // Linux has MSG_NOSIGNAL per call; older macOS SDKs lack it and use the SO_NOSIGPIPE socket option.
+#  ifndef MSG_NOSIGNAL
+#    define MSG_NOSIGNAL 0
+#  endif
 #endif
 
 namespace xr {
@@ -121,6 +126,9 @@ bool TcpSocket::connect(const std::string& host, uint16_t port, int timeoutMs, s
                 int
 #endif
                 )fd, IPPROTO_TCP, TCP_NODELAY, (const char*)&one, sizeof one);
+#ifdef SO_NOSIGPIPE
+            setsockopt((int)fd, SOL_SOCKET, SO_NOSIGPIPE, (const char*)&one, sizeof one);
+#endif
             fd_ = fd;
             break;
         }
