@@ -45,6 +45,16 @@ static int peak(const std::vector<int16_t>& v) {
     return p;
 }
 
+// The power of one frequency in a stretch of samples (Goertzel): tells two
+// speakers apart by the tone each one sends.
+static double tonePower(const std::vector<int16_t>& v, double hz) {
+    const double w = 2.0 * xr::kPi * hz / kSampleRate, c = 2.0 * cos(w);
+    double s1 = 0, s2 = 0;
+    for (int16_t x : v) { const double s0 = (double)x + c * s1 - s2; s2 = s1; s1 = s0; }
+    const double n = (double)v.size();
+    return v.empty() ? 0.0 : (s1 * s1 + s2 * s2 - c * s1 * s2) / (n * n);
+}
+
 static std::vector<int16_t> slice(const std::vector<int16_t>& v, int fromMs, int toMs) {
     const size_t a = (size_t)(kSampleRate * fromMs / 1000), b = (size_t)(kSampleRate * toMs / 1000);
     return std::vector<int16_t>(v.begin() + (long)std::min(a, v.size()),
@@ -304,6 +314,44 @@ int main() {
         const double two = rms(slice(renderMs(300), 60, 280));
         check("two carriers at once produce the blocked squeal", two > 1500.0 && two > 10.0 * (one + 1.0),
               std::to_string(two) + " vs " + std::to_string(one));
+
+        // The capture effect, by level at the receiver (docs/radio.md). Two
+        // stations keying at once, each sending its own tone: more than 6 dB
+        // apart the stronger captures the receiver -- its words come through,
+        // the other's are lost under a whine; within 6 dB both garble.
+        auto twoTones = [&](float levelA, float levelB, double* a600, double* b2200) {
+            fresh(); setHiss(0.f);
+            feed(61, encode(tone(400, 600.0)));
+            feed(62, encode(tone(400, 2200.0)));
+            setSignal(61, 1.f, levelA);
+            setSignal(62, 1.f, levelB);
+            const auto out = slice(renderMs(400), 60, 380);
+            *a600 = tonePower(out, 600.0);
+            *b2200 = tonePower(out, 2200.0);
+        };
+        double pa = 0, pb = 0;
+        twoTones(-60.f, -75.f, &pa, &pb);
+        check("15 dB stronger: it captures the receiver, the other's words are lost", pa > 50.0 * pb,
+              std::to_string(pa) + " vs " + std::to_string(pb));
+        twoTones(-75.f, -60.f, &pa, &pb);
+        check("the other way round, the other one wins", pb > 50.0 * pa, std::to_string(pb) + " vs " + std::to_string(pa));
+        twoTones(-60.f, -62.f, &pa, &pb);
+        check("2 dB apart nobody captures it: both come through, garbled", pa < 4.0 * pb && pb < 4.0 * pa && pa > 0.0,
+              std::to_string(pa) + " vs " + std::to_string(pb));
+        // ...and what the carriers themselves sound like, with nothing said
+        auto carriers = [&](float levelA, float levelB) {
+            fresh(); setHiss(0.f);
+            feed(63, encode(nothing));
+            feed(64, encode(nothing));
+            setSignal(63, 1.f, levelA);
+            setSignal(64, 1.f, levelB);
+            return rms(slice(renderMs(300), 60, 280));
+        };
+        const double whine = carriers(-60.f, -75.f), squeal = carriers(-60.f, -62.f);
+        check("one captured under another is a whine, quieter than two equals squealing",
+              whine > 5.0 * (one + 1.0) && squeal > 1.5 * whine,
+              std::to_string(whine) + " / " + std::to_string(squeal) + " (one carrier " + std::to_string(one) + ")");
+        check("and the further down it is, the fainter the whine", carriers(-60.f, -90.f) < 0.5 * whine);
 
         // Sidetone: while keyed you hear yourself, through the transmitter.
         fresh(); setHiss(0.f); setSidetone(true);

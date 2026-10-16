@@ -30,7 +30,9 @@ docs/            this file, the server guide, the VPN guide
 | `protocol.h` | the wire format. Every struct that crosses the network, byte-packed. Has a twin in `server/protocol.py`. |
 | `server.cpp/.h` | the relay server built into the plugin. `Core` is the logic with no socket; the rest is the socket and the thread. Has a twin in `server/server.py`. |
 | `net.cpp/.h` | UDP sockets for Windows, macOS and Linux. The only file that knows Winsock from BSD sockets. |
-| `voice.cpp/.h` | microphone to Opus to the network, and back to the speakers, with the sound of a VHF radio modelled on the way in. |
+| `voice.cpp/.h` | microphone to Opus to the network, and back to the speakers, with the sound of a VHF radio modelled on the way in -- noise, flutter, break-up, and two transmissions fighting it out by level. |
+| `radio.h` | the radio model (`docs/radio.md`): the horizon from heights above the ground, service volumes, the link budget, ducting, the terrain arithmetic. No X-Plane; both servers route by it (`server.py` has the same, line for line). |
+| `shadow.cpp/.h` | the terrain on the path to each station, sampled from the scenery a few probes a frame. |
 | `xpmp_bridge.cpp/.h` | other pilots as aircraft in the sim, through XPMP2. |
 | `smoothing.h` | turns five position reports a second into continuous motion. Pure maths, no X-Plane. |
 | `terrain.h` | where the ground is, asked of the sim, so models stand on it. |
@@ -70,12 +72,16 @@ touched by one thread only -- and each global in `main.cpp` says which.
 Packed little-endian UDP, defined twice -- `plugin/src/protocol.h` and
 `server/protocol.py` -- and the two **must stay in sync**. CI compiles
 `tools/check_sizes.cpp` and diffs its answers against
-`tools/check_sizes.py`, so a struct that grew on one side fails the build.
+`tools/check_sizes.py`, so a struct that grew on one side fails the build --
+and so does a radio model that works a link out differently in C++ and in
+Python: both print a table of links (`docs/radio.md`).
 
 Every datagram is a 12-byte `Header` (magic, type, protocol version, payload
-length, session id) and a payload. The server refuses a login from any other
-protocol version with a reason, and everything that is not a login needs the
-session id the server handed out. Nothing is ever larger than 1200 bytes,
+length, session id) and a payload. The server takes its own protocol version
+and the one before (a v5 client gets v5 headers, v5-sized records and none of
+v6's own packets), refuses any other with a reason, and everything that is not
+a login needs the session id the server handed out. New fields go at the end
+of a record, so the old size can still be read. Nothing is ever larger than 1200 bytes,
 because WireGuard VPNs hand you a 1280-byte link.
 
 To add a packet type: a `PT_*` value and a payload struct in both protocol

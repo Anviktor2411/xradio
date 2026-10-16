@@ -44,26 +44,34 @@ def check(name, cond, detail=""):
 
 
 class Client:
+    """`agl_ft`: the height above the ground it reports (v6); left out, the
+    country is flat at sea level and it is the altitude -- a station passes 0
+    for its facility's antenna. `proto=5` makes it a v5 client: v5 headers and
+    the 72-byte position without the radio fields."""
+
     def __init__(self, port, callsign, lat, lon, alt_ft=3000.0, com1=FREQ, com2=0,
-                 ac="C172"):
+                 ac="C172", agl_ft=None, on_ground=False, proto=P.PROTO_VERSION):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(0.25)
         self.dest = ("127.0.0.1", port)
         self.callsign = callsign
         self.ac = ac
         self.lat, self.lon, self.alt_ft = lat, lon, alt_ft
+        self.agl_ft = alt_ft if agl_ft is None else agl_ft
+        self.on_ground = on_ground
         self.com1, self.com2 = com1, com2
+        self.proto = proto
         self.sid = 0
 
     def send(self, ptype, payload=b"", sid=None):
-        self.sock.sendto(P.pack(ptype, self.sid if sid is None else sid, payload),
+        self.sock.sendto(P.pack(ptype, self.sid if sid is None else sid, payload, self.proto),
                          self.dest)
 
-    def login(self, proto=P.PROTO_VERSION, callsign=None, ac=None, livery="",
+    def login(self, proto=None, callsign=None, ac=None, livery="",
               password="", flags=0):
         self.send(P.PT_LOGIN, P.LOGIN.pack(
             P.pad(callsign if callsign is not None else self.callsign, 16),
-            P.pad(ac if ac is not None else self.ac, 8), proto, flags,
+            P.pad(ac if ac is not None else self.ac, 8), self.proto if proto is None else proto, flags,
             P.pad(livery, 16), P.pad(password, 32)), sid=0)
         self.rejected = None
         pkt = self.recv(None)
@@ -81,14 +89,18 @@ class Client:
     def position(self, tx=P.TX_NONE, rx=P.RX_COM1, sid=None, lat=None, lon=None,
                  alt_ft=None, gs=50.0, gear=0.0, flap=0.0, time_ms=0,
                  track=90.0, vs=0.0, heading=90.0,
-                 squawk=1200, xpdr=P.XPDR_ALT, ident=0):
-        self.send(P.PT_POSITION, P.POSITION.pack(
-            self.lat if lat is None else lat,
-            self.lon if lon is None else lon,
-            (self.alt_ft if alt_ft is None else alt_ft) / 3.28084,
-            heading, 0.0, 0.0, gs, gear, flap,
-            self.com1, self.com2, 0, 0, tx, rx, time_ms, track, vs,
-            squawk, xpdr, ident), sid=sid)
+                 squawk=1200, xpdr=P.XPDR_ALT, ident=0, agl_ft=None, svc_range=0, svc_ceiling=0):
+        fields = (self.lat if lat is None else lat,
+                  self.lon if lon is None else lon,
+                  (self.alt_ft if alt_ft is None else alt_ft) / 3.28084,
+                  heading, 0.0, 0.0, 0.0 if self.on_ground else gs, gear, flap,
+                  self.com1, self.com2, 0, 1 if self.on_ground else 0, tx, rx, time_ms, track, vs,
+                  squawk, xpdr, ident)
+        if self.proto >= 6:
+            agl = (self.agl_ft if agl_ft is None else agl_ft) / 3.28084
+            self.send(P.PT_POSITION, P.POSITION.pack(*fields, agl, svc_range, svc_ceiling), sid=sid)
+        else:
+            self.send(P.PT_POSITION, P.POSITION_V5.pack(*fields), sid=sid)
 
     def text(self, body, freq=0, sid=None, to=""):
         raw = body.encode()
@@ -199,10 +211,11 @@ def traffic_set(packets, keep=None):
             # lat, lon, alt, heading, ground speed, vertical speed and the
             # sender's timestamp: enough that a validation rule quietly
             # dropped from one server shows up as a different aircraft state.
+            # And the height above the ground the radio is routed by.
             seen.add((cs, P.cstr(e[2]),
                       round(e[3], 4), round(e[4], 4), round(e[5], 1),
                       round(e[6], 1), round(e[9], 1), round(e[18], 1),
-                      e[16], e[12], e[13]))
+                      e[16], e[12], e[13], round(e[23], 1)))
     return sorted(seen)
 
 
@@ -493,6 +506,7 @@ def scenario_logout(port):
     before = traffic_set(wait_traffic(b, want="ESOUT1"), ("ESOUT",))
     a.send(P.PT_LOGOUT)
     time.sleep(0.25)
+    b.drain(0.3)        # what was sent before the logout took effect is not the answer
     for _ in range(2):
         b.position()
         time.sleep(0.12)
@@ -814,27 +828,30 @@ def scenario_big_roster(port):
     return out
 
 
-def atc_list_of(packets):
-    """The newest ATC list in a burst, as (callsign, icao, freq, kind) rows."""
-    rows = []
+def atc_list_of(packets, with_flags=False):
+    """The newest ATC list in a burst, as (callsign, icao, freq, kind) rows
+    followed by where the station transmits from and what it covers. With
+    `with_flags`, (header flags, rows)."""
+    rows, flags = [], None
     for payload in packets:
         if len(payload) < P.ATC_LIST_HDR.size:
             continue
-        count, _ = P.ATC_LIST_HDR.unpack_from(payload, 0)
+        count, hflags = P.ATC_LIST_HDR.unpack_from(payload, 0)
         off, cur = P.ATC_LIST_HDR.size, []
         for _ in range(count):
             if off + P.ATC_ENTRY.size > len(payload):
                 break
             e = P.ATC_ENTRY.unpack_from(payload, off)
             off += P.ATC_ENTRY.size
-            cur.append((P.cstr(e[1]), P.cstr(e[2]), e[3], e[4]))
-        rows = cur
-    return rows
+            cur.append((P.cstr(e[1]), P.cstr(e[2]), e[3], e[4],
+                        e[5], round(e[7], 4), round(e[8], 4), round(e[9], 1), round(e[10], 1), e[11], e[12]))
+        rows, flags = cur, hflags
+    return (flags, rows) if with_flags else rows
 
 
 def scenario_atc_v6(port):
     """v6: a station, an injector and its aircraft, flight plans, the ATIS."""
-    twr = Client(port, "EETN_TWR", 57.85, 27.02, alt_ft=150.0, ac="ATC")
+    twr = Client(port, "EETN_TWR", 57.85, 27.02, alt_ft=150.0, ac="ATC", agl_ft=0.0)
     inj = Client(port, "TTRAIN_AI", 57.85, 27.02, ac="ZZZZ", com1=0)
     a = Client(port, "ESNA12", 57.85, 27.02)
     b = Client(port, "ESNB34", 57.86, 27.03, ac="A20N")
@@ -848,13 +865,14 @@ def scenario_atc_v6(port):
     def ai_entry(local, cs, lat, lon, flags=0):
         return P.TRAFFIC_ENTRY.pack(local, P.pad(cs, 16), P.pad("A320", 8), lat, lon, 500.0, 90.0, 0.0, 0.0,
                                     70.0, 1.0, 0.0, 0, 0, 0, P.XPDR_ALT, 4242, 90.0, 0.0, P.pad("", 16),
-                                    4521, 0, flags)
+                                    4521, 0, flags, 480.0)
 
     def inject(entries):
         inj.send(P.PT_AI_TRAFFIC, P.TRAFFIC_HDR.pack(len(entries), 0) + b"".join(entries))
 
     bad = P.TRAFFIC_ENTRY.pack(7, P.pad("GHOST", 16), P.pad("A320", 8), 500.0, 27.0, 500.0, 90.0, 0.0, 0.0,
-                               70.0, 1.0, 0.0, 0, 0, 0, P.XPDR_ALT, 0, 90.0, 0.0, P.pad("", 16), 4521, 0, 0)
+                               70.0, 1.0, 0.0, 0, 0, 0, P.XPDR_ALT, 0, 90.0, 0.0, P.pad("", 16), 4521, 0, 0,
+                               480.0)
     for _ in range(4):
         a.position(); b.position(); twr.position(); inj.position()
         inject([ai_entry(1, "FIN321", 57.86, 27.03), ai_entry(2, "BTI101", 57.87, 27.04), bad])
@@ -890,7 +908,7 @@ def scenario_atc_v6(port):
     fp_a = [P.unpack_flightplan(p) for p in a.drain(0.3).get(P.PT_FLIGHTPLAN, [])]
     out["fp_ack"] = sorted((d["status"], d["squawk"], d["remarks"]) for d in fp_a)
     out["fp_b"] = len(b.drain(0.2).get(P.PT_FLIGHTPLAN, []))
-    gnd = Client(port, "EETN_GND", 57.85, 27.02, alt_ft=150.0, ac="ATC", com1=OTHER_FREQ)
+    gnd = Client(port, "EETN_GND", 57.85, 27.02, alt_ft=150.0, ac="ATC", com1=OTHER_FREQ, agl_ft=0.0)
     out["sid_gnd"] = gnd.login(flags=P.LF_ATC)
     late = [P.unpack_flightplan(p) for p in gnd.drain(0.4).get(P.PT_FLIGHTPLAN, [])]
     out["fp_late"] = sorted((d["callsign"], d["squawk"], d["status"]) for d in late)
@@ -928,9 +946,186 @@ def scenario_atc_v6(port):
     return out
 
 
+# ---------------------------------------------------------------------------
+# the radio model (docs/radio.md)
+# ---------------------------------------------------------------------------
+LOWI = (47.2602, 11.3439)     # Innsbruck: an apron at 1900 ft, in a valley
+
+
+def west_of_lowi(nm):
+    return LOWI[1] - nm / (60.0 * 0.678575)
+
+
+def scenario_radio_heights(port):
+    """Heights above the ground, a tower's service volume, FL350 to a ground
+    station -- both servers must route every one of these the same way."""
+    APRON, TOWER = 121900, 120100
+    out = {}
+    ap1 = Client(port, "OELWA1", LOWI[0], LOWI[1], alt_ft=1906.0, agl_ft=0.0, on_ground=True, com1=APRON)
+    ap2 = Client(port, "OELWA2", LOWI[0] + 0.04, LOWI[1], alt_ft=1906.0, agl_ft=0.0, on_ground=True, com1=APRON)
+    ap3 = Client(port, "OELWA3", LOWI[0] + 0.1667, LOWI[1], alt_ft=1906.0, agl_ft=0.0, on_ground=True, com1=APRON)
+    twr = Client(port, "LOWI_TWR", LOWI[0], LOWI[1], alt_ft=2006.0, agl_ft=0.0, on_ground=True, com1=TOWER,
+                 ac="ATC")
+    fin = Client(port, "OEFIN1", LOWI[0], west_of_lowi(10.0), alt_ft=4900.0, agl_ft=3000.0, com1=TOWER)
+    rim = Client(port, "OERIM1", LOWI[0], west_of_lowi(20.0), alt_ft=1950.0, agl_ft=0.0, on_ground=True,
+                 com1=TOWER)
+    hold = Client(port, "OEHLD1", LOWI[0], LOWI[1] + 0.01, alt_ft=1906.0, agl_ft=0.0, on_ground=True, com1=TOWER)
+    hi = Client(port, "DLH4AB", LOWI[0] + 3.5, LOWI[1], alt_ft=35000.0, agl_ft=34000.0, com1=TOWER)
+    hi2 = Client(port, "DLH4AC", LOWI[0] + 4.4, LOWI[1], alt_ft=35000.0, agl_ft=34000.0, com1=TOWER)
+    everyone = (ap1, ap2, ap3, twr, fin, rim, hold, hi, hi2)
+    for c in everyone:
+        c.login(flags=P.LF_ATC if c is twr else 0)
+    for _ in range(2):
+        for c in everyone:
+            c.position()
+        time.sleep(0.12)
+    ap1.text("Innsbruck Ground, OELWA1, radio check", freq=APRON)
+    twr.text("Innsbruck Tower, all stations", freq=TOWER)
+    time.sleep(0.3)
+    got = {c.callsign: texts(c.drain(0.3)[P.PT_TEXT]) for c in everyone}
+    out["apron_2nm"] = got["OELWA2"]
+    out["apron_10nm"] = got["OELWA3"]
+    out["tower_to_final"] = got["OEFIN1"]
+    out["tower_to_20nm_on_ground"] = got["OERIM1"]
+    out["tower_to_fl350_210nm"] = got["DLH4AB"]
+    out["tower_to_fl350_264nm"] = got["DLH4AC"]
+    rim.text("OERIM1, request taxi", freq=TOWER)
+    hi.text("DLH4AB, FL350", freq=TOWER)
+    time.sleep(0.3)
+    out["tower_hears"] = texts(twr.drain(0.3)[P.PT_TEXT])
+    out["pilot_at_airport_hears"] = texts(hold.drain(0.3)[P.PT_TEXT])
+    # and the height above the ground each one is routed by, as the traffic carries it
+    out["traffic_agl"] = [(t[0], t[-1]) for t in
+                          traffic_set(wait_traffic(ap1, want="OEFIN1"), ("OELWA", "OEFIN", "OERIM"))]
+    for c in everyone:
+        c.close()
+    return out
+
+
+def raw_packets(c, seconds):
+    """Everything that arrives as (type, header version, payload)."""
+    out = []
+    end = time.time() + seconds
+    while time.time() < end:
+        c.sock.settimeout(max(0.01, end - time.time()))
+        try:
+            data, _ = c.sock.recvfrom(2048)
+        except socket.timeout:
+            break
+        except ConnectionResetError:
+            continue
+        parsed = P.unpack_header(data)
+        if parsed is not None:
+            out.append((parsed[0], parsed[1], parsed[4]))
+    return out
+
+
+def scenario_v5_client(port):
+    """A v5 pilot (XRadio 0.5) in a v6 flight: let in, sent what v5 knows in
+    the shape v5 reads it, routed by its altitude in the air and as 0 above
+    the ground on the ground."""
+    APRON = 121900
+    out = {}
+    new = Client(port, "OELWA1", LOWI[0], LOWI[1], alt_ft=1906.0, agl_ft=0.0, on_ground=True, com1=APRON)
+    old = Client(port, "OELWB1", LOWI[0] + 0.01, LOWI[1], alt_ft=1906.0, on_ground=True, com1=APRON, proto=5)
+    far5 = Client(port, "OELWB2", LOWI[0] + 0.1667, LOWI[1], alt_ft=1906.0, on_ground=True, com1=APRON, proto=5)
+    up5 = Client(port, "OELWB3", LOWI[0] + 1.9, LOWI[1], alt_ft=9000.0, com1=APRON, proto=5)   # 114 nm, airborne
+    out["logged_in"] = [c.login() != 0 for c in (new, old, far5, up5)]
+    for _ in range(3):
+        for c in (new, old, far5, up5):
+            c.position()
+        time.sleep(0.12)
+    got = raw_packets(old, 1.0)
+    out["versions"] = sorted({v for _t, v, _p in got})
+    out["kinds"] = sorted({t for t, _v, _p in got})
+    sizes_ok, names = True, set()
+    for t, _v, payload in got:
+        if t != P.PT_TRAFFIC:
+            continue
+        count, _ = P.TRAFFIC_HDR.unpack_from(payload, 0)
+        sizes_ok &= len(payload) == P.TRAFFIC_HDR.size + count * P.TRAFFIC_ENTRY_V5.size
+        for k in range(count):
+            if P.TRAFFIC_HDR.size + (k + 1) * P.TRAFFIC_ENTRY_V5.size <= len(payload):
+                e = P.TRAFFIC_ENTRY_V5.unpack_from(payload, P.TRAFFIC_HDR.size + k * P.TRAFFIC_ENTRY_V5.size)
+                names.add(P.cstr(e[1]))
+    out["v5_sized_entries"] = sizes_ok
+    out["sees"] = sorted(n for n in names if n.startswith("OELW"))
+    new.text("OELWA1, taxiing to 26", freq=APRON)
+    time.sleep(0.3)
+    out["old_hears_new"] = texts(old.drain(0.3)[P.PT_TEXT])
+    out["far5_hears_new"] = texts(far5.drain(0.3)[P.PT_TEXT])
+    out["up5_hears_new"] = texts(up5.drain(0.3)[P.PT_TEXT])
+    old.text("OELWB1, roger", freq=APRON)
+    time.sleep(0.3)
+    out["new_hears_old"] = texts(new.drain(0.3)[P.PT_TEXT])
+    # a v4 client is still told no -- in a header it can read
+    v4 = Client(port, "OELWB4", LOWI[0], LOWI[1], proto=4)
+    v4.send(P.PT_LOGIN, P.login("OELWB4", "C172", version=4), sid=0)
+    rej = [(v, P.LOGIN_REJECT.unpack_from(p, 0)[0]) for t, v, p in raw_packets(v4, 0.6) if t == P.PT_LOGIN_REJECT]
+    out["v4_rejected"] = rej
+    for c in (new, old, far5, up5, v4):
+        c.close()
+    return out
+
+
+def warm_still_weather(temp_c=24.0):
+    """Warm, high pressure, calm and dry, at an hour that ducts (19500 days, 07:00)."""
+    w = [0, 7 * 3600.0, 19500, 10.0, 102200.0, temp_c, 0.0, 0.0, 0.0, 0] + [0.0] * (P.WEATHER.size // 4 - 10)
+    w[35] = 2.5
+    return P.WEATHER.pack(*w)
+
+
+def ducting_run(port):
+    SEA = 123450
+    out = {}
+    sea1 = Client(port, "ESSEA1", 59.60, 22.00, alt_ft=500.0, com1=SEA)
+    sea2 = Client(port, "ESSEA2", 59.60, 24.635, alt_ft=500.0, com1=SEA)     # 80 nm east, both at 500 ft
+    wx = Client(port, "ESWXD1", 59.60, 23.30, alt_ft=500.0, com1=SEA)
+    sea1.login(); sea2.login()
+    wx.login(flags=P.LF_WEATHER_SOURCE)
+    for c in (sea1, sea2, wx):
+        c.position()
+    time.sleep(0.2)
+    sea1.text("over the Gulf, before", freq=SEA)
+    time.sleep(0.3)
+    out["before"] = texts(sea2.drain(0.3)[P.PT_TEXT])
+    wx.send(P.PT_WEATHER, warm_still_weather())
+    time.sleep(0.4)
+    out["flags_warm"] = atc_list_of(sea2.drain(0.4).get(P.PT_ATC_LIST, []), with_flags=True)[0]
+    for c in (sea1, sea2, wx):
+        c.position()
+    time.sleep(0.2)
+    sea1.text("over the Gulf, in the duct", freq=SEA)
+    time.sleep(0.3)
+    out["warm"] = texts(sea2.drain(0.3)[P.PT_TEXT])
+    wx.send(P.PT_WEATHER, warm_still_weather(8.0))
+    time.sleep(0.4)
+    out["flags_cold"] = atc_list_of(sea2.drain(0.4).get(P.PT_ATC_LIST, []), with_flags=True)[0]
+    sea1.text("over the Gulf, after", freq=SEA)
+    time.sleep(0.3)
+    out["cold"] = texts(sea2.drain(0.3)[P.PT_TEXT])
+    for c in (sea1, sea2, wx):
+        c.close()
+    return out
+
+
+def scenario_ducting(port):
+    """The realism switch on (--ducting): warm, still weather carries VHF far over the sea."""
+    return ducting_run(port)
+
+
+def scenario_ducting_off(port):
+    """...and off, as every server starts: the same weather changes nothing."""
+    return ducting_run(port)
+
+
 SCENARIOS = [
     ("login and traffic", scenario_login_and_traffic),
     ("atc v6", scenario_atc_v6),
+    ("radio heights", scenario_radio_heights),
+    ("v5 client", scenario_v5_client),
+    ("ducting", scenario_ducting),
+    ("ducting off", scenario_ducting_off),
     ("login validation", scenario_bad_login),
     ("position validation", scenario_position_validation),
     ("text routing", scenario_text_routing),
@@ -949,6 +1144,8 @@ SCENARIOS = [
 ]
 # scenarios whose server runs with a flight password
 PASSWORDED = {"flight password": "sky"}
+# ...and with other switches, the same on both servers
+EXTRA_ARGS = {"ducting": ["--ducting"]}
 
 
 # ---------------------------------------------------------------------------
@@ -981,7 +1178,7 @@ def run_against(label, make_cmd, base_port, cwd=None):
     results = {}
     for i, (name, fn) in enumerate(SCENARIOS):
         port = base_port + i
-        proc = subprocess.Popen(make_cmd(port, PASSWORDED.get(name, "")), cwd=cwd,
+        proc = subprocess.Popen(make_cmd(port, PASSWORDED.get(name, "")) + EXTRA_ARGS.get(name, []), cwd=cwd,
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             if not wait_until_up(port, PASSWORDED.get(name, "")):
@@ -1207,6 +1404,49 @@ def main():
     check("and the reply comes back the same way",
           r["reply_came_back"] == [(0, "ESDMB1", "on my way")],
           str(r["reply_came_back"]))
+
+    r = cpp["radio heights"]
+    check("radio: 2.4 nm across Innsbruck's airport, both on the ground: heard", r["apron_2nm"] != [])
+    check("radio: 10 nm down the valley: not -- two 3 m aerials see 7.7 nm, 1900 ft of altitude gave 107",
+          r["apron_10nm"] == [], str(r["apron_10nm"]))
+    check("radio: the tower reaches a 10 nm final at 3000 ft", r["tower_to_final"] != [])
+    check("radio: and one on the ground 20 nm out, inside its 25 nm service volume",
+          r["tower_to_20nm_on_ground"] != [])
+    check("radio: a ground station reaches FL350 210 nm away, not 264",
+          r["tower_to_fl350_210nm"] != [] and r["tower_to_fl350_264nm"] == [])
+    heard = [n for _f, n, _b in r["tower_hears"]]
+    check("radio: and hears both of them back", "OERIM1" in heard and "DLH4AB" in heard, str(heard))
+    check("radio: the service volume is the station's -- a pilot at the airport does not hear the one 20 nm out",
+          not any(n == "OERIM1" for _f, n, _b in r["pilot_at_airport_hears"]), str(r["pilot_at_airport_hears"]))
+    check("radio: the traffic carries the height above the ground each is routed by",
+          dict(r["traffic_agl"]).get("OEFIN1") == 914.4 and dict(r["traffic_agl"]).get("OELWA2") == 0.0,
+          str(r["traffic_agl"]))
+
+    r = cpp["v5 client"]
+    check("v5: a v5 client logs in next to v6 ones", r["logged_in"] == [True] * 4, str(r["logged_in"]))
+    check("v5: everything it is sent has a v5 header", r["versions"] == [5], str(r["versions"]))
+    check("v5: its traffic comes in 108-byte v5 entries, the v6 pilot in it",
+          r["v5_sized_entries"] and "OELWA1" in r["sees"], str(r["sees"]))
+    check("v5: and none of v6's own packets", P.PT_ATC_LIST not in r["kinds"], str(r["kinds"]))
+    check("v5: it hears the v6 pilot next door, and is heard back",
+          r["old_hears_new"] != [] and r["new_hears_old"] != [])
+    check("v5: on the ground with no height sent it counts 0 above it: 10 nm down the valley, nothing",
+          r["far5_hears_new"] == [], str(r["far5_hears_new"]))
+    check("v5: in the air it counts its altitude, as before: 9000 ft 114 nm away still hears",
+          r["up5_hears_new"] != [])
+    check("v5: a v4 client is still refused, in a v4 header",
+          r["v4_rejected"] == [(4, P.RJ_VERSION)], str(r["v4_rejected"]))
+
+    r = cpp["ducting"]
+    check("ducting: 80 nm over the sea at 500 ft is past the horizon", r["before"] == [], str(r["before"]))
+    check("ducting: warm, still weather and the switch on: the ATC list says the air ducts",
+          bool((r["flags_warm"] or 0) & P.AL_DUCTING), str(r["flags_warm"]))
+    check("ducting: and the 80 nm get through", r["warm"] != [])
+    check("ducting: cold weather ends it", r["flags_cold"] == 0 and r["cold"] == [],
+          f"{r['flags_cold']} {r['cold']}")
+    r = cpp["ducting off"]
+    check("ducting: off unless asked -- the same weather changes nothing",
+          not (r["flags_warm"] or 0) & P.AL_DUCTING and r["warm"] == [], f"{r['flags_warm']} {r['warm']}")
 
     print()
     if failures:

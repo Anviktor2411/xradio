@@ -1,7 +1,9 @@
 #include "voice.h"
 
 #include "protocol.h"   // kGuardKhz: guard is heard on no radio in particular
+#include "radio.h"      // the model's levels and the capture margin
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -38,6 +40,7 @@ void setRadioFilter(bool) {}
 void setSquelch(float) {}
 void setCabinNoise(float) {}
 void setSignalQuality(uint32_t, float) {}
+void setSignal(uint32_t, float, float) {}
 void shutdown() {}
 bool available() { return false; }
 bool haveMicrophone() { return false; }
@@ -314,7 +317,15 @@ constexpr float kNoiseStatic  = 4800.f;   // the squelch knob all the way down
 // because the limiter's make-up gain multiplies it by ten between words --
 // which is exactly the swell a real transmission has between words.
 constexpr float kCabinAmp     = 450.f;
-constexpr float kHetAmp       = 4000.f;   // two carriers on one frequency
+constexpr float kHetAmp       = 4000.f;   // two carriers on one frequency, within a few dB
+// One captured under a stronger one: a whine, this loud just past the capture
+// margin and fading dB for dB the further down it is. Its words stay at
+// kCapturedGain; a rival within the margin keeps kRivalGain of its own, chopped
+// at kGarbleHz by the beat with the other.
+constexpr float kWhineAmp     = 2000.f;
+constexpr float kCapturedGain = 0.05f;
+constexpr float kRivalGain    = 0.8f;
+constexpr float kGarbleHz     = 23.f;
 constexpr float kClickAmp     = 14000.f;
 constexpr int   kClickLen     = 96;       // 2 ms step, the filter turns it into a click
 constexpr int   kOpenBurst    = 960;      // 20 ms of noise as the squelch opens
@@ -328,7 +339,7 @@ struct Radio {
     bool   open = false;                  // squelch state
     int    burst = 0, tail = 0, click = 0, settle = 0;
     float  clickSign = 1.f;
-    float  hetPhase = 0.f, wobble = 0.f;
+    float  hetPhase = 0.f, wobble = 0.f, garblePhase = 0.f;
     uint32_t noise = 0x12345678u;
 
     void design() {
@@ -375,12 +386,14 @@ struct Radio {
 
     // One output sample. `speech` is the mixed, already-transmitter-processed
     // voice (0 when nobody is talking), `quality` the best signal among the
-    // carriers (1 next door, 0 at the horizon), `carriers` how many.
-    // `squelchOpen` is the knob turned all the way down: static whenever
-    // nobody is on, which is how a pilot listens for a station too faint to
-    // open the squelch.
-    float receiver(float speech, bool carrier, int carriers, float quality, float hiss,
-                   bool squelchOpen) {
+    // carriers (1 next door, 0 at the horizon). `squelchOpen` is the knob
+    // turned all the way down: static whenever nobody is on, which is how a
+    // pilot listens for a station too faint to open the squelch. With two or
+    // more carriers, `hetAmp` is how loud their beat is (the full squeal, or
+    // the whine of one captured under another) and `garble` whether they are
+    // close enough in level to chop each other's words up.
+    float receiver(float speech, bool carrier, float quality, float hiss, bool squelchOpen,
+                   float hetAmp, bool garble) {
         float noiseAmp = 0.f;
         if (tail > 0) {
             noiseAmp = hiss * kNoiseBurst;
@@ -393,16 +406,23 @@ struct Radio {
             noiseAmp = hiss * kNoiseStatic;
         }
         float x = carrier ? speech : 0.f;
+        if (carrier && garble) {
+            // Two carriers within a few dB of each other: their envelopes
+            // beat, and the words of both come out chopped by it.
+            garblePhase += 2.f * (float)kPi * kGarbleHz / (float)kSampleRate;
+            if (garblePhase > 2.f * (float)kPi) garblePhase -= 2.f * (float)kPi;
+            x *= 0.5f + 0.5f * sinf(garblePhase);
+        }
         if (noiseAmp > 0.f) x += white() * noiseAmp;
 
-        if (carrier && carriers >= 2) {
+        if (carrier && hetAmp > 0.f) {
             // Two AM carriers a little apart beat against each other.
             wobble += 2.f * (float)kPi * 0.6f / (float)kSampleRate;
             if (wobble > 2.f * (float)kPi) wobble -= 2.f * (float)kPi;
             const float f = 1300.f + 250.f * sinf(wobble);
             hetPhase += 2.f * (float)kPi * f / (float)kSampleRate;
             if (hetPhase > 2.f * (float)kPi) hetPhase -= 2.f * (float)kPi;
-            x += kHetAmp * sinf(hetPhase);
+            x += hetAmp * sinf(hetPhase);
         }
         if (click > 0) {
             x += clickSign * kClickAmp * (float)click / (float)kClickLen;
@@ -479,14 +499,26 @@ bool refill(Speaker& sp) {
     return true;
 }
 
-// Per-speaker signal quality from the main thread: distance against the VHF
-// horizon. Sessions come and go, so entries older than a while are dropped.
-struct Quality { float q; std::chrono::steady_clock::time_point at; };
+// Per-speaker signal from the main thread (the radio model, radio.h): its
+// quality, which sets the noise, flutter and break-up, and its level at the
+// receiver, which decides who wins when two transmit at once. Sessions come
+// and go, so entries older than a while are dropped.
+struct Quality { float q; float levelDbm; std::chrono::steady_clock::time_point at; };
 std::map<uint32_t, Quality> g_quality;          // guarded by g_mx
+
+// A level to go with a quality when only the quality is known: the model's
+// own mapping read backwards, so a better signal is always a louder one.
+float levelFromQuality(float q) {
+    return (float)(radio::kNoiseDbm + radio::kSnrZeroDb + (double)q * (radio::kSnrCleanDb - radio::kSnrZeroDb));
+}
 
 float qualityOf(uint32_t sid) {
     auto it = g_quality.find(sid);
     return it == g_quality.end() ? 1.f : it->second.q;
+}
+float levelOf(uint32_t sid) {
+    auto it = g_quality.find(sid);
+    return it == g_quality.end() ? levelFromQuality(1.f) : it->second.levelDbm;
 }
 
 void render(int16_t* out, int count) {
@@ -520,14 +552,14 @@ void render(int16_t* out, int count) {
     static std::vector<float> mix;
     mix.assign((size_t)count, 0.f);
 
-    // Who is on, and how strong the strongest of them is -- needed before the
-    // mixing, because with two stations on at once the louder one dominates.
-    // The squelch knob decides who is on at all: a station below it is not a
-    // carrier, its frames are thrown away unheard, and the squelch stays shut
-    // as if nobody had keyed, which is what a real radio does with a signal
-    // too weak to open it.
+    // Who is on, and how strong the strongest of them is at this receiver --
+    // needed before the mixing, because with two stations on at once the
+    // stronger decides what is heard. The squelch knob decides who is on at
+    // all: a station below it is not a carrier, its frames are thrown away
+    // unheard, and the squelch stays shut as if nobody had keyed, which is
+    // what a real radio does with a signal too weak to open it.
     int   onAir = 0;
-    float strongest = 0.f;
+    float top = -1e9f;                           // the strongest level on the air, dBm
     for (auto& kv : g_speakers) {
         Speaker& sp = *kv.second;
         const float q = qualityOf(kv.first);
@@ -537,8 +569,25 @@ void render(int16_t* out, int count) {
         }
         if (!sp.playing && (int)sp.packets.size() < kPrebuffer) continue;
         ++onAir;
-        if (q > strongest) strongest = q;
+        top = std::max(top, levelOf(kv.first));
     }
+    // The capture effect. A transmission more than kCaptureDb stronger than
+    // another captures the receiver: it is heard, and the other only as a
+    // whine under it -- the beat of the two carriers, fainter the further
+    // down it is -- its words lost. Two within kCaptureDb of each other
+    // capture nothing: both garble, under the full heterodyne squeal.
+    int   rivals = 0;
+    float whine = 0.f;
+    for (auto& kv : g_speakers) {
+        Speaker& sp = *kv.second;
+        if (fx && qualityOf(kv.first) < sq) continue;
+        if (!sp.playing && (int)sp.packets.size() < kPrebuffer) continue;
+        const float down = top - levelOf(kv.first);
+        if (down <= (float)radio::kCaptureDb) ++rivals;
+        else whine += kWhineAmp * powf(10.f, -(down - (float)radio::kCaptureDb) / 20.f);
+    }
+    const bool  garble = onAir > 1 && rivals > 1;
+    const float hetAmp = onAir < 2 ? 0.f : (garble ? kHetAmp : std::min(kWhineAmp, whine));
 
     int   carriers = 0;
     float best = 0.f;                            // strongest signal actually heard
@@ -551,10 +600,10 @@ void render(int16_t* out, int count) {
             sp.playing = true;
         }
         const float knob = radioGain(sp.freqKhz);
-        // AM has no capture effect to speak of, but the louder carrier does
-        // win: with two on at once the weaker is heard underneath, not
-        // alongside.
-        const float share = (onAir > 1 && strongest > 0.f) ? (0.35f + 0.65f * q / strongest) : 1.f;
+        // Alone, all of it; a rival within kCaptureDb, most of it, garbled;
+        // captured by a stronger one, next to nothing.
+        const float share = onAir < 2 ? 1.f
+                          : (top - levelOf(kv.first) <= (float)radio::kCaptureDb ? kRivalGain : kCapturedGain);
         // Flutter: the signal wavering as the far aircraft banks and the path
         // between you changes, a slow wobble that deepens towards the horizon.
         const float w = 1.f - q;
@@ -609,7 +658,8 @@ void render(int16_t* out, int count) {
     if (!g_radio.active() && !squelchOpen) return;   // silence, and the filters stay put
     for (int i = 0; i < count; ++i) {
         const float speech = carrier ? mix[(size_t)i] : 0.f;
-        float v = g_radio.receiver(speech, carrier, carriers, best, hiss, squelchOpen) * vol;
+        float v = g_radio.receiver(speech, carrier, best, hiss, squelchOpen,
+                                   carriers >= 2 ? hetAmp : 0.f, garble && carriers >= 2) * vol;
         out[i] = (int16_t)(v > 32767.f ? 32767.f : (v < -32768.f ? -32768.f : v));
     }
 }
@@ -997,8 +1047,13 @@ float signalQualityOf(uint32_t sid) {
 }
 void  setSignalQuality(uint32_t sid, float q) {
     q = q < 0.f ? 0.f : (q > 1.f ? 1.f : q);
+    setSignal(sid, q, levelFromQuality(q));
+}
+void  setSignal(uint32_t sid, float q, float levelDbm) {
+    q = q < 0.f ? 0.f : (q > 1.f ? 1.f : q);
+    if (!std::isfinite(levelDbm)) levelDbm = -200.f;
     std::lock_guard<std::mutex> lk(g_mx);
-    g_quality[sid] = {q, std::chrono::steady_clock::now()};
+    g_quality[sid] = {q, levelDbm, std::chrono::steady_clock::now()};
 }
 void  setRadioFilter(bool on)  { g_filter.store(on); }
 float micLevel()         { return g_micLevel.load(); }

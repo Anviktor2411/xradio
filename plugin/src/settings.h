@@ -56,6 +56,10 @@ struct Settings {
     bool        hostEnabled = false;
     std::string hostPort    = "49100";
     bool        hostUpnp    = true;        // ask the router to open the port
+    // Realism for the flight this server carries: on a warm, still evening the
+    // shared weather may bring tropospheric ducting, and VHF reaches far past
+    // the horizon over the sea (docs/radio.md). Rare, and off unless asked.
+    bool        hostDucting = false;
     // One sim decides the sky for everyone who wants it. Which one is settled
     // by the server, first come: on a flight hosted in X-Plane that is
     // naturally the host, but on a dedicated server -- which has no weather of
@@ -198,6 +202,7 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"hosting",     "Host a flight here", Kind::Bool, 3, &s.hostEnabled},
         {"hostport",    "Port to host on",    Kind::Text, 3, &s.hostPort, 0,0,"",0, 5, true},
         {"hostupnp",    "Ask the router to open it", Kind::Bool, 3, &s.hostUpnp},
+        {"hostducting", "Rare tropospheric ducting (realism)", Kind::Bool, 3, &s.hostDucting},
 
         {"showai",      "List computer-flown aircraft (AI)", Kind::Bool, 4, &s.showAiTraffic},
         {"aimax",       "Computer-flown aircraft drawn", Kind::Slider, 4, &s.aiMax, 0.f, 60.f, "", 0},

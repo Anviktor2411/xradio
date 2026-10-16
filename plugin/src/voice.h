@@ -126,10 +126,15 @@ void  setSquelch(float minQuality);
 // held down under the words and swells up between them, the way it does on a
 // real transmission.
 void  setCabinNoise(float level);
-// How good another pilot's signal is, 1 next door down to 0 at the VHF
-// horizon: sets their noise level and how badly they break up. The main
-// thread works it out from distance; unknown pilots count as strong.
+// How good another station's signal is, 1 next door down to 0 at the edge of
+// its coverage: sets their noise level and how badly they break up. The main
+// thread works it out from the radio model (radio.h, docs/radio.md); unknown
+// pilots count as strong. `levelDbm` is what arrives at the receiver, which
+// decides who wins when two transmit at once: more than 6 dB stronger and it
+// captures the receiver, the other only a whine underneath; closer than that
+// they garble each other. Without a level, one goes with the quality.
 void  setSignalQuality(uint32_t sid, float quality);
+void  setSignal(uint32_t sid, float quality, float levelDbm);
 float micLevel();                // 0..1, peak of the most recent capture block
 std::vector<uint32_t> activeSpeakers();
 // Which frequency that pilot's voice is arriving on, 0 if they are not

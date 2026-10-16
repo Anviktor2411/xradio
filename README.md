@@ -674,6 +674,7 @@ you go looking for someone to talk to.
 | Host a flight here | run the relay server inside the plugin. Your own aircraft connects to it, so the Connection tab is ignored while this is on |
 | Port to host on | the UDP port friends connect to. 49100 unless something else is using it |
 | Ask the router to open it | UPnP: opens the port automatically so nobody touches a router config page. Off if you have forwarded the port yourself, or if your router's UPnP is switched off |
+| Rare tropospheric ducting (realism) | off by default. On a warm, still evening the flight's shared weather may let VHF reach far past the horizon over the sea, as it really does now and then; the radio log says when it begins and ends. Changing it does not restart the server (`docs/radio.md`) |
 
 **Traffic**
 
@@ -713,6 +714,7 @@ range = 80
 hosting = no
 hostport = 49100
 hostupnp = yes
+hostducting = no
 ```
 
 Out-of-range numbers are clamped to the limits above rather than rejected, and
@@ -775,13 +777,18 @@ side, in the order the real signal goes through it (`plugin/src/voice.cpp`,
 | stage | what it does |
 |---|---|
 | transmitter | the other pilot's cockpit comes in through their microphone — engine and wind, a roar rather than a hiss; a modulation limiter squashes every syllable to the same level and holds that roar down under the words, letting it swell back up between them; then a soft overdrive adds the crunch that consonants get when a voice over-modulates |
-| channel | noise that rises as the other aircraft nears the VHF horizon; the signal flutters, a slow wobble in its level that deepens towards the horizon; near it the audio breaks up, whole 20 ms frames going missing; two people keying at once produce the beating heterodyne squeal, with the stronger of them on top and the weaker underneath |
+| channel | noise that rises as the signal weakens -- towards the edge of the coverage, or behind a ridge; the signal flutters, a slow wobble in its level that deepens as it weakens; near the edge the audio breaks up, whole 20 ms frames going missing; two people keying at once fight it out by level: more than 6 dB apart the stronger captures the receiver and the weaker is only a whine underneath, within 6 dB both garble under the beating heterodyne squeal |
 | receiver | a squelch knob: a station weaker than its setting does not open the receiver at all, and with the knob all the way down the squelch is open and there is constant static; the squelch opens with a click and a burst of noise, closes with a longer burst and a click once the carrier drops; a 4th-order 300–2700 Hz audio filter with a headset's lift around 1.8 kHz; an output stage that cannot be driven past two thirds of full scale, whatever comes in |
 
-Distance comes from the same VHF horizon the server uses to route
-transmissions (`1.23 × (√h₁ + √h₂)` nm): a signal is clean to about half of
-it, then degrades to nothing at the horizon, where the server stops relaying
-it anyway. Someone the traffic list does not know about counts as strong.
+How strong a signal is comes from the radio model the server routes by
+(`docs/radio.md`): the VHF horizon worked out from both aerials' heights
+above the ground (`1.23 × (√h₁ + √h₂)` nm, never under 5 nm), an ATC station's
+service volume, and a link budget -- transmitter power less free space path
+loss against the receiver's noise. A signal is clean well inside the coverage
+and fades to nothing at its edge, where the server stops relaying it anyway;
+the plugin also samples the terrain on the path from the scenery, so a station
+behind a mountain comes in weak and noisy, or not at all. Someone the traffic
+list does not know about counts as strong.
 
 To hear it without X-Plane, `tools/harness/radio_demo.cpp` renders a WAV
 through the real pipeline — microphone path, Opus, the radio — and writes
@@ -831,9 +838,10 @@ dropouts, the squeal, and the output ceiling.
 ### Two ranges, on purpose
 
 Traffic is sent within 80 nm, but the radio reaches as far as the VHF horizon
-(`1.23 × (√h₁ + √h₂)` in feet and nautical miles — about 135 nm for two
-aircraft at 3000 ft). So you can hear someone you cannot see, exactly as in
-real life.
+(`1.23 × (√h₁ + √h₂)` in feet and nautical miles, from each aerial's height
+above the ground — about 135 nm for two aircraft 3000 ft up, 7.7 nm for two on
+the ground). So you can hear someone you cannot see, exactly as in real life;
+`docs/radio.md` has the whole model.
 
 ### Untrusted input
 

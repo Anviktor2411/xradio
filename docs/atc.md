@@ -45,9 +45,18 @@ all of it from the command line and is the quickest way to see the packets.
 `EETN_TWR`, `EETN_GND`, `EETN_DEL`, `EETN_APP`, `EETN_CTR` -- the airport before
 the underscore and the position after it are what the ATC list shows. Send
 `PT_POSITION` like a pilot, from the tower's position (`onGround = 1`,
-altitude of the cab): the horizon for voice and text is worked out from it. Put
-the position's frequency on COM1 and, if the station should hear guard without
-being tuned to it, 121.500 on COM2 with `rxMask = RX_COM1 | RX_COM2`.
+altitude of the cab). Put the position's frequency on COM1 and, if the station
+should hear guard without being tuned to it, 121.500 on COM2 with
+`rxMask = RX_COM1 | RX_COM2`.
+
+Who hears the station is the radio model (`docs/radio.md`). Its reach is worked
+out from its **antenna** -- `aglM` in the position, the height above the terrain
+around it -- and its **service volume**: everybody within `svcRangeNm` and
+below `svcCeilingFt` above the station hears it, horizon or not. Send 0 in all
+three for the facility's defaults (a tower 45 m, 25 nm and 4000 ft; approach
+300 m and 60 nm; a centre 600 m and its 250 nm area); send your own for a
+station that is different. Note that `aglM` is the antenna, not the cab: a
+station that put its height above the ground there would give itself a mast.
 
 A station is never relayed as traffic and is not on anybody's TCAS. It does
 receive `PT_TRAFFIC` (pilots and injected aircraft within 80 nm), every
@@ -59,12 +68,18 @@ roster, the ATC list and text and voice on its frequencies.
         --atis "Tallinn information Charlie, runway 26, wind 250 degrees 8 knots" \
         --atis-freq 127905 --atis-letter C --ack-plans 4521
 
+(`--agl-ft`, `--svc-range` and `--svc-ceiling` set the antenna and the service
+volume; left out, the facility's.)
+
 ### Driving aircraft: the injector
 
 A second login with `flags = LF_INJECTOR` (one per program is enough). Then
 `PT_AI_TRAFFIC` every 200 ms: a `TrafficHeader` followed by up to ten
 `TrafficEntry` records -- the same records `PT_TRAFFIC` delivers -- with the
-program's own local number (1…65535) in `sessionId`. The server validates each
+program's own local number (1…65535) in `sessionId`, and each aircraft's height
+above the ground in `aglM` -- an older injector's 108-byte entries are taken
+too, and count 0 above the ground on it and the altitude in the air. The
+server validates each
 entry like a position report, keeps the set alive for 5 s after the last
 refresh, and relays the aircraft to everyone in range as ordinary traffic under
 a flight-wide id (`aiSid(injectorSid, local)`: the injector's session in the high
@@ -102,7 +117,10 @@ frequency.
 
 `PT_ATC_LIST` goes from the server to everyone whenever a station joins, leaves
 or retunes, and every five seconds besides: one `AtcEntry` per station
-(session, callsign, airport, frequency, kind) plus one per published ATIS.
+(session, callsign, airport, frequency, kind -- and where it transmits from and
+what it covers: position, antenna, service volume, exactly what the server
+routes by) plus one per published ATIS. The header's `flags` carry the flight's
+radio conditions: `AL_DUCTING` while tropospheric ducting is on.
 
 ### Tests
 

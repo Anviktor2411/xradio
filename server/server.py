@@ -95,10 +95,22 @@ class Session:
     owner: int = 0              # ...and this is the injector it belongs to
     fp: bytes = None            # a pilot's latest flight plan, as it will be relayed
     atis_seen: dict = field(default_factory=dict)   # icao -> letter already sent to this pilot
+    kind: int = P.ATC_OTHER     # a station's facility, from its callsign
+    proto: int = P.PROTO_VERSION   # what the client speaks: a v5 one gets v5 packets
+    # v6: the radio model (docs/radio.md)
+    agl_m: float = 0.0          # height above the terrain as reported (a station: its antenna)
+    agl_known: bool = False     # the report carried it; a v5-sized one does not
+    svc_range_nm: int = 0       # a station's service volume as it asked, 0 = by facility
+    svc_ceiling_ft: int = 0
 
     @property
     def alt_ft(self) -> float:
         return self.alt_m * 3.28084
+
+    @property
+    def radio_agl_m(self) -> float:
+        """The height above the ground the radio counts for this aircraft."""
+        return effective_agl_m(self.agl_known, self.agl_m, bool(self.on_ground), self.alt_m)
 
     def listening_on(self, freq_khz: int) -> bool:
         """True if this session has that frequency tuned on a receiving radio."""
@@ -162,31 +174,190 @@ def disable_udp_reset(transport):
 
 def distance_nm(a: Session, b: Session) -> float:
     """Great-circle distance in nautical miles (haversine)."""
+    return distance_deg_nm(a.lat, a.lon, b.lat, b.lon)
+
+
+def distance_deg_nm(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     r_nm = 3440.065
-    p1, p2 = math.radians(a.lat), math.radians(b.lat)
+    p1, p2 = lat1 * math.pi / 180.0, lat2 * math.pi / 180.0
     dp = p2 - p1
-    dl = math.radians(b.lon - a.lon)
-    h = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    dl = (lon2 - lon1) * math.pi / 180.0
+    h = math.sin(dp / 2) * math.sin(dp / 2) + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) * math.sin(dl / 2)
     return 2 * r_nm * math.asin(min(1.0, math.sqrt(h)))
 
 
-def radio_range_nm(a: Session, b: Session) -> float:
-    """VHF line-of-sight horizon between two aircraft, in NM.
+# --- the radio model -----------------------------------------------------------
+# How far a transmission reaches and how strong it is when it gets there --
+# docs/radio.md has the formulas with worked examples. plugin/src/radio.h is
+# the same model line for line (the built-in server routes by it and the
+# plugin turns it into noise and break-up), and tools/check_sizes.py compares
+# the two on a table of cases: two servers deciding differently would be a
+# station heard in one flight and silent in another.
+FT_PER_M = 3.28084
+NM_KM = 1.852
+AIRCRAFT_ANTENNA_M = 3.0      # a blade aerial on the fuselage, ~10 ft
+HORIZON_K = 1.23              # nm per sqrt(ft): the radio horizon over an earth bent to 4/3
+RANGE_FLOOR_NM = 5.0          # this close always works: one airport is never bigger
+# An ATC station that does not say: its antenna above the terrain around it
+# (m), and its service volume -- radius (nm) and ceiling (ft above it) --
+# inside which it is heard whatever the horizon says, like a facility whose
+# antennas are placed to cover its airspace.
+STATION_DEFAULTS = {
+    P.ATC_DEL: (30.0, 10.0, 2000.0),
+    P.ATC_GND: (30.0, 10.0, 2000.0),
+    P.ATC_TWR: (45.0, 25.0, 4000.0),
+    P.ATC_APP: (300.0, 60.0, 25000.0),
+    P.ATC_CTR: (600.0, 250.0, 65000.0),   # a centre's whole area
+    P.ATC_ATIS: (45.0, 60.0, 20000.0),
+}
+STATION_UNKNOWN = (30.0, 0.0, 0.0)
+DUCT_FACTOR = 2.0             # tropospheric ducting: low links reach this much further
+DUCT_MAX_HEIGHT_FT = 6000.0
+TX_AIRCRAFT_DBM = 40.0        # 10 W
+TX_STATION_DBM = 43.9794      # 25 W
+NOISE_DBM = -113.0            # 25 kHz channel, 7 dB noise figure
+SNR_ZERO_DB = 3.0             # nothing worth hearing at or below
+SNR_CLEAN_DB = 33.0           # clean at or above
+FADE_FROM = 0.6               # clean to this share of the horizon, nothing at it
+SERVICE_FADE_FROM = 0.9       # a service volume is full strength to its last tenth
 
-    The classic approximation: 1.23 * (sqrt(h1_ft) + sqrt(h2_ft)).
-    Clamped at the bottom so two aircraft on the same apron can still talk.
-    """
-    los = 1.23 * (math.sqrt(max(0.0, a.alt_ft)) + math.sqrt(max(0.0, b.alt_ft)))
-    return max(15.0, los)
+
+@dataclass
+class Node:
+    """One end of a link, as the model needs it."""
+    lat: float
+    lon: float
+    alt_msl_m: float
+    height_ft: float            # its aerial above the terrain around it
+    atc: bool = False
+    range_nm: float = 0.0       # service volume (stations)
+    ceiling_ft: float = 0.0
 
 
-def in_radio_range(a: Session, b: Session) -> bool:
-    return distance_nm(a, b) <= radio_range_nm(a, b)
+def aircraft_height_ft(agl_m: float) -> float:
+    return (max(0.0, agl_m) + AIRCRAFT_ANTENNA_M) * FT_PER_M
+
+
+def effective_agl_m(known: bool, agl_m: float, on_ground: bool, alt_msl_m: float) -> float:
+    """What the radio counts for an aircraft: its report, or for one that sends
+    none (v5, a 108-byte injected entry) 0 on the ground and its altitude in
+    the air -- what every version before v6 used."""
+    if known:
+        return agl_m
+    return 0.0 if on_ground else alt_msl_m
+
+
+def horizon_nm(h1_ft: float, h2_ft: float) -> float:
+    los = HORIZON_K * (math.sqrt(max(0.0, h1_ft)) + math.sqrt(max(0.0, h2_ft)))
+    return max(RANGE_FLOOR_NM, los)
+
+
+def horizon_for(a: Node, b: Node, ducting: bool) -> float:
+    """The horizon between these two, longer in a duct."""
+    r = horizon_nm(a.height_ft, b.height_ft)
+    if ducting and a.height_ft <= DUCT_MAX_HEIGHT_FT and b.height_ft <= DUCT_MAX_HEIGHT_FT:
+        r *= DUCT_FACTOR
+    return r
+
+
+def service_range_for(a: Node, b: Node) -> float:
+    """A station's service volume radius when the other end is an aircraft
+    below its ceiling; 0 otherwise."""
+    if a.atc == b.atc:
+        return 0.0
+    st, ac = (a, b) if a.atc else (b, a)
+    if st.range_nm > 0.0 and ac.alt_msl_m * FT_PER_M <= st.alt_msl_m * FT_PER_M + st.ceiling_ft:
+        return st.range_nm
+    return 0.0
+
+
+def coverage_nm(a: Node, b: Node, ducting: bool) -> float:
+    """The horizon, or a station's service volume for an aircraft inside it,
+    whichever is further."""
+    return max(horizon_for(a, b, ducting), service_range_for(a, b))
+
+
+def smoothstep01(t: float) -> float:
+    if t <= 0.0:
+        return 0.0
+    if t >= 1.0:
+        return 1.0
+    return t * t * (3.0 - 2.0 * t)
+
+
+def airband_mhz(freq_khz: int) -> float:
+    return min(160.0, max(100.0, freq_khz / 1000.0))
+
+
+def fspl_db(mhz: float, km: float) -> float:
+    """Free space path loss: 32.45 + 20 log10(f MHz) + 20 log10(d km)."""
+    return 32.45 + 20.0 * math.log10(mhz) + 20.0 * math.log10(max(km, 0.05))
+
+
+def link(tx: Node, rx: Node, freq_khz: int, ducting: bool, terrain_loss_db: float = 0.0):
+    """(quality 0..1, level dBm, distance nm, coverage nm) from tx to rx.
+    Quality above 0 is what the server relays."""
+    dist = distance_deg_nm(tx.lat, tx.lon, rx.lat, rx.lon)
+    rh, rs = horizon_for(tx, rx, ducting), service_range_for(tx, rx)
+    cov = max(rh, rs)
+    if dist >= cov:
+        return 0.0, -200.0, dist, cov
+    fade_h = 1.0 - smoothstep01((dist / rh - FADE_FROM) / (1.0 - FADE_FROM))
+    fade_s = (1.0 - smoothstep01((dist / rs - SERVICE_FADE_FROM) / (1.0 - SERVICE_FADE_FROM))
+              if rs > 0.0 else 0.0)
+    fade = max(fade_h, fade_s)
+    p_rx = ((TX_STATION_DBM if tx.atc else TX_AIRCRAFT_DBM)
+            - fspl_db(airband_mhz(freq_khz), dist * NM_KM) - terrain_loss_db)
+    snr = p_rx - NOISE_DBM
+    q = smoothstep01((snr - SNR_ZERO_DB) / (SNR_CLEAN_DB - SNR_ZERO_DB)) * fade
+    level = p_rx + 20.0 * math.log10(max(fade, 1e-3))
+    return q, level, dist, cov
+
+
+def station_radio(s: Session):
+    """A station's antenna height (m), service radius (nm) and ceiling (ft):
+    what it sent, or its facility's defaults."""
+    ant, rng, ceil = STATION_DEFAULTS.get(s.kind, STATION_UNKNOWN)
+    if s.agl_known and s.agl_m > 0.0:
+        ant = s.agl_m
+    if s.svc_range_nm > 0:
+        rng = float(s.svc_range_nm)
+    if s.svc_ceiling_ft > 0:
+        ceil = float(s.svc_ceiling_ft)
+    return ant, rng, ceil
+
+
+def node_of(s: Session) -> Node:
+    if s.atc:
+        ant, rng, ceil = station_radio(s)
+        return Node(s.lat, s.lon, s.alt_m, ant * FT_PER_M, True, rng, ceil)
+    return Node(s.lat, s.lon, s.alt_m, aircraft_height_ft(s.radio_agl_m), False)
+
+
+def in_radio_range(tx: Session, rx: Session, freq_khz: int, ducting: bool = False) -> bool:
+    return link(node_of(tx), node_of(rx), freq_khz, ducting)[0] > 0.0
+
+
+def ducting_from(w) -> bool:
+    """Tropospheric ducting from the flight's weather (a WEATHER tuple): warm,
+    high pressure, little wind, dry -- and then a third of the hours, picked
+    from the sim's date and hour so every server agrees which."""
+    zulu, date_days, slp, slt, rain, wind0 = w[1], w[2], w[4], w[5], w[6], w[35]
+    if not (slt >= 20.0 and slp >= 101500.0 and wind0 <= 6.0 and rain < 0.1):
+        return False
+    hour = date_days * 24 + math.floor(zulu / 3600.0)
+    return ((hour * 2654435761) & 0xFFFFFFFF) < 0x59999999
 
 
 class XRadioServer(asyncio.DatagramProtocol):
-    def __init__(self, password: str = ""):
+    def __init__(self, password: str = "", ducting: bool = False):
         self.password = password       # empty: anyone may join
+        # Tropospheric ducting (docs/radio.md): off unless whoever runs the
+        # server asks for it. When on, the flight's shared weather decides --
+        # warm and still, then a third of the hours -- and the ATC list tells
+        # every receiver, so the radios hear what the server now relays.
+        self.ducting_enabled = ducting
+        self.ducting = False
         self.transport = None
         self.sessions: dict[tuple, Session] = {}   # addr -> Session
         self.by_sid: dict[int, Session] = {}
@@ -222,40 +393,46 @@ class XRadioServer(asyncio.DatagramProtocol):
         if parsed is None:
             return                      # not ours, or truncated -- ignore silently
         ptype, version, _plen, sid, payload = parsed
-        if version != P.PROTO_VERSION:
-            # Tell a login from another version why it is getting nowhere;
-            # the header is the same in every version, so the reply can at
-            # least be seen. Anything else from a mismatched client is dropped.
+        if not P.MIN_PROTO_VERSION <= version <= P.PROTO_VERSION:
+            # Tell a login from another version why it is getting nowhere, in
+            # its own header version -- an older client drops any other.
+            # Anything else from a mismatched client is dropped.
             if ptype == P.PT_LOGIN:
-                self._send(addr, P.PT_LOGIN_REJECT, 0, P.LOGIN_REJECT.pack(P.RJ_VERSION, 0))
+                self._send(addr, P.PT_LOGIN_REJECT, 0, P.LOGIN_REJECT.pack(P.RJ_VERSION, 0), version)
             return
         try:
-            self._dispatch(ptype, sid, payload, addr)
+            self._dispatch(ptype, version, sid, payload, addr)
         except Exception:               # never let one bad packet kill the server
             LOG.exception("error handling packet type %s from %s", ptype, addr)
 
     def error_received(self, exc):
         LOG.debug("udp error: %s", exc)
 
-    def _send(self, addr: tuple, ptype: int, sid: int, payload: bytes = b""):
+    def _send(self, addr: tuple, ptype: int, sid: int, payload: bytes = b"", version: int = 0):
+        """`version` 0: the header version the receiver speaks (a v5 client
+        drops a packet with any other in it)."""
+        if not version:
+            to = self.sessions.get(addr)
+            version = to.proto if to is not None else P.PROTO_VERSION
         self.packets_out += 1
-        self.transport.sendto(P.pack(ptype, sid, payload), addr)
+        self.transport.sendto(P.pack(ptype, sid, payload, version), addr)
 
     def _now_ms(self) -> int:
         return int((time.monotonic() - self._t0) * 1000)
 
     # -- packet handlers ----------------------------------------------------
-    def _dispatch(self, ptype, sid, payload, addr):
+    def _dispatch(self, ptype, version, sid, payload, addr):
         if ptype == P.PT_LOGIN:
-            return self._on_login(payload, addr)
+            return self._on_login(payload, addr, version)
 
         s = self.sessions.get(addr)
         if s is None:
             return                      # everything else requires a login first
         # The session id is only ever sent to the address that logged in, so
         # requiring it here means an off-path spoofer has to guess it before
-        # it can drive traffic at someone.
-        if sid != s.sid:
+        # it can drive traffic at someone. And a session speaks the one
+        # version it logged in with.
+        if sid != s.sid or version != s.proto:
             return
         s.last_seen = time.monotonic()
 
@@ -278,19 +455,21 @@ class XRadioServer(asyncio.DatagramProtocol):
         elif ptype == P.PT_LOGOUT:
             self._drop(s, "logout")
 
-    def _on_login(self, payload, addr):
+    def _on_login(self, payload, addr, version=P.PROTO_VERSION):
         if len(payload) < P.LOGIN.size:
             return
         (callsign_raw, icao_raw, proto_ver, flags,
          livery_raw, password_raw) = P.LOGIN.unpack_from(payload, 0)
-        if proto_ver != P.PROTO_VERSION:
+        if proto_ver != version or not P.MIN_PROTO_VERSION <= proto_ver <= P.PROTO_VERSION:
             LOG.warning("rejecting %s: protocol v%s", addr, proto_ver)
-            self._send(addr, P.PT_LOGIN_REJECT, 0, P.LOGIN_REJECT.pack(P.RJ_VERSION, 0))
+            self._send(addr, P.PT_LOGIN_REJECT, 0, P.LOGIN_REJECT.pack(P.RJ_VERSION, 0), version)
             return
         if self.password and P.cstr(password_raw) != self.password:
             LOG.warning("rejecting %s: wrong password", addr)
-            self._send(addr, P.PT_LOGIN_REJECT, 0, P.LOGIN_REJECT.pack(P.RJ_PASSWORD, 0))
+            self._send(addr, P.PT_LOGIN_REJECT, 0, P.LOGIN_REJECT.pack(P.RJ_PASSWORD, 0), version)
             return
+        if proto_ver < 6:
+            flags &= P.LF_WEATHER_SOURCE    # the station and injector bits are v6's
 
         callsign = _clean(P.cstr(callsign_raw), 15)
         ac_icao = _clean(P.cstr(icao_raw), 7)
@@ -318,14 +497,17 @@ class XRadioServer(asyncio.DatagramProtocol):
             weather_source=bool(flags & P.LF_WEATHER_SOURCE),
             atc=bool(flags & P.LF_ATC),
             injector=bool(flags & P.LF_INJECTOR),
+            proto=proto_ver,
         )
+        s.kind = P.atc_kind(s.callsign) if s.atc else P.ATC_OTHER
         self.sessions[addr] = s
         self.by_sid[sid] = s
         if s.weather_source and self._weather_sid == 0:
             self._weather_sid = sid
             LOG.info("weather and time now come from %s", s.callsign)
-        LOG.info("login: %s (%s) sid=%d from %s%s%s", s.callsign, s.ac_icao, sid, addr,
-                 " [ATC]" if s.atc else "", " [injector]" if s.injector else "")
+        LOG.info("login: %s (%s) sid=%d from %s%s%s%s", s.callsign, s.ac_icao, sid, addr,
+                 " [ATC]" if s.atc else "", " [injector]" if s.injector else "",
+                 f" [v{proto_ver} client]" if proto_ver != P.PROTO_VERSION else "")
         self._send(addr, P.PT_LOGIN_ACK, sid, P.LOGIN_ACK.pack(sid, self._now_ms()))
         self._roster_dirty = True
         self._atc_dirty = True
@@ -336,13 +518,22 @@ class XRadioServer(asyncio.DatagramProtocol):
                     self._send(addr, P.PT_FLIGHTPLAN, sid, p.fp)
 
     def _on_position(self, s: Session, payload):
-        if len(payload) < P.POSITION.size:
+        # v6 adds the radio model's fields at the end; a v5-sized report is
+        # still a position, its height above the ground then unknown.
+        if len(payload) >= P.POSITION.size:
+            fields = P.POSITION.unpack_from(payload, 0)
+            agl_m, svc_range, svc_ceiling = fields[21:24]
+            agl_known = True
+        elif len(payload) >= P.POSITION_V5.size:
+            fields = P.POSITION_V5.unpack_from(payload, 0)
+            agl_m, svc_range, svc_ceiling, agl_known = 0.0, 0, 0, False
+        else:
             return
         (lat, lon, alt_m, heading, pitch, roll, gs_ms,
          gear, flap, com1, com2,
          lights, on_ground, tx_radio, rx_mask,
          time_ms, track, vs_ms,
-         squawk, xpdr_mode, xpdr_ident) = P.POSITION.unpack_from(payload, 0)
+         squawk, xpdr_mode, xpdr_ident) = fields[:21]
 
         # A client can send anything. NaN or a wild coordinate would be relayed
         # to everyone else and poison their renderer, and it breaks the
@@ -360,8 +551,15 @@ class XRadioServer(asyncio.DatagramProtocol):
             return
         if not 0.0 <= gs_ms <= 1500.0:
             return
+        if not (math.isfinite(agl_m) and -1000.0 <= agl_m <= 40000.0):
+            return
 
+        if s.atc and (not s.has_position or (s.agl_m, s.agl_known, s.svc_range_nm, s.svc_ceiling_ft)
+                      != (agl_m, agl_known, svc_range, svc_ceiling)):
+            self._atc_dirty = True          # the list says where a station is and what it covers
         s.lat, s.lon, s.alt_m = lat, lon, alt_m
+        s.agl_m, s.agl_known = agl_m, agl_known
+        s.svc_range_nm, s.svc_ceiling_ft = svc_range, svc_ceiling
         s.heading = heading % 360.0
         s.pitch, s.roll = pitch, roll
         s.gs_ms = gs_ms
@@ -402,11 +600,14 @@ class XRadioServer(asyncio.DatagramProtocol):
         off = P.TRAFFIC_HDR.size
         now = time.monotonic()
         mine = sum(1 for a in self.ai.values() if a.owner == s.sid)
+        # v6 entries carry the aircraft's height above the ground at their
+        # end; an injector that predates it sends them 108 bytes long.
+        entry = P.TRAFFIC_ENTRY if len(payload) - off >= count * P.TRAFFIC_ENTRY.size else P.TRAFFIC_ENTRY_V5
         for _ in range(count):
-            if off + P.TRAFFIC_ENTRY.size > len(payload):
+            if off + entry.size > len(payload):
                 break
-            e = P.TRAFFIC_ENTRY.unpack_from(payload, off)
-            off += P.TRAFFIC_ENTRY.size
+            e = entry.unpack_from(payload, off)
+            off += entry.size
             local = e[0] & 0xFFFF
             if local == 0:
                 continue
@@ -426,6 +627,10 @@ class XRadioServer(asyncio.DatagramProtocol):
             if not all(math.isfinite(v) for v in (heading, pitch, roll, gs_ms, gear, flap, track, vs_ms)):
                 continue
             if not -200.0 <= vs_ms <= 200.0 or not 0.0 <= gs_ms <= 1500.0:
+                continue
+            agl_known = entry is P.TRAFFIC_ENTRY
+            agl_m = e[23] if agl_known else 0.0
+            if not (math.isfinite(agl_m) and -1000.0 <= agl_m <= 40000.0):
                 continue
             a = self.ai.get(sid)
             if a is None:
@@ -447,6 +652,7 @@ class XRadioServer(asyncio.DatagramProtocol):
             squawk = e[20]
             a.squawk = squawk if 0 <= squawk <= 7777 and all(c <= "7" for c in f"{squawk:04d}") else 0
             a.xpdr_ident = 1 if e[21] else 0
+            a.agl_m, a.agl_known = agl_m, agl_known
             a.has_position = True
             a.last_seen = now
 
@@ -463,7 +669,8 @@ class XRadioServer(asyncio.DatagramProtocol):
                 return
             out = P.FLIGHTPLAN.pack(target.sid, P.pad(target.callsign, 16), *P.FLIGHTPLAN.unpack_from(payload, 0)[2:])
             target.fp = out
-            self._send(target.addr, P.PT_FLIGHTPLAN, target.sid, out)
+            if target.proto >= 6:           # a v5 client has no flight plans
+                self._send(target.addr, P.PT_FLIGHTPLAN, target.sid, out)
             for p in self.sessions.values():
                 if p.atc and p.sid != s.sid:
                     self._send(p.addr, P.PT_FLIGHTPLAN, p.sid, out)
@@ -513,7 +720,7 @@ class XRadioServer(asyncio.DatagramProtocol):
 
     def _offer_atis(self, s: Session):
         """Send a pilot the ATIS of every frequency they have just tuned."""
-        if s.ai or s.injector:
+        if s.ai or s.injector or s.proto < 6:
             return
         for icao, a in self.atis.items():
             if a["owner"] == s.sid:
@@ -522,9 +729,22 @@ class XRadioServer(asyncio.DatagramProtocol):
                 s.atis_seen[icao] = a["letter"]
                 self._send(s.addr, P.PT_ATIS, s.sid, a["payload"])
 
+    @staticmethod
+    def _atc_entry(sid, callsign, icao, freq, kind, where, antenna_m, range_nm, ceiling_ft):
+        """One row of the ATC list: who, where it transmits from and what it
+        covers -- what the server routes by, so a pilot's radio can work out
+        the same signal (docs/radio.md)."""
+        has = where is not None and where.has_position
+        return P.ATC_ENTRY.pack(sid, P.pad(callsign, 16), P.pad(icao, 8), freq, kind,
+                                P.AE_POSITION if has else 0, b"\x00\x00",
+                                where.lat if has else 0.0, where.lon if has else 0.0,
+                                where.alt_m if has else 0.0, antenna_m,
+                                int(min(65535.0, range_nm)), int(min(65535.0, ceiling_ft)))
+
     def _broadcast_atc_list(self, now: float):
-        """The stations online and the ATIS frequencies, to everyone. Ordered
-        by session so both servers produce the same bytes."""
+        """The stations online and the ATIS frequencies, to everyone -- and
+        whether the flight's air is ducting tonight. Ordered by session so
+        both servers produce the same bytes. A v5 client has no such list."""
         self._last_atc = now
         self._atc_dirty = False
         if not self.sessions:
@@ -532,16 +752,20 @@ class XRadioServer(asyncio.DatagramProtocol):
         entries = []
         for s in sorted(self.sessions.values(), key=lambda x: x.sid):
             if s.atc:
-                entries.append(P.ATC_ENTRY.pack(s.sid, P.pad(s.callsign, 16), P.pad(P.atc_icao(s.callsign), 8),
-                                                s.com1, P.atc_kind(s.callsign), b"\x00\x00\x00"))
+                ant, rng, ceil = station_radio(s)
+                entries.append(self._atc_entry(s.sid, s.callsign, P.atc_icao(s.callsign), s.com1, s.kind,
+                                               s, ant, rng, ceil))
         for icao in sorted(self.atis):
             a = self.atis[icao]
-            entries.append(P.ATC_ENTRY.pack(0, P.pad(f"{icao}_ATIS", 16), P.pad(icao, 8), a["freq"], P.ATC_ATIS,
-                                            b"\x00\x00\x00"))
+            owner = self.by_sid.get(a["owner"])
+            ant = station_radio(owner)[0] if owner is not None else STATION_DEFAULTS[P.ATC_ATIS][0]
+            _, rng, ceil = STATION_DEFAULTS[P.ATC_ATIS]
+            entries.append(self._atc_entry(0, f"{icao}_ATIS", icao, a["freq"], P.ATC_ATIS, owner, ant, rng, ceil))
         entries = entries[:P.MAX_ATC_ENTRIES]
-        body = P.ATC_LIST_HDR.pack(len(entries), 0) + b"".join(entries)
+        body = P.ATC_LIST_HDR.pack(len(entries), P.AL_DUCTING if self.ducting else 0) + b"".join(entries)
         for to in list(self.sessions.values()):
-            self._send(to.addr, P.PT_ATC_LIST, to.sid, body)
+            if to.proto >= 6:
+                self._send(to.addr, P.PT_ATC_LIST, to.sid, body)
 
     def _on_text(self, s: Session, payload):
         if len(payload) < P.TEXT_HDR.size:
@@ -627,7 +851,10 @@ class XRadioServer(asyncio.DatagramProtocol):
             self._send(peer.addr, P.PT_VOICE, peer.sid, out_payload)
 
     def _listeners(self, sender: Session, freq_khz: int):
-        """Everyone except the sender who has freq tuned and is in range.
+        """Everyone except the sender who has freq tuned and can receive it --
+        the radio model's quality above nothing (docs/radio.md): inside the
+        horizon worked out from both heights above the ground, or inside a
+        station's service volume.
 
         Guard is the exception: it reaches everyone in range whether or not
         they have it tuned. It is the one frequency you can call somebody on
@@ -642,7 +869,8 @@ class XRadioServer(asyncio.DatagramProtocol):
                 continue                # the program driving it said it; it knows
             if not guard and not peer.listening_on(freq_khz):
                 continue
-            if sender.has_position and peer.has_position and not in_radio_range(sender, peer):
+            if sender.has_position and peer.has_position and \
+                    not in_radio_range(sender, peer, freq_khz, self.ducting):
                 continue
             yield peer
 
@@ -683,6 +911,18 @@ class XRadioServer(asyncio.DatagramProtocol):
         for other in list(self.sessions.values()):
             if other.sid != s.sid:
                 self._send(other.addr, P.PT_WEATHER, other.sid, payload)
+        if self.ducting_enabled:
+            self._set_ducting(ducting_from(P.WEATHER.unpack(payload)))
+
+    def _set_ducting(self, on: bool):
+        """The flight's air, ducting or not; the ATC list carries it to every
+        radio at once."""
+        if on == self.ducting:
+            return
+        self.ducting = on
+        self._atc_dirty = True
+        LOG.info("tropospheric ducting %s", "begins: VHF reaches far past the horizon over the sea"
+                 if on else "is over: VHF range back to the horizon")
 
     def _drop(self, s: Session, why: str):
         if self.sessions.pop(s.addr, None) is None:
@@ -690,6 +930,7 @@ class XRadioServer(asyncio.DatagramProtocol):
         self.by_sid.pop(s.sid, None)
         if self._weather_sid == s.sid:
             self._weather_sid = 0      # the next claimant may have it
+            self._set_ducting(False)   # and with no shared sky, nothing says the air is layered
         self._roster_dirty = True
         # v6: its aircraft and its ATIS go with it
         if s.injector:
@@ -753,21 +994,26 @@ class XRadioServer(asyncio.DatagramProtocol):
         header promising more than it holds is how a receiver ends up reading
         a neighbouring aircraft's bytes as a position.
         """
-        for first in range(0, max(len(others), 1), MAX_ENTRIES_PER_PACKET):
-            chunk = others[first:first + MAX_ENTRIES_PER_PACKET]
+        # A v6 receiver gets each aircraft's height above the ground as well --
+        # the one its radio is routed by, so its own model agrees; a v5 one
+        # gets the entries it knows, which are shorter.
+        v6 = me.proto >= 6
+        per = MAX_ENTRIES_PER_PACKET if v6 else P.MAX_TRAFFIC_ENTRIES_V5
+        for first in range(0, max(len(others), 1), per):
+            chunk = others[first:first + per]
             parts = [P.TRAFFIC_HDR.pack(len(chunk), 0)]
             for o in chunk:
                 tx_active = 0
                 if now - o.last_voice < TX_HOLD_S:
                     f = o.tx_freq()
                     tx_active = 1 if (f and me.listening_on(f)) else 0
-                parts.append(P.TRAFFIC_ENTRY.pack(
-                    o.sid, P.pad(o.callsign, 16), P.pad(o.ac_icao, 8),
-                    o.lat, o.lon, o.alt_m, o.heading, o.pitch, o.roll,
-                    o.gs_ms, o.gear, o.flap,
-                    o.lights, o.on_ground, tx_active, o.xpdr_mode,
-                    o.time_ms, o.track, o.vs_ms,
-                    P.pad(o.livery, 16), o.squawk, o.xpdr_ident, 0))
+                fields = (o.sid, P.pad(o.callsign, 16), P.pad(o.ac_icao, 8),
+                          o.lat, o.lon, o.alt_m, o.heading, o.pitch, o.roll,
+                          o.gs_ms, o.gear, o.flap,
+                          o.lights, o.on_ground, tx_active, o.xpdr_mode,
+                          o.time_ms, o.track, o.vs_ms,
+                          P.pad(o.livery, 16), o.squawk, o.xpdr_ident, 0)
+                parts.append(P.TRAFFIC_ENTRY.pack(*fields, o.radio_agl_m) if v6 else P.TRAFFIC_ENTRY_V5.pack(*fields))
             self._send(me.addr, P.PT_TRAFFIC, me.sid, b"".join(parts))
 
 
@@ -833,7 +1079,8 @@ class Dashboard:
             f"XRadio relay server  ·  port {self.port}  ·  up {uptime}  ·  "
             f"{'password required' if s.password else 'no password'}",
             f"pilots {len(s.sessions)}  ·  packets in {self.rate_in:.0f}/s, out "
-            f"{self.rate_out:.0f}/s  ·  sky from {source.callsign if source else 'nobody yet'}",
+            f"{self.rate_out:.0f}/s  ·  sky from {source.callsign if source else 'nobody yet'}"
+            + ("  ·  DUCTING: VHF reaches far over the sea" if s.ducting else ""),
             "",
             f"{'callsign':<9}{'type':<6}{'position':<22}{'alt ft':>7} {'kt':>4}  "
             f"{'COM1':<8}{'COM2':<8}{'xpdr':<6}{'radio':<6}{'seen':>5}",
@@ -870,6 +1117,10 @@ async def main():
     ap.add_argument("--password", default=os.environ.get("XRADIO_PASSWORD", ""),
                     help="flight password pilots must give to join (default: none)")
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--ducting", action="store_true",
+                    default=os.environ.get("XRADIO_DUCTING", "") not in ("", "0"),
+                    help="realism: let the flight's shared weather bring rare tropospheric ducting, "
+                         "when VHF reaches far past the horizon over the sea (default: off)")
     ap.add_argument("--dashboard", action="store_true",
                     help="show a live picture of the flight in this terminal instead of a log")
     ap.add_argument("--log", metavar="FILE",
@@ -895,9 +1146,11 @@ async def main():
         )
 
     loop = asyncio.get_running_loop()
-    server = XRadioServer(password=args.password)
+    server = XRadioServer(password=args.password, ducting=args.ducting)
     if args.password:
         LOG.info("a flight password is required to join")
+    if args.ducting:
+        LOG.info("tropospheric ducting is on: warm, still weather from the flight's sky can carry VHF far over the sea")
     transport, _ = await loop.create_datagram_endpoint(
         lambda: server, local_addr=(args.host, args.port))
     disable_udp_reset(transport)

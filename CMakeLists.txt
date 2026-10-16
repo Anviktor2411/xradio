@@ -102,6 +102,7 @@ set(XR_PLUGIN_SOURCES
     plugin/src/natpmp.cpp
     plugin/src/net.cpp
     plugin/src/server.cpp
+    plugin/src/shadow.cpp
     plugin/src/simbrief.cpp
     plugin/src/tcp.cpp
     plugin/src/tower.cpp
@@ -372,6 +373,16 @@ if(XRADIO_BUILD_TESTS)
     endif()
     # Not a test: renders a WAV through the radio chain so it can be listened to.
     xradio_test_exe(radio_demo     tools/harness/radio_demo.cpp)
+
+    # The radio model and the terrain shadow on their own (docs/radio.md):
+    # the horizon and service volumes, the link budget, a made-up mountain.
+    add_executable(radio_test tools/harness/radio_test.cpp plugin/src/shadow.cpp)
+    target_include_directories(radio_test PRIVATE plugin/src)
+    target_compile_features(radio_test PRIVATE cxx_std_17)
+    if(XRADIO_SANITIZE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(radio_test PRIVATE -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(radio_test    PRIVATE -fsanitize=address,undefined)
+    endif()
 
     # The UPnP client alone, against tools/harness/fake_igd.py.
     add_executable(upnp_test tools/harness/upnp_test.cpp plugin/src/upnp.cpp

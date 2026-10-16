@@ -209,6 +209,13 @@ jobs:
       - name: The window's logic
         run: ASAN_OPTIONS=detect_leaks=0 ./build-tests/ui_logic_test
 
+      # The radio model (docs/radio.md): heights above the ground, service volumes, the
+      # link budget, ducting, a ridge on a fixture height profile, and the terrain sampler
+      # keeping to its probe and time budgets. server.py's copy of the model is held to the
+      # same answers by the wire-struct step.
+      - name: The radio model
+        run: ASAN_OPTIONS=detect_leaks=0 ./build-tests/radio_test
+
       # Tower mode's windows clicked through in ImGui contexts of their own, without X-Plane
       # or OpenGL: Clear in Delivery, the command line, strips dragged between bays, the radar,
       # the light gun, the banner's Retry -- each checked to ask tower.cpp for the right thing.

@@ -5,13 +5,20 @@
 // change the matching struct.Struct format string there.
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 namespace xr {
 
 // "XRC1" as little-endian bytes.
 static const uint32_t kMagic       = 0x31435258u;
-static const uint16_t kProtoVersion = 6;   // v6: ATC stations, injected AI traffic, flight plans, ATIS
+static const uint16_t kProtoVersion = 6;   // v6: ATC stations, injected AI traffic, flight plans, ATIS,
+                                           //     the radio model (heights above the ground, service volumes)
+// The oldest client a server still lets in. v6 only added to v5 -- new packet
+// types, and fields at the end of records -- so a v5 pilot (XRadio 0.5) flies
+// in a v6 flight on exactly what v5 knew: the server sends it v5 headers and
+// v5-sized records and keeps the v6-only packets to itself. docs/server.md.
+static const uint16_t kMinProtoVersion = 5;
 
 enum PacketType : uint8_t {
     PT_LOGIN     = 1,  // client -> server
@@ -196,7 +203,7 @@ struct LoginRejectPayload {  // 4 bytes
 };
 
 // State of our own aircraft, sent to the server.
-struct PositionPayload {     // 72 bytes (v4)
+struct PositionPayload {     // 80 bytes (v6); 72 without the radio fields (v4, v5)
     double   lat;            // degrees
     double   lon;            // degrees
     float    altMslM;        // metres MSL
@@ -223,10 +230,20 @@ struct PositionPayload {     // 72 bytes (v4)
     uint16_t squawk;
     uint8_t  xpdrMode;       // XpdrMode
     uint8_t  xpdrIdent;      // 1 while IDENT is being squawked
+    // v6: the radio model (docs/radio.md). The VHF horizon is worked out from
+    // the height above the ground, not the altitude: from the altitude, two
+    // aircraft on the apron at Innsbruck (1900 ft) would talk over a hundred
+    // miles. A report without these fields -- 72 bytes, from a v5 client or a
+    // tool that predates them -- is still taken, and then counts 0 above the
+    // ground on the ground and its altitude in the air, as every version did.
+    float    aglM;           // metres above the terrain under it. An ATC station:
+                             // its antenna above the terrain around it, 0 = by facility
+    uint16_t svcRangeNm;     // ATC stations: how far the service volume reaches, 0 = by facility
+    uint16_t svcCeilingFt;   // ...and how high, feet above the station, 0 = by facility
 };
 
 // One other aircraft, as the server sees it.
-struct TrafficEntry {        // 108 bytes (v4)
+struct TrafficEntry {        // 112 bytes (v6); 108 without aglM (v4, v5)
     uint32_t sessionId;
     char     callsign[16];
     char     acIcao[8];
@@ -250,6 +267,11 @@ struct TrafficEntry {        // 108 bytes (v4)
     uint16_t squawk;         // v4
     uint8_t  xpdrIdent;      // v4
     uint8_t  reserved;
+    // v6: its height above the terrain, metres -- the one the server routes
+    // its radio by (its own report, or for one that sends none: 0 on the
+    // ground, its altitude in the air), so the receiver works out the same
+    // horizon. An injector may send 108-byte entries without it.
+    float    aglM;
 };
 
 struct TrafficHeader {       // 4 bytes, followed by `count` TrafficEntry
@@ -370,19 +392,42 @@ static const int kMaxAtisBytes = 600;
 
 struct AtcListHeader {       // 4 bytes, followed by `count` AtcEntry
     uint16_t count;
-    uint16_t reserved;
+    uint16_t flags;          // AL_* bits: the flight's radio conditions
 };
+// The air tonight carries VHF much further over the sea than the horizon
+// (tropospheric ducting: the flight's server has the realism switch on and the
+// shared weather is warm and still). docs/radio.md.
+static const uint16_t AL_DUCTING = 1 << 0;
 
-struct AtcEntry {            // 36 bytes
+struct AtcEntry {            // 64 bytes
     uint32_t sessionId;      // the station's session; 0 for an ATIS entry
     char     callsign[16];   // EETN_TWR
     char     icao[8];        // the airport
     uint32_t freqKhz;
     uint8_t  kind;           // AtcKind
-    uint8_t  reserved[3];
+    uint8_t  flags;          // AE_* bits
+    uint8_t  reserved[2];
+    // The radio model: where the station transmits from and what it covers --
+    // exactly what the server routes by, so a pilot's radio can work out the
+    // same signal from it (docs/radio.md). An ATIS entry carries its station's.
+    double   lat;
+    double   lon;
+    float    altMslM;        // the station's altitude; its service volume's ceiling counts from it
+    float    antennaM;       // its antenna above the terrain around it; the horizon counts from it
+    uint16_t rangeNm;        // service volume: everyone this close is covered, 0 = the horizon only
+    uint16_t ceilingFt;      // ...up to this many feet above the station
 };
+static const uint8_t AE_POSITION = 1 << 0;   // lat, lon and altMslM are real: it has reported one
 
 #pragma pack(pop)
+
+// What a v5 client sends and receives: the same records without the v6 radio
+// fields at their end. A v6 server reads a 72-byte position as v5 and writes
+// v5 clients 108-byte traffic entries.
+static const int kPositionSizeV5     = 72;
+static const int kTrafficEntrySizeV5 = 108;
+static_assert(offsetof(PositionPayload, aglM) == kPositionSizeV5, "v6 position fields go at the end");
+static_assert(offsetof(TrafficEntry, aglM) == kTrafficEntrySizeV5, "v6 traffic fields go at the end");
 
 // The whole datagram, header included.
 //
@@ -401,6 +446,9 @@ static const int kMaxPacket = 1200;
 static const int kMaxTrafficEntries =
     (kMaxPacket - (int)sizeof(Header) - (int)sizeof(TrafficHeader)) /
     (int)sizeof(TrafficEntry);
+// ...and in one packet to a v5 client, whose entries are shorter.
+static const int kMaxTrafficEntriesV5 =
+    (kMaxPacket - (int)sizeof(Header) - (int)sizeof(TrafficHeader)) / kTrafficEntrySizeV5;
 
 // And how many pilots fit in one roster packet, the same way.
 static const int kMaxRosterEntries =

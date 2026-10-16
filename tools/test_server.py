@@ -35,19 +35,31 @@ def check(name, cond, detail=""):
 
 
 class Client:
-    """A minimal XRadio client for testing."""
+    """A minimal XRadio client for testing.
 
-    def __init__(self, callsign, lat, lon, alt_ft=3000.0, com1=FREQ, com2=0):
+    `agl_ft` is the height above the ground it reports (v6); left out, the
+    country is flat at sea level and it is the altitude. `proto=5` makes it a
+    v5 client: v5 headers, and the 72-byte position without the radio fields."""
+
+    def __init__(self, callsign, lat, lon, alt_ft=3000.0, com1=FREQ, com2=0, agl_ft=None,
+                 on_ground=False, proto=P.PROTO_VERSION):
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(0.4)
         self.dest = ("127.0.0.1", PORT)
         self.callsign = callsign
         self.lat, self.lon, self.alt_ft = lat, lon, alt_ft
+        self.agl_ft = alt_ft if agl_ft is None else agl_ft
+        self.on_ground = on_ground
         self.com1, self.com2 = com1, com2
+        self.proto = proto
         self.sid = 0
 
-    def login(self):
-        self.sock.sendto(P.pack(P.PT_LOGIN, 0, P.login(self.callsign, "C172")), self.dest)
+    def send(self, ptype, payload=b"", sid=None):
+        self.sock.sendto(P.pack(ptype, self.sid if sid is None else sid, payload, self.proto), self.dest)
+
+    def login(self, flags=0):
+        self.sock.sendto(P.pack(P.PT_LOGIN, 0, P.login(self.callsign, "C172", flags=flags, version=self.proto),
+                                self.proto), self.dest)
         pkt = self.recv(P.PT_LOGIN_ACK)
         if pkt is not None:
             self.sid, _ = P.LOGIN_ACK.unpack_from(pkt, 0)
@@ -55,20 +67,29 @@ class Client:
 
     def position(self, tx=P.TX_NONE, rx=P.RX_COM1, sid=None,
                  squawk=1200, xpdr=P.XPDR_ALT, ident=0):
-        self.sock.sendto(P.pack(P.PT_POSITION, self.sid if sid is None else sid,
-                                P.POSITION.pack(
-                                    self.lat, self.lon, self.alt_ft / 3.28084,
-                                    90.0, 0.0, 0.0, 60.0, 0.0, 0.0,
-                                    self.com1, self.com2, 0, 0, tx, rx,
-                                    int(time.monotonic() * 1000) & 0xFFFFFFFF, 90.0, 0.0,
-                                    squawk, xpdr, ident)),
-                         self.dest)
+        fields = (self.lat, self.lon, self.alt_ft / 3.28084,
+                  90.0, 0.0, 0.0, 0.0 if self.on_ground else 60.0, 0.0, 0.0,
+                  self.com1, self.com2, 0, 1 if self.on_ground else 0, tx, rx,
+                  int(time.monotonic() * 1000) & 0xFFFFFFFF, 90.0, 0.0,
+                  squawk, xpdr, ident)
+        body = (P.POSITION.pack(*fields, self.agl_ft / 3.28084, 0, 0) if self.proto >= 6
+                else P.POSITION_V5.pack(*fields))
+        self.send(P.PT_POSITION, body, sid)
 
     def text(self, msg, freq, sid=None):
         b = msg.encode()
-        self.sock.sendto(P.pack(P.PT_TEXT, self.sid if sid is None else sid,
-                                P.TEXT_HDR.pack(freq, self.sid, P.pad(self.callsign, 16),
-                                                len(b), P.pad("", 16)) + b), self.dest)
+        self.send(P.PT_TEXT, P.TEXT_HDR.pack(freq, self.sid, P.pad(self.callsign, 16),
+                                             len(b), P.pad("", 16)) + b, sid)
+
+    def recv_any(self, timeout=0.6):
+        """The next packet whatever it is: (type, header version, payload)."""
+        self.sock.settimeout(timeout)
+        try:
+            data, _ = self.sock.recvfrom(P.MAX_PACKET)
+        except socket.timeout:
+            return None
+        parsed = P.unpack_header(data)
+        return (parsed[0], parsed[1], parsed[4]) if parsed else None
 
     def recv(self, want_type, timeout=0.6):
         """Read packets until one of want_type arrives, or give up."""
@@ -136,8 +157,9 @@ def run():
 
     print("\nwire format")
     check("C++/Python struct sizes agree", all([
-        P.HEADER.size == 12, P.LOGIN.size == 76, P.POSITION.size == 72,
-        P.TRAFFIC_ENTRY.size == 108, P.TEXT_HDR.size == 42, P.VOICE_HDR.size == 12,
+        P.HEADER.size == 12, P.LOGIN.size == 76, P.POSITION.size == 80, P.POSITION_V5.size == 72,
+        P.TRAFFIC_ENTRY.size == 112, P.TRAFFIC_ENTRY_V5.size == 108, P.TEXT_HDR.size == 42,
+        P.VOICE_HDR.size == 12, P.ATC_ENTRY.size == 64,
     ]))
     check("bad magic is rejected",
           P.unpack_header(struct.pack("<IBBHI", 0xDEADBEEF, 1, 1, 0, 0)) is None)
@@ -177,7 +199,7 @@ def run():
     a.sock.sendto(P.pack(P.PT_POSITION, a.sid, P.POSITION.pack(
         a.lat, a.lon, a.alt_ft / 3.28084, 90.0, 0.0, 0.0, 60.0, 0.0, 0.0,
         a.com1, 0, 0, 0, P.TX_NONE, P.RX_COM1, stamp, 123.5, -2.5,
-        1200, P.XPDR_ALT, 0)), a.dest)
+        1200, P.XPDR_ALT, 0, a.agl_ft / 3.28084, 0, 0)), a.dest)
     pump(0.4)
     relayed = None
     for _ in range(30):
@@ -254,17 +276,19 @@ def run():
     bad.position()
     pump(0.3)
     good_lat = next((x.lat for x in srv.sessions.values() if x.callsign == "ESBAD1"), None)
-    for label, lat, lon, alt, gs in [
-        ("NaN latitude", float("nan"), 27.0, 900.0, 60.0),
-        ("infinite longitude", 57.0, float("inf"), 900.0, 60.0),
-        ("latitude 500", 500.0, 27.0, 900.0, 60.0),
-        ("altitude 1e9", 57.0, 27.0, 1e9, 60.0),
-        ("negative ground speed", 57.0, 27.0, 900.0, -5.0),
+    for label, lat, lon, alt, gs, agl in [
+        ("NaN latitude", float("nan"), 27.0, 900.0, 60.0, 900.0),
+        ("infinite longitude", 57.0, float("inf"), 900.0, 60.0, 900.0),
+        ("latitude 500", 500.0, 27.0, 900.0, 60.0, 900.0),
+        ("altitude 1e9", 57.0, 27.0, 1e9, 60.0, 900.0),
+        ("negative ground speed", 57.0, 27.0, 900.0, -5.0, 900.0),
+        ("NaN height above the ground", 57.0, 27.0, 900.0, 60.0, float("nan")),
+        ("height above the ground 1e9", 57.0, 27.0, 900.0, 60.0, 1e9),
     ]:
         bad.sock.sendto(P.pack(P.PT_POSITION, bad.sid, P.POSITION.pack(
             lat, lon, alt, 90.0, 0.0, 0.0, gs, 0.0, 0.0,
             FREQ, 0, 0, 0, P.TX_NONE, P.RX_COM1, 0, 90.0, 0.0,
-            1200, P.XPDR_ALT, 0)), bad.dest)
+            1200, P.XPDR_ALT, 0, agl, 0, 0)), bad.dest)
     pump(0.4)
     now_lat = next((x.lat for x in srv.sessions.values() if x.callsign == "ESBAD1"), None)
     check("implausible position reports are rejected",
@@ -275,7 +299,7 @@ def run():
     bad.sock.sendto(P.pack(P.PT_POSITION, bad.sid, P.POSITION.pack(
         57.85, 27.02, 900.0, 90.0, 0.0, 0.0, 60.0, 9.0, -4.0,
         FREQ, 0, 0, 0, P.TX_NONE, P.RX_COM1, 0, 90.0, 0.0,
-        1200, P.XPDR_ALT, 0)), bad.dest)
+        1200, P.XPDR_ALT, 0, 900.0, 0, 0)), bad.dest)
     pump(0.3)
     sess = next((x for x in srv.sessions.values() if x.callsign == "ESBAD1"), None)
     check("gear and flap ratios are clamped to 0..1",
@@ -294,17 +318,42 @@ def run():
     check("control characters are stripped from callsigns", not dirty, str(dirty))
     ctl.close()
 
-    print("\nradio range maths")
-    g = S.Session(1, None, "A", "C172", 0, lat=0, lon=0, alt_m=0)
-    h = S.Session(2, None, "B", "C172", 0, lat=0, lon=0, alt_m=0)
-    check("ground-to-ground has a usable minimum", S.radio_range_nm(g, h) >= 15.0)
-    g.alt_m = 10000 / 3.28084     # 10 000 ft
-    check("range grows with altitude", S.radio_range_nm(g, h) > 100.0,
-          f"{S.radio_range_nm(g, h):.0f} nm")
+    print("\nradio model maths (docs/radio.md)")
+    ground = S.aircraft_height_ft(0.0)
+    h_apron = S.horizon_nm(ground, ground)
+    check("two aerials 3 m up on the ground see 7.7 nm", abs(h_apron - 7.72) < 0.01, f"{h_apron:.2f} nm")
+    check("and nothing is ever under 5 nm", S.horizon_nm(0.0, 0.0) == 5.0 == S.RANGE_FLOOR_NM)
+    ft10k = S.aircraft_height_ft(10000 / 3.28084)
+    check("range grows with the height above the ground", S.horizon_nm(ft10k, ground) > 120.0,
+          f"{S.horizon_nm(ft10k, ground):.0f} nm")
+    check("a report without the height (v5): 0 on the ground, the altitude in the air, as before",
+          S.effective_agl_m(False, 0.0, True, 581.0) == 0.0 and S.effective_agl_m(False, 0.0, False, 914.4) == 914.4
+          and S.effective_agl_m(True, 120.0, False, 914.4) == 120.0)
+    a1, a2 = S.Node(57.0, 27.0, 900.0, ft10k), S.Node(57.0, 27.0, 900.0, ft10k)
+    qualities = []
+    for nm in (5, 40, 90, 120, 150, 200, 260):
+        a2.lat = 57.0 + nm / 60.0
+        qualities.append(S.link(a1, a2, 122800, False)[0])
+    check("clean close by, noisier further, nothing past the horizon",
+          qualities[0] == 1.0 and qualities[1] > 0.99 and all(x >= y for x, y in zip(qualities, qualities[1:]))
+          and qualities[4] > 0.9 and 0.0 < qualities[5] < 0.9 and qualities[-1] == 0.0, str([round(q, 3) for q in qualities]))
+    q_ac = S.link(S.Node(60.0, 27.0, 10668.0, S.aircraft_height_ft(10600.0)), S.Node(57.0, 27.0, 70.0, 45 * S.FT_PER_M,
+                  True, 25.0, 4000.0), 132800, False)
+    q_st = S.link(S.Node(57.0, 27.0, 70.0, 45 * S.FT_PER_M, True, 25.0, 4000.0),
+                  S.Node(60.0, 27.0, 10668.0, S.aircraft_height_ft(10600.0)), 132800, False)
+    check("a 25 W station reaches FL350 better than a 10 W aircraft reaches it back", q_st[0] > q_ac[0] > 0.0,
+          f"{q_st[0]:.3f} vs {q_ac[0]:.3f}")
     n, s2 = S.Session(1, None, "", "", 0, lat=57.0, lon=27.0), \
             S.Session(2, None, "", "", 0, lat=58.0, lon=27.0)
     d = S.distance_nm(n, s2)
     check("1 degree of latitude is ~60 nm", 59.0 < d < 61.0, f"{d:.2f} nm")
+    warm = [0, 7 * 3600.0, 19500, 0.0, 102200.0, 24.0, 0.0, 0.0, 0.0, 0] + [0.0] * (P.WEATHER.size // 4 - 10)
+    warm[35] = 2.5
+    cold = list(warm)
+    cold[5] = 8.0
+    check("ducting needs warm, still weather -- and then only some hours",
+          S.ducting_from(warm) and not S.ducting_from(cold) and
+          not all(S.ducting_from(warm[:1] + [h * 3600.0] + warm[2:]) for h in range(24)))
 
     print("\ntimeout")
     stale = Client("ESOLD1", 57.85, 27.02)
@@ -378,7 +427,7 @@ def run():
             last = names
         return last
 
-    twr = Client("EETN_TWR", 57.85, 27.02, alt_ft=100.0)
+    twr = Client("EETN_TWR", 57.85, 27.02, alt_ft=100.0, agl_ft=0.0)   # a station: 0 = its facility's antenna
     inj = Client("TTRAIN_AI", 57.85, 27.02)
     check("an ATC station and an injector log in",
           login_flags(twr, "EETN_TWR", "ATC", P.LF_ATC) and login_flags(inj, "TTRAIN_AI", "ZZZZ", P.LF_INJECTOR))
@@ -433,9 +482,10 @@ def run():
     seen = traffic_now(a) or {}
     check("the station is not relayed as traffic", "EETN_TWR" not in seen and "ESNB34" in seen, str(list(seen)))
 
-    def ai_entry(local, cs, lat, lon, flags=0, squawk=4521):
+    def ai_entry(local, cs, lat, lon, flags=0, squawk=4521, agl=500.0):
         return P.TRAFFIC_ENTRY.pack(local, P.pad(cs, 16), P.pad("A320", 8), lat, lon, 500.0, 90.0, 0.0, 0.0,
-                                    70.0, 1.0, 0.0, 0, 0, 0, P.XPDR_ALT, 0, 90.0, 0.0, P.pad("", 16), squawk, 0, flags)
+                                    70.0, 1.0, 0.0, 0, 0, 0, P.XPDR_ALT, 0, 90.0, 0.0, P.pad("", 16), squawk, 0, flags,
+                                    agl)
 
     def inject(entries):
         inj.sock.sendto(P.pack(P.PT_AI_TRAFFIC, inj.sid, P.TRAFFIC_HDR.pack(len(entries), 0) + b"".join(entries)),
@@ -459,6 +509,10 @@ def run():
     check("the ATC list names the station with its frequency and position",
           "EETN_TWR" in stations and stations["EETN_TWR"][3] == FREQ and stations["EETN_TWR"][4] == P.ATC_TWR
           and P.cstr(stations["EETN_TWR"][2]) == "EETN", str({k: (v[3], v[4]) for k, v in stations.items()}))
+    e = stations.get("EETN_TWR")
+    check("...and where it transmits from and what it covers (a tower's defaults)",
+          e is not None and e[5] & P.AE_POSITION and abs(e[7] - 57.85) < 1e-9 and abs(e[8] - 27.02) < 1e-9
+          and e[10] == 45.0 and e[11] == 25 and e[12] == 4000, str(e and e[5:]))
     check("the injector is not in it", "TTRAIN_AI" not in stations)
 
     print("\nv6: an injector speaks as its aircraft")
@@ -509,7 +563,7 @@ def run():
     check("the station's answer reaches the pilot with the squawk",
           d2 is not None and d2["status"] == P.FP_ACK and d2["squawk"] == 4521 and d2["remarks"].startswith("cleared"), str(d2))
     check("other pilots do not see it", b.recv(P.PT_FLIGHTPLAN, 0.3) is None)
-    gnd = Client("EETN_GND", 57.85, 27.02, alt_ft=100.0, com1=OTHER_FREQ)
+    gnd = Client("EETN_GND", 57.85, 27.02, alt_ft=100.0, agl_ft=0.0, com1=OTHER_FREQ)
     login_flags(gnd, "EETN_GND", "ATC", P.LF_ATC)
     keep.append(gnd)
     late = gnd.recv(P.PT_FLIGHTPLAN)
@@ -565,7 +619,172 @@ def run():
     for c in (twr, inj, gnd):
         c.close()
 
+    radio_scenarios(srv, pump)
+
     for c in (a, b, far, off, mid, stale, bad):
+        c.close()
+
+
+def texts_for(c, timeout=0.4):
+    """Every text that arrives in the window, as (from, body)."""
+    out = []
+    end = time.time() + timeout
+    while time.time() < end:
+        payload = c.recv(P.PT_TEXT, max(0.01, end - time.time()))
+        if payload is None:
+            break
+        _f, _sid, frm, n, _to = P.TEXT_HDR.unpack_from(payload, 0)
+        out.append((P.cstr(frm), payload[P.TEXT_HDR.size:P.TEXT_HDR.size + n].decode()))
+    return out
+
+
+def radio_scenarios(srv, pump):
+    """The radio model end to end (docs/radio.md), well away from the Estonian
+    clients above: Innsbruck, whose apron is at 1900 ft, and the Gulf of Finland."""
+    APRON, TOWER, SEA = 121900, 120100, 123450
+    lowi_lat, lowi_lon = 47.2602, 11.3439
+    west = lambda nm: lowi_lon - nm / (60.0 * 0.678575)     # nm west along the valley at 47.26 N
+
+    print("\nradio: heights above the ground (Innsbruck, 1900 ft)")
+    ap1 = Client("OELWA1", lowi_lat, lowi_lon, alt_ft=1906.0, agl_ft=0.0, on_ground=True, com1=APRON)
+    ap2 = Client("OELWA2", lowi_lat + 0.04, lowi_lon, alt_ft=1906.0, agl_ft=0.0, on_ground=True, com1=APRON)
+    ap3 = Client("OELWA3", lowi_lat + 0.1667, lowi_lon, alt_ft=1906.0, agl_ft=0.0, on_ground=True, com1=APRON)
+    for c in (ap1, ap2, ap3):
+        c.login(); c.position()
+    pump(0.3)
+    ap1.text("Innsbruck Ground, OELWA1, radio check", APRON)
+    pump(0.3)
+    check("2.4 nm across the airport, both on the ground: heard", texts_for(ap2) != [])
+    check("10 nm down the valley: nothing -- two 3 m aerials see 7.7 nm, where 1900 ft of altitude gave 107",
+          texts_for(ap3, 0.3) == [])
+
+    print("\nradio: a tower's service volume")
+    twr = Client("LOWI_TWR", lowi_lat, lowi_lon, alt_ft=2006.0, agl_ft=0.0, on_ground=True, com1=TOWER)
+    fin = Client("OEFIN1", lowi_lat, west(10.0), alt_ft=4900.0, agl_ft=3000.0, com1=TOWER)
+    rim = Client("OERIM1", lowi_lat, west(20.0), alt_ft=1950.0, agl_ft=0.0, on_ground=True, com1=TOWER)
+    hold = Client("OEHLD1", lowi_lat, lowi_lon + 0.01, alt_ft=1906.0, agl_ft=0.0, on_ground=True, com1=TOWER)
+    twr.login(flags=P.LF_ATC)
+    for c in (fin, rim, hold):
+        c.login()
+    for c in (twr, fin, rim, hold):
+        c.position()
+    pump(0.3)
+    twr.text("OEFIN1, wind calm, runway 26 cleared to land", TOWER)
+    pump(0.3)
+    check("the tower reaches a 10 nm final at 3000 ft", texts_for(fin) != [])
+    check("and an aircraft on the ground 20 nm out: past the horizon (18.9 nm), inside its 25 nm",
+          texts_for(rim) != [])
+    texts_for(hold, 0.2)
+    fin.text("cleared to land 26, OEFIN1", TOWER)
+    pump(0.3)
+    check("the final reaches the tower back", any(f == "OEFIN1" for f, _ in texts_for(twr)))
+    texts_for(hold, 0.2)
+    rim.text("OERIM1, request taxi", TOWER)
+    pump(0.3)
+    check("so does the one on the ground 20 nm out", any(f == "OERIM1" for f, _ in texts_for(twr)))
+    check("but the service volume is the station's: a pilot on the ground at the airport does not hear it",
+          not any(f == "OERIM1" for f, _ in texts_for(hold, 0.3)))
+
+    print("\nradio: FL350 and a ground station")
+    hi = Client("DLH4AB", lowi_lat + 3.5, lowi_lon, alt_ft=35000.0, agl_ft=34000.0, com1=TOWER)     # 210 nm north
+    hi2 = Client("DLH4AC", lowi_lat + 4.4, lowi_lon, alt_ft=35000.0, agl_ft=34000.0, com1=TOWER)    # 264 nm north
+    for c in (hi, hi2):
+        c.login(); c.position()
+    twr.position()
+    pump(0.3)
+    twr.text("DLH4AB, Innsbruck Tower, read you", TOWER)
+    pump(0.3)
+    check("a ground station reaches FL350 210 nm away (the horizon is ~240 nm)", texts_for(hi) != [])
+    check("but not 264 nm away", texts_for(hi2, 0.3) == [])
+    hi.text("Innsbruck Tower, DLH4AB, FL350", TOWER)
+    pump(0.3)
+    check("and FL350 reaches the station back", any(f == "DLH4AB" for f, _ in texts_for(twr)))
+
+    print("\nradio: v5 clients (XRadio 0.5) still fly")
+    old = Client("OELWB1", lowi_lat + 0.01, lowi_lon, alt_ft=1906.0, on_ground=True, com1=APRON, proto=5)
+    check("a v5 client logs in", old.login() != 0)
+    old.position(); ap1.position()
+    pump(0.4)
+    kinds, versions, entries_ok, saw_ap1 = set(), set(), True, False
+    end = time.time() + 1.2
+    while time.time() < end:
+        got = old.recv_any(max(0.01, end - time.time()))
+        if got is None:
+            break
+        ptype, version, payload = got
+        kinds.add(ptype); versions.add(version)
+        if ptype == P.PT_TRAFFIC:
+            count, _ = P.TRAFFIC_HDR.unpack_from(payload, 0)
+            entries_ok &= len(payload) == P.TRAFFIC_HDR.size + count * P.TRAFFIC_ENTRY_V5.size
+            for k in range(count):
+                if P.cstr(P.TRAFFIC_ENTRY_V5.unpack_from(payload, P.TRAFFIC_HDR.size + k * 108)[1]) == "OELWA1":
+                    saw_ap1 = True
+    check("everything it is sent carries a v5 header", versions == {5}, str(versions))
+    check("its traffic comes in 108-byte v5 entries, with the v6 pilot next door in it",
+          P.PT_TRAFFIC in kinds and entries_ok and saw_ap1)
+    check("and none of v6's own packets (the ATC list)", P.PT_ATC_LIST not in kinds, str(kinds))
+    ap1.text("OELWA1, taxiing to 26", APRON)
+    pump(0.3)
+    check("it hears a v6 pilot 0.6 nm away", texts_for(old) != [])
+    old.text("OELWB1, roger", APRON)
+    pump(0.3)
+    check("and the v6 pilot hears it", any(f == "OELWB1" for f, _ in texts_for(ap1)))
+    sess = next((x for x in srv.sessions.values() if x.callsign == "OELWB1"), None)
+    check("it sends no height above the ground, so on the ground it counts 0 above it",
+          sess is not None and not sess.agl_known and sess.radio_agl_m == 0.0)
+    far5 = Client("OELWB2", lowi_lat + 0.1667, lowi_lon, alt_ft=1906.0, on_ground=True, com1=APRON, proto=5)
+    far5.login(); far5.position()
+    pump(0.3)
+    ap1.text("OELWA1, anyone down the valley?", APRON)
+    pump(0.3)
+    check("so a v5 client 10 nm down the valley is as far out of reach as a v6 one", texts_for(far5, 0.3) == [])
+    up5 = Client("OELWB3", lowi_lat + 1.0, lowi_lon, alt_ft=9000.0, com1=APRON, proto=5)     # 60 nm, airborne
+    up5.login(); up5.position()
+    pump(0.3)
+    sess = next((x for x in srv.sessions.values() if x.callsign == "OELWB3"), None)
+    check("one in the air counts its altitude, as every version before v6 did",
+          sess is not None and abs(sess.radio_agl_m - 9000.0 / 3.28084) < 0.01)
+    v4 = Client("OELWB4", lowi_lat, lowi_lon, proto=4)
+    v4.sock.sendto(P.pack(P.PT_LOGIN, 0, P.login("OELWB4", "C172", version=4), 4), v4.dest)
+    got = v4.recv_any()
+    check("a v4 client is still told the versions differ, in a v4 header it can read",
+          got is not None and got[0] == P.PT_LOGIN_REJECT and got[1] == 4
+          and P.LOGIN_REJECT.unpack_from(got[2], 0)[0] == P.RJ_VERSION, str(got and got[:2]))
+
+    print("\nradio: tropospheric ducting (a server switch, off by default)")
+    sea1 = Client("ESSEA1", 59.60, 22.00, alt_ft=500.0, com1=SEA)
+    sea2 = Client("ESSEA2", 59.60, 24.635, alt_ft=500.0, com1=SEA)          # 80 nm east, both at 500 ft
+    for c in (sea1, sea2):
+        c.login(); c.position()
+    pump(0.3)
+    sea1.text("ESSEA1 over the Gulf", SEA)
+    pump(0.3)
+    check("80 nm apart at 500 ft: past the horizon (56 nm), nothing", texts_for(sea2, 0.3) == [])
+    srv.ducting_enabled = True
+    srv._weather_sid = 0                         # whoever held the sky in the sections above has gone quiet
+    wx = Client("ESWXD1", 59.60, 23.30, alt_ft=500.0, com1=SEA)
+    wx.sock.sendto(P.pack(P.PT_LOGIN, 0, P.login("ESWXD1", "C172", flags=P.LF_WEATHER_SOURCE)), wx.dest)
+    pkt = wx.recv(P.PT_LOGIN_ACK)
+    wx.sid = P.LOGIN_ACK.unpack_from(pkt, 0)[0] if pkt else 0
+    warm = [0, 7 * 3600.0, 19500, 10.0, 102200.0, 24.0, 0.0, 0.0, 0.0, 0] + [0.0] * (P.WEATHER.size // 4 - 10)
+    warm[35] = 2.5
+    wx.send(P.PT_WEATHER, P.WEATHER.pack(*warm))
+    pump(0.3)
+    check("warm, still weather at a ducting hour: the flight has a duct", srv.ducting)
+    lst = sea2.recv(P.PT_ATC_LIST, 1.0)
+    check("and the ATC list tells every radio", lst is not None and P.ATC_LIST_HDR.unpack_from(lst, 0)[1] & P.AL_DUCTING)
+    for c in (sea1, sea2, wx):
+        c.position()
+    pump(0.2)
+    sea1.text("ESSEA1 over the Gulf, anyone?", SEA)
+    pump(0.3)
+    check("now 80 nm over the sea gets through", texts_for(sea2) != [])
+    wx.send(P.PT_LOGOUT)
+    pump(0.3)
+    check("the sky's source leaving ends it", not srv.ducting)
+    srv.ducting_enabled = False
+
+    for c in (ap1, ap2, ap3, twr, fin, rim, hold, hi, hi2, old, far5, up5, v4, sea1, sea2, wx):
         c.close()
 
 

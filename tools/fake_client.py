@@ -104,7 +104,7 @@ def run(args):
                 for _ in range(count):
                     e = P.TRAFFIC_ENTRY.unpack_from(payload, off)
                     off += P.TRAFFIC_ENTRY.size
-                    names.append(f"{P.cstr(e[1])}@{e[5] * 3.28084:.0f}ft"
+                    names.append(f"{P.cstr(e[1])}@{e[5] * 3.28084:.0f}ft/{e[23] * 3.28084:.0f}agl"
                                  + ("[TX]" if e[14] else ""))
                 if names:
                     print(f"  traffic: {', '.join(names)}")
@@ -285,7 +285,12 @@ def run(args):
                 0.0,                                        # vsMs
                 me["squawk"],                               # squawk
                 args.xpdr,                                  # xpdrMode
-                0)), dest)                                  # xpdrIdent
+                0,                                          # xpdrIdent
+                # v6, the radio model: height above the ground (flat country at sea
+                # level unless --agl-ft says), or a station's antenna (0: its facility's)
+                (args.agl_ft / 3.28084) if args.agl_ft is not None
+                else (0.0 if args.atc or me["on_ground"] else alt_m),
+                args.svc_range, args.svc_ceiling)), dest)
 
             # v6: an injector drives a row of aircraft east of itself
             if args.inject:
@@ -295,7 +300,7 @@ def run(args):
                         i, P.pad(f"AI{i:03d}", 16), P.pad("A320", 8), lat, lon + 0.01 * i, alt_m + 100.0 * i,
                         me["hdg"], 0.0, 0.0, gs_ms, 1.0, 0.0, 0, 0, 0, P.XPDR_ALT,
                         int(time.monotonic() * 1000) & 0xFFFFFFFF, me["hdg"], 0.0, P.pad("", 16),
-                        2000 + i, 0, 0))
+                        2000 + i, 0, 0, alt_m + 100.0 * i))      # v6: height above the (flat) ground
                     if len(entries) == P.MAX_TRAFFIC_ENTRIES or i == args.inject:
                         sock.sendto(P.pack(P.PT_AI_TRAFFIC, sid, P.TRAFFIC_HDR.pack(len(entries), 0)
                                            + b"".join(entries)), dest)
@@ -363,6 +368,13 @@ if __name__ == "__main__":
                          "(FILE, or - for stdin). "
                          "In say TEXT, {squawk} {climb} {fl} {rwy} {sid} are filled from the last text received")
     ap.add_argument("--on-ground", action="store_true", help="report on the ground (a parked or taxiing aircraft)")
+    ap.add_argument("--agl-ft", type=float, default=None,
+                    help="height above the ground to report (default: the altitude, 0 on the ground); "
+                         "with --atc the station's antenna above the terrain around it (default 0: its facility's)")
+    ap.add_argument("--svc-range", type=int, default=0, metavar="NM",
+                    help="with --atc: the service volume's radius (default 0: its facility's, e.g. 25 for a tower)")
+    ap.add_argument("--svc-ceiling", type=int, default=0, metavar="FT",
+                    help="with --atc: how high it reaches above the station (default 0: its facility's)")
     ap.add_argument("--direct", default="", metavar="'CALLSIGN message'",
                     help="send one direct message after logging in")
     run(ap.parse_args())

@@ -11,6 +11,7 @@
 #include "mathconst.h"
 #include "net.h"
 #include "protocol.h"
+#include "radio.h"
 
 #include <atomic>
 #include <algorithm>
@@ -59,8 +60,19 @@ struct Session {
     uint32_t owner = 0;              // ...and this is the injector it belongs to
     std::vector<uint8_t> fp;         // a pilot's latest flight plan, as it will be relayed
     std::map<std::string, char> atisSeen;   // icao -> letter already sent to this pilot
+    uint8_t  kind = ATC_OTHER;       // a station's facility, from its callsign
+    uint16_t proto = kProtoVersion;  // what the client speaks: a v5 one gets v5 packets
+    // v6: the radio model (docs/radio.md)
+    float    aglM = 0.f;             // height above the terrain as reported (a station: its antenna)
+    bool     aglKnown = false;       // the report carried it; a v5-sized one does not
+    uint16_t svcRangeNm = 0;         // a station's service volume as it asked, 0 = by facility
+    uint16_t svcCeilingFt = 0;
 
     double altFt() const { return (double)altM * 3.28084; }
+    // The height above the ground the radio counts for this aircraft.
+    double radioAglM() const {
+        return radio::effectiveAglM(aglKnown, (double)aglM, onGround != 0, (double)altM);
+    }
 
     bool listeningOn(uint32_t freqKhz) const {
         if (freqKhz == 0) return false;
@@ -99,25 +111,38 @@ void padInto(char* dst, size_t size, const std::string& s) {
 }
 
 double distanceNm(const Session& a, const Session& b) {
-    const double rNm = 3440.065;
-    const double p1 = a.lat * kPi / 180.0, p2 = b.lat * kPi / 180.0;
-    const double dp = p2 - p1;
-    const double dl = (b.lon - a.lon) * kPi / 180.0;
-    const double h = std::sin(dp / 2) * std::sin(dp / 2) +
-                     std::cos(p1) * std::cos(p2) * std::sin(dl / 2) * std::sin(dl / 2);
-    return 2 * rNm * std::asin(std::min(1.0, std::sqrt(h)));
+    return radio::distanceNm(a.lat, a.lon, b.lat, b.lon);
 }
 
-// VHF line-of-sight horizon, 1.23 * (sqrt(h1_ft) + sqrt(h2_ft)), with a floor
-// so two aircraft on the same apron can still talk.
-double radioRangeNm(const Session& a, const Session& b) {
-    const double los = 1.23 * (std::sqrt(std::max(0.0, a.altFt())) +
-                               std::sqrt(std::max(0.0, b.altFt())));
-    return std::max(15.0, los);
+// A station's antenna height (m), service radius (nm) and ceiling (ft): what
+// it sent, or its facility's defaults. server.py's station_radio().
+radio::StationDefaults stationRadio(const Session& s) {
+    radio::StationDefaults r = radio::stationDefaults(s.kind);
+    if (s.aglKnown && s.aglM > 0.f) r.antennaM = (double)s.aglM;
+    if (s.svcRangeNm > 0) r.rangeNm = (double)s.svcRangeNm;
+    if (s.svcCeilingFt > 0) r.ceilingFt = (double)s.svcCeilingFt;
+    return r;
 }
 
-bool inRadioRange(const Session& a, const Session& b) {
-    return distanceNm(a, b) <= radioRangeNm(a, b);
+// The radio model's view of a session (radio.h; server.py's node_of()).
+radio::Node nodeOf(const Session& s) {
+    radio::Node n;
+    n.lat = s.lat; n.lon = s.lon; n.altMslM = (double)s.altM;
+    if (s.atc) {
+        const radio::StationDefaults st = stationRadio(s);
+        n.heightFt = st.antennaM * radio::kFtPerM;
+        n.atc = true; n.rangeNm = st.rangeNm; n.ceilingFt = st.ceilingFt;
+    } else {
+        n.heightFt = radio::aircraftHeightFt(s.radioAglM());
+    }
+    return n;
+}
+
+// Whether `rx` receives what `tx` sends on `freqKhz`: the model's quality
+// above nothing -- inside the horizon worked out from both heights above the
+// ground, or inside a station's service volume.
+bool inRadioRange(const Session& tx, const Session& rx, uint32_t freqKhz, bool ducting) {
+    return radio::link(nodeOf(tx), nodeOf(rx), freqKhz, ducting).quality > 0.0;
 }
 
 bool finite(float v) { return std::isfinite(v); }
@@ -173,13 +198,20 @@ public:
     // Called for every datagram the server wants to send.
     using Sink = void (*)(void* ctx, const Peer& to, const void* data, int len);
 
-    Core(Sink sink, void* ctx, std::string password)
-        : sink_(sink), ctx_(ctx), password_(std::move(password)) {}
+    // `ducting`: the realism switch (docs/radio.md) -- the flight's weather may
+    // then bring tropospheric ducting. Off unless whoever runs the server asks.
+    Core(Sink sink, void* ctx, std::string password, bool ducting = false)
+        : sink_(sink), ctx_(ctx), password_(std::move(password)), ductingEnabled_(ducting) {}
 
     void onPacket(const Peer& from, const uint8_t* data, int len, double now);
     void tick(double now);
 
     int  clientCount() const { return (int)sessions_.size(); }
+    // The realism switch, while running. Off takes the duct away at once.
+    void setDuctingEnabled(bool on) {
+        if (!on) setDucting(false);
+        ductingEnabled_ = on;
+    }
     std::vector<std::string> callsigns() const {
         std::vector<std::string> out;
         for (const auto& kv : sessions_) out.push_back(kv.second.callsign);
@@ -189,10 +221,12 @@ public:
     uint64_t sent() const { return sent_; }
 
 private:
+    // `version` 0: the header version the receiver speaks (a v5 client drops
+    // a packet with any other in it).
     void send(const Peer& to, uint8_t type, uint32_t sid,
-              const void* payload = nullptr, int payloadLen = 0);
+              const void* payload = nullptr, int payloadLen = 0, uint8_t version = 0);
 
-    void onLogin(const Peer& from, const uint8_t* p, int len, double now);
+    void onLogin(const Peer& from, const uint8_t* p, int len, double now, uint8_t version);
     void onPosition(Session& s, const uint8_t* p, int len);
     void onText(Session& s, const uint8_t* p, int len);
     void onWeather(Session& s, const uint8_t* p, int len);
@@ -213,10 +247,13 @@ private:
     void broadcastRoster(double now);
     void drop(const Peer& peer);
     void forget(const Session& s);      // what goes with a session: its aircraft, its ATIS
+    void setDucting(bool on);
 
     Sink     sink_;
     void*    ctx_;
     std::string password_;              // empty: open to all
+    bool     ductingEnabled_ = false;   // the realism switch
+    bool     ducting_ = false;          // ...and the flight's air, ducting right now
     std::map<Peer, Session> sessions_;
     uint32_t nextSid_ = 1;
     // v6. The aircraft injectors drive, by flight-wide id; the ATIS on the air,
@@ -246,14 +283,18 @@ private:
 };
 
 void Core::send(const Peer& to, uint8_t type, uint32_t sid,
-                const void* payload, int payloadLen) {
+                const void* payload, int payloadLen, uint8_t version) {
     uint8_t buf[kMaxPacket];
     if (payloadLen < 0 || (size_t)payloadLen + sizeof(Header) > sizeof(buf)) return;
+    if (version == 0) {
+        auto it = sessions_.find(to);
+        version = (uint8_t)(it != sessions_.end() ? it->second.proto : kProtoVersion);
+    }
 
     Header h{};
     h.magic      = kMagic;
     h.type       = type;
-    h.version    = (uint8_t)kProtoVersion;
+    h.version    = version;
     h.payloadLen = (uint16_t)payloadLen;
     h.sessionId  = sid;
     memcpy(buf, &h, sizeof(h));
@@ -270,13 +311,13 @@ void Core::onPacket(const Peer& from, const uint8_t* data, int len, double now) 
     Header h{};
     memcpy(&h, data, sizeof(h));
     if (h.magic != kMagic) return;
-    if (h.version != kProtoVersion) {
-        // A login from another version is told why it gets nowhere; the
-        // header is the same in every version, so the reply can be read.
+    if (h.version < kMinProtoVersion || h.version > kProtoVersion) {
+        // A login from another version is told why it gets nowhere, in its
+        // own header version -- an older client drops any other.
         if (h.type == PT_LOGIN) {
             LoginRejectPayload rj{};
             rj.reason = RJ_VERSION;
-            send(from, PT_LOGIN_REJECT, 0, &rj, (int)sizeof(rj));
+            send(from, PT_LOGIN_REJECT, 0, &rj, (int)sizeof(rj), h.version);
         }
         return;
     }
@@ -287,14 +328,15 @@ void Core::onPacket(const Peer& from, const uint8_t* data, int len, double now) 
     const int avail = len - (int)sizeof(Header);
     if ((int)h.payloadLen != avail) return;
 
-    if (h.type == PT_LOGIN) { onLogin(from, payload, avail, now); return; }
+    if (h.type == PT_LOGIN) { onLogin(from, payload, avail, now, h.version); return; }
 
     auto it = sessions_.find(from);
     if (it == sessions_.end()) return;      // everything else needs a login first
     Session& s = it->second;
     // The session id only ever goes to the address that logged in, so
-    // requiring it here means an off-path spoofer has to guess it first.
-    if (h.sessionId != s.sid) return;
+    // requiring it here means an off-path spoofer has to guess it first. And a
+    // session speaks the one version it logged in with.
+    if (h.sessionId != s.sid || h.version != s.proto) return;
     s.lastSeen = now;
 
     switch (h.type) {
@@ -336,11 +378,15 @@ void Core::onAiTraffic(Session& s, const uint8_t* p, int len, double now) {
     int off = (int)sizeof(th);
     int mine = 0;
     for (const auto& kv : ai_) if (kv.second.owner == s.sid) ++mine;
+    // v6 entries carry the aircraft's height above the ground at their end;
+    // an injector that predates it sends them 108 bytes long.
+    const bool v6 = len - off >= (int)th.count * (int)sizeof(TrafficEntry);
+    const int esize = v6 ? (int)sizeof(TrafficEntry) : kTrafficEntrySizeV5;
     for (int i = 0; i < th.count; ++i) {
-        if (off + (int)sizeof(TrafficEntry) > len) break;
+        if (off + esize > len) break;
         TrafficEntry e{};
-        memcpy(&e, p + off, sizeof(e));
-        off += (int)sizeof(e);
+        memcpy(&e, p + off, (size_t)esize);
+        off += esize;
         const uint16_t local = (uint16_t)(e.sessionId & 0xFFFFu);
         if (local == 0) continue;
         const uint32_t sid = aiSid(s.sid, local);
@@ -356,6 +402,8 @@ void Core::onAiTraffic(Session& s, const uint8_t* p, int len, double now) {
             !finite(e.trackTrue) || !finite(e.vsMs)) continue;
         if (e.vsMs < -200.f || e.vsMs > 200.f) continue;
         if (e.gsMs < 0.f || e.gsMs > 1500.f) continue;
+        const float aglM = v6 ? e.aglM : 0.f;
+        if (!finite(aglM) || aglM < -1000.f || aglM > 40000.f) continue;
 
         auto it = ai_.find(sid);
         if (it == ai_.end()) {
@@ -381,6 +429,7 @@ void Core::onAiTraffic(Session& s, const uint8_t* p, int len, double now) {
         a.livery = clean(e.livery, sizeof(e.livery), 15);
         a.squawk = validSquawk(e.squawk) ? e.squawk : 0;
         a.xpdrIdent = e.xpdrIdent ? 1 : 0;
+        a.aglM = aglM; a.aglKnown = v6;
         a.hasPosition = true;
         a.lastSeen = now;
     }
@@ -399,7 +448,8 @@ void Core::onFlightPlan(Session& s, const uint8_t* p, int len) {
         fp.sessionId = target->sid;
         padInto(fp.callsign, sizeof(fp.callsign), target->callsign);
         target->fp.assign((const uint8_t*)&fp, (const uint8_t*)&fp + sizeof(fp));
-        send(target->peer, PT_FLIGHTPLAN, target->sid, &fp, (int)sizeof(fp));
+        if (target->proto >= 6)                  // a v5 client has no flight plans
+            send(target->peer, PT_FLIGHTPLAN, target->sid, &fp, (int)sizeof(fp));
         for (auto& kv : sessions_) {
             if (kv.second.atc && kv.second.sid != s.sid)
                 send(kv.first, PT_FLIGHTPLAN, kv.second.sid, &fp, (int)sizeof(fp));
@@ -458,7 +508,7 @@ void Core::onAtis(Session& s, const uint8_t* p, int len) {
 
 // Send a pilot the ATIS of every frequency they have just tuned.
 void Core::offerAtis(Session& s) {
-    if (s.ai || s.injector) return;
+    if (s.ai || s.injector || s.proto < 6) return;
     for (auto& kv : atis_) {
         const Atis& a = kv.second;
         if (a.owner == s.sid) continue;
@@ -470,8 +520,9 @@ void Core::offerAtis(Session& s) {
     }
 }
 
-// The stations online and the ATIS frequencies, to everyone. Ordered by
-// session so both servers produce the same bytes.
+// The stations online and the ATIS frequencies, to everyone -- and whether
+// the flight's air is ducting tonight. Ordered by session so both servers
+// produce the same bytes. A v5 client has no such list.
 void Core::broadcastAtcList(double now) {
     lastAtc_ = now;
     atcDirty_ = false;
@@ -491,13 +542,27 @@ void Core::broadcastAtcList(double now) {
         off += sizeof(e);
         ++count;
     };
+    // Where it transmits from and what it covers: what the server routes by,
+    // so a pilot's radio can work out the same signal (docs/radio.md).
+    auto radioInto = [](AtcEntry& e, const Session* where, double antennaM, double rangeNm, double ceilingFt) {
+        const bool has = where && where->hasPosition;
+        e.flags = has ? AE_POSITION : 0;
+        e.lat = has ? where->lat : 0.0;
+        e.lon = has ? where->lon : 0.0;
+        e.altMslM = has ? where->altM : 0.f;
+        e.antennaM = (float)antennaM;
+        e.rangeNm = (uint16_t)std::min(65535.0, rangeNm);
+        e.ceilingFt = (uint16_t)std::min(65535.0, ceilingFt);
+    };
     for (const Session* s : stations) {
         AtcEntry e{};
         e.sessionId = s->sid;
         padInto(e.callsign, sizeof(e.callsign), s->callsign);
         padInto(e.icao, sizeof(e.icao), atcIcao(s->callsign));
         e.freqKhz = s->com1;
-        e.kind = atcKind(s->callsign);
+        e.kind = s->kind;
+        const radio::StationDefaults st = stationRadio(*s);
+        radioInto(e, s, st.antennaM, st.rangeNm, st.ceilingFt);
         put(e);
     }
     for (const auto& kv : atis_) {                 // std::map: sorted by icao, like Python's sorted()
@@ -507,24 +572,28 @@ void Core::broadcastAtcList(double now) {
         padInto(e.icao, sizeof(e.icao), kv.first);
         e.freqKhz = kv.second.freq;
         e.kind = ATC_ATIS;
+        const Session* owner = bySid(kv.second.owner);
+        const radio::StationDefaults atis = radio::stationDefaults(ATC_ATIS);
+        radioInto(e, owner, owner ? stationRadio(*owner).antennaM : atis.antennaM, atis.rangeNm, atis.ceilingFt);
         put(e);
     }
     AtcListHeader lh{};
     lh.count = (uint16_t)count;
+    lh.flags = ducting_ ? AL_DUCTING : 0;
     memcpy(payload, &lh, sizeof(lh));
     for (const auto& kv : sessions_) {
-        send(kv.first, PT_ATC_LIST, kv.second.sid, payload, (int)off);
+        if (kv.second.proto >= 6) send(kv.first, PT_ATC_LIST, kv.second.sid, payload, (int)off);
     }
 }
 
-void Core::onLogin(const Peer& from, const uint8_t* p, int len, double now) {
+void Core::onLogin(const Peer& from, const uint8_t* p, int len, double now, uint8_t version) {
     if (len < (int)sizeof(LoginPayload)) return;
     LoginPayload lp{};
     memcpy(&lp, p, sizeof(lp));
-    if (lp.protoVer != kProtoVersion) {
+    if (lp.protoVer != version || lp.protoVer < kMinProtoVersion || lp.protoVer > kProtoVersion) {
         LoginRejectPayload rj{};
         rj.reason = RJ_VERSION;
-        send(from, PT_LOGIN_REJECT, 0, &rj, (int)sizeof(rj));
+        send(from, PT_LOGIN_REJECT, 0, &rj, (int)sizeof(rj), version);
         return;
     }
     if (!password_.empty()) {
@@ -533,10 +602,11 @@ void Core::onLogin(const Peer& from, const uint8_t* p, int len, double now) {
         if (given != password_) {
             LoginRejectPayload rj{};
             rj.reason = RJ_PASSWORD;
-            send(from, PT_LOGIN_REJECT, 0, &rj, (int)sizeof(rj));
+            send(from, PT_LOGIN_REJECT, 0, &rj, (int)sizeof(rj), version);
             return;
         }
     }
+    if (lp.protoVer < 6) lp.flags &= LF_WEATHER_SOURCE;   // the station and injector bits are v6's
 
     std::string callsign = clean(lp.callsign, sizeof(lp.callsign), 15);
     std::string acIcao   = clean(lp.acIcao,   sizeof(lp.acIcao),   7);
@@ -559,6 +629,8 @@ void Core::onLogin(const Peer& from, const uint8_t* p, int len, double now) {
     s.weatherSource = (lp.flags & LF_WEATHER_SOURCE) != 0;
     s.atc      = (lp.flags & LF_ATC) != 0;
     s.injector = (lp.flags & LF_INJECTOR) != 0;
+    s.proto    = lp.protoVer;
+    s.kind     = s.atc ? atcKind(s.callsign) : (uint8_t)ATC_OTHER;
     s.lastSeen = now;
     const uint32_t sid = s.sid;
     sessions_[from] = s;
@@ -581,9 +653,12 @@ void Core::onLogin(const Peer& from, const uint8_t* p, int len, double now) {
 }
 
 void Core::onPosition(Session& s, const uint8_t* p, int len) {
-    if (len < (int)sizeof(PositionPayload)) return;
+    // v6 adds the radio model's fields at the end; a v5-sized report is still
+    // a position, its height above the ground then unknown.
+    if (len < kPositionSizeV5) return;
+    const bool v6 = len >= (int)sizeof(PositionPayload);
     PositionPayload pp{};
-    memcpy(&pp, p, sizeof(pp));
+    memcpy(&pp, p, v6 ? sizeof(pp) : (size_t)kPositionSizeV5);
 
     // A client can send anything. NaN or a wild coordinate would be relayed to
     // everyone else and poison their renderer, and it breaks the distance
@@ -596,8 +671,15 @@ void Core::onPosition(Session& s, const uint8_t* p, int len) {
         !finite(pp.trackTrue) || !finite(pp.vsMs)) return;
     if (pp.vsMs < -200.f || pp.vsMs > 200.f) return;
     if (pp.gsMs < 0.f || pp.gsMs > 1500.f) return;
+    if (!finite(pp.aglM) || pp.aglM < -1000.f || pp.aglM > 40000.f) return;
 
+    // the list says where a station is and what it covers
+    if (s.atc && (!s.hasPosition || s.aglM != pp.aglM || s.aglKnown != v6 ||
+                  s.svcRangeNm != pp.svcRangeNm || s.svcCeilingFt != pp.svcCeilingFt))
+        atcDirty_ = true;
     s.lat = pp.lat; s.lon = pp.lon; s.altM = pp.altMslM;
+    s.aglM = pp.aglM; s.aglKnown = v6;
+    s.svcRangeNm = pp.svcRangeNm; s.svcCeilingFt = pp.svcCeilingFt;
     s.heading = wrap360(pp.headingTrue);
     s.pitch = pp.pitch; s.roll = pp.roll;
     s.gsMs = pp.gsMs;
@@ -750,7 +832,7 @@ std::vector<Session*> Core::listeners(const Session& sender, uint32_t freqKhz) {
         if (peer.sid == sender.sid) continue;
         if (sender.ai && peer.sid == sender.owner) continue;   // the program driving it said it; it knows
         if (!guard && !peer.listeningOn(freqKhz)) continue;
-        if (sender.hasPosition && peer.hasPosition && !inRadioRange(sender, peer)) {
+        if (sender.hasPosition && peer.hasPosition && !inRadioRange(sender, peer, freqKhz, ducting_)) {
             continue;
         }
         out.push_back(&peer);
@@ -769,6 +851,18 @@ void Core::onWeather(Session& s, const uint8_t* p, int len) {
         if (kv.second.sid == s.sid) continue;
         send(kv.first, PT_WEATHER, kv.second.sid, p, len);
     }
+    if (ductingEnabled_) {
+        WeatherPayload w{};
+        memcpy(&w, p, sizeof(w));
+        setDucting(radio::ductingFrom(w));
+    }
+}
+
+// The flight's air, ducting or not; the ATC list carries it to every radio at once.
+void Core::setDucting(bool on) {
+    if (on == ducting_) return;
+    ducting_ = on;
+    atcDirty_ = true;
 }
 
 // v6: what goes with a session when it goes -- its aircraft, its ATIS.
@@ -791,7 +885,8 @@ void Core::forget(const Session& s) {
 void Core::drop(const Peer& peer) {
     auto it = sessions_.find(peer);
     if (it == sessions_.end()) return;
-    if (it->second.sid == weatherSid_) weatherSid_ = 0;
+    // with no shared sky, nothing says the air is layered
+    if (it->second.sid == weatherSid_) { weatherSid_ = 0; setDucting(false); }
     forget(it->second);
     sessions_.erase(it);
     rosterDirty_ = true;
@@ -800,7 +895,7 @@ void Core::drop(const Peer& peer) {
 void Core::reap(double now) {
     for (auto it = sessions_.begin(); it != sessions_.end();) {
         if (now - it->second.lastSeen > kSessionTimeoutS) {
-            if (it->second.sid == weatherSid_) weatherSid_ = 0;
+            if (it->second.sid == weatherSid_) { weatherSid_ = 0; setDucting(false); }
             forget(it->second);
             it = sessions_.erase(it);
             rosterDirty_ = true;
@@ -904,9 +999,14 @@ void Core::broadcastTraffic(double now) {
 // that promises more than it carries is how a receiver ends up reading a
 // neighbouring aircraft's bytes as a position.
 void Core::sendTraffic(Session& me, const std::vector<Session*>& others, double now) {
-  for (size_t first = 0; first == 0 || first < others.size();
-       first += (size_t)kMaxEntriesPerPacket) {
-    const size_t n = std::min((size_t)kMaxEntriesPerPacket, others.size() - first);
+  // A v6 receiver gets each aircraft's height above the ground as well -- the
+  // one its radio is routed by, so its own model agrees; a v5 one gets the
+  // entries it knows, which are shorter.
+  const bool v6 = me.proto >= 6;
+  const size_t esize = v6 ? sizeof(TrafficEntry) : (size_t)kTrafficEntrySizeV5;
+  const size_t per = (size_t)(v6 ? kMaxEntriesPerPacket : kMaxTrafficEntriesV5);
+  for (size_t first = 0; first == 0 || first < others.size(); first += per) {
+    const size_t n = std::min(per, others.size() - first);
     uint8_t payload[kMaxPacket];
     TrafficHeader th{};
     th.count = (uint16_t)n;
@@ -933,10 +1033,11 @@ void Core::sendTraffic(Session& me, const std::vector<Session*>& others, double 
         e.timeMs = o->timeMs; e.trackTrue = o->track; e.vsMs = o->vsMs;
         padInto(e.livery, sizeof(e.livery), o->livery);
         e.squawk = o->squawk; e.xpdrIdent = o->xpdrIdent; e.reserved = 0;
+        e.aglM = (float)o->radioAglM();
 
-        if (off + sizeof(e) > sizeof(payload)) break;
-        memcpy(payload + off, &e, sizeof(e));
-        off += sizeof(e);
+        if (off + esize > sizeof(payload)) break;
+        memcpy(payload + off, &e, esize);
+        off += esize;
     }
     send(me.peer, PT_TRAFFIC, me.sid, payload, (int)off);
   }
@@ -953,6 +1054,7 @@ std::atomic<bool> g_run{false};
 std::mutex        g_statusMx;
 Status            g_status;
 std::string       g_password;
+std::atomic<bool> g_ducting{false};
 
 double nowSeconds() {
     static const auto t0 = std::chrono::steady_clock::now();
@@ -964,7 +1066,7 @@ void sinkFn(void*, const Peer& to, const void* data, int len) {
 }
 
 void serverThread() {
-    Core core(sinkFn, nullptr, g_password);
+    Core core(sinkFn, nullptr, g_password, g_ducting.load());
     uint8_t buf[kMaxPacket];
     uint64_t in = 0;
     double lastStatus = 0;
@@ -979,6 +1081,7 @@ void serverThread() {
             ++in;
             core.onPacket(from, buf, n, now);
         }
+        core.setDuctingEnabled(g_ducting.load());
         core.tick(now);
 
         if (now - lastStatus > 0.5) {
@@ -994,9 +1097,10 @@ void serverThread() {
 
 }  // namespace
 
-bool start(uint16_t port, const std::string& password, std::string* err) {
+bool start(uint16_t port, const std::string& password, std::string* err, bool ducting) {
     stop();
     g_password = password;
+    g_ducting.store(ducting);
     std::string e;
     if (!g_sock.open(port, "", &e)) {
         if (err) *err = e;
@@ -1027,6 +1131,8 @@ void stop() {
 }
 
 bool running() { return g_run.load(); }
+
+void setDucting(bool on) { g_ducting.store(on); }
 
 Status status() {
     std::lock_guard<std::mutex> lk(g_statusMx);

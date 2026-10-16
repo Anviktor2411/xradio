@@ -342,6 +342,9 @@ void drawHost(Model& m, const Actions& a) {
     char pw[64]; snprintf(pw, sizeof pw, "%s", e.password.c_str());
     if (ImGui::InputText(tr("Password"), pw, sizeof pw, ImGuiInputTextFlags_Password)) { e.password = pw; g_st.editDirty = true; }
     if (ImGui::Checkbox(tr("Ask the router to open the port"), &e.hostUpnp)) g_st.editDirty = true;
+    if (ImGui::Checkbox(tr("Rare tropospheric ducting (realism)"), &e.hostDucting)) g_st.editDirty = true;
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("%s", tr("On a warm, still evening the flight's shared weather may let VHF reach far past the horizon over the sea"));
     const HostInfo& h = m.host;
     if (h.running) {
         ImGui::TextColored(p.ok, "%s: %s %u  ·  %d %s", tr("Running"), tr("Port"), h.port, h.clients, tr("connected"));

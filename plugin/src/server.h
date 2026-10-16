@@ -7,8 +7,9 @@
 //
 // This is a line-for-line port of server/server.py. The Python server is
 // still the one to run on a machine that should stay up without X-Plane
-// open; both are held to the same test suite (tools/test_server.py runs
-// against either), so their behaviour cannot drift apart.
+// open; both are held to the same test suite (tools/test_server_parity.py runs
+// against both) and route radio by the same model (radio.h), so their
+// behaviour cannot drift apart.
 #pragma once
 
 #include <cstdint>
@@ -56,10 +57,14 @@ struct Status {
 
 // Starts the listener and its own thread. Returns false (and fills `err`) if
 // the port cannot be bound -- almost always something else already on it.
-// `password` empty means anyone may join.
-bool start(uint16_t port, const std::string& password, std::string* err);
+// `password` empty means anyone may join. `ducting` is the realism switch: the
+// flight's shared weather may then bring tropospheric ducting (docs/radio.md).
+bool start(uint16_t port, const std::string& password, std::string* err, bool ducting = false);
 void stop();
 bool running();
+// The realism switch, changed while the server runs -- no restart, so nobody
+// connected is thrown off for it.
+void setDucting(bool on);
 
 Status status();
 

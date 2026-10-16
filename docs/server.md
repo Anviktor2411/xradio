@@ -148,9 +148,12 @@ python3 /opt/xradio/server/server.py --host 0.0.0.0 --port 49100 -v
 | `--port 49100` | the UDP port. Any port works; this is the default pilots expect |
 | `--password word` | pilots must give this to join. See [below](#5-set-a-password) |
 | `-v` | log every packet type. Useful now, noisy later |
+| `--ducting` | realism, off by default: on a warm, still evening the flight's shared weather may bring tropospheric ducting, when VHF reaches far past the horizon over the sea. Rare. See `docs/radio.md` |
 | `--dashboard` | a live picture of the flight in this terminal instead of a log: who is in, where they are, what they have tuned, who is talking, packets per second. `--log FILE` keeps the log as well |
 
-All three can come from the environment instead — `XRADIO_HOST`, `XRADIO_PORT`, `XRADIO_PASSWORD` — which is how systemd and background services parse configurations.
+These can come from the environment instead — `XRADIO_HOST`, `XRADIO_PORT`, `XRADIO_PASSWORD`, `XRADIO_DUCTING=1` — which is how systemd and background services parse configurations.
+
+Who hears whom is the radio model in `docs/radio.md`: the VHF horizon from each aerial's height above the ground (never under 5 nm), an ATC station's service volume, and a link budget. The server relays a transmission only to who can receive it; the pilots' plugins then add the terrain on the path.
 
 `--dashboard` is for the evening you are running the server yourself and want
 to see the flight rather than read about it. It redraws once a second and
@@ -176,7 +179,7 @@ the journal instead.
 
 #### Running Precompiled Standalone Binaries (No Python Required):
 
-The release zip carries compiled versions for 64-bit Linux and Windows. They take positional arguments (`port`, then `password`):
+The release zip carries compiled versions for 64-bit Linux and Windows. They take positional arguments (`port`, then `password`), and `--ducting` anywhere on the line:
 
 * **Linux (x86_64):**
   ```bash
@@ -377,13 +380,13 @@ If everyone switches *Offer my weather* off, nobody is the sky and each pilot fl
 
 ## Keeping it up to date
 
-**This is the part that bites.** XRadio's wire protocol changes between releases, and the server speaks exactly one version of it. When pilots update and the server does not, every one of them is refused at login — their window says the versions do not match, and your log fills with:
+**This is the part that bites.** XRadio's wire protocol changes between releases. A server lets in pilots of its own version and of the one before it — a v0.6 server (protocol 6) also takes v0.5 pilots (protocol 5), who fly, talk and see traffic exactly as before; what v6 added (the ATC list, ATIS, flight plans, the radio model's fields) simply never reaches them. Anything older, and any pilot newer than the server, is refused at login — their window says the versions do not match, and your log fills with:
 
 ```
 WARNING rejecting ('81.90.144.12', 50413): protocol v4
 ```
 
-So: **update the server whenever you tell people to update the plugin**, and do it first.
+So: **update the server whenever you tell people to update the plugin**, and do it first: an updated server still takes the pilots who have not updated yet, never the other way round.
 
 ### On Linux:
 ```bash
@@ -444,7 +447,7 @@ Should show `0.0.0.0:49100`. If it shows `127.0.0.1:49100`, `--host` was left at
 
 **4. Do the replies get back?** If you see `login:` lines in the log but the pilot still says "no answer", the packets are arriving and the replies are not. Almost always an outbound rule on the provider's firewall, or a NAT the server sits behind.
 
-**5. Is everybody on the same version?** A pilot refused at login sees the reason in their own window, and your log names the protocol version they tried. Update the server.
+**5. Is everybody on a version the server takes?** That is its own and the one before it. A pilot refused at login sees the reason in their own window, and your log names the protocol version they tried. Update the server.
 
 **6. Is the address right?** From the pilot's machine:
 

@@ -1,0 +1,43 @@
+# A made-up height profile for tools/harness/radio_test.cpp (not real terrain):
+# a 40 km path along a valley floor at 600 m with one ridge across it,
+# peaking at 2400 m half way. Each line: km from the receiver, ground metres
+# MSL, 1 if water. The two aerials stand at 903 m at either end.
+1 600 0
+2 600 0
+3 600 0
+4 600 0
+5 600 0
+6 600 0
+7 600 0
+8 600 0
+9 600 0
+10 600 0
+11 600 0
+12 600 0
+13 600 0
+14 600 0
+15 600 0
+16 960 0
+17 1320 0
+18 1680 0
+19 2040 0
+20 2400 0
+21 2040 0
+22 1680 0
+23 1320 0
+24 960 0
+25 600 0
+26 600 0
+27 600 0
+28 600 0
+29 600 0
+30 600 0
+31 600 0
+32 600 0
+33 600 0
+34 600 0
+35 600 0
+36 600 0
+37 600 0
+38 600 0
+39 600 0

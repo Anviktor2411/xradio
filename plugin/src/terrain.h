@@ -53,4 +53,31 @@ inline bool groundElevM(double lat, double lon, double nearAltM, double* out) {
 // still catches a probe that hit something on the other side of the world.
 inline constexpr double kMaxDatumAboveGroundM = 30.0;
 
+// The terrain at (lat, lon), metres MSL, and whether it is water: what the
+// radio's path sampler (shadow.h) asks, a few times a frame, to find a
+// mountain between two aerials -- or the sea under a duct. False where X-Plane
+// has no scenery loaded. A probe of its own, so it never disturbs the one
+// above. Main thread only.
+inline bool terrainAt(double lat, double lon, double* groundMslM, bool* wet) {
+    static XPLMProbeRef probe = nullptr;
+    if (!probe) probe = XPLMCreateProbe(xplm_ProbeY);
+    if (!probe) return false;
+
+    double x = 0, y = 0, z = 0;
+    XPLMWorldToLocal(lat, lon, 0.0, &x, &y, &z);
+
+    XPLMProbeInfo_t info;
+    memset(&info, 0, sizeof(info));
+    info.structSize = sizeof(info);
+    if (XPLMProbeTerrainXYZ(probe, (float)x, (float)y, (float)z, &info) != xplm_ProbeHitTerrain)
+        return false;
+
+    double glat = 0, glon = 0, galt = 0;
+    XPLMLocalToWorld(info.locationX, info.locationY, info.locationZ, &glat, &glon, &galt);
+    if (!std::isfinite(galt)) return false;
+    *groundMslM = galt;
+    *wet = info.is_wet != 0;
+    return true;
+}
+
 }  // namespace xr

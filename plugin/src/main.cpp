@@ -15,6 +15,8 @@
 #include "settings.h"
 #include "joincode.h"
 #include "smoothing.h"
+#include "radio.h"
+#include "shadow.h"
 #include "terrain.h"
 #include "ui.h"
 #include "clipboard.h"
@@ -389,6 +391,10 @@ struct Remote {
     float       lastSeen = 0;   // seconds since plugin start
     bool        ai = false;     // v6: driven by an ATC program, not a pilot
     bool        drawn = true;   // false: over the AI cap, listed but not in the sky
+    // v6: its height above the ground, the one the server routes its radio by
+    // (docs/radio.md); unknown from a server that sends 108-byte entries.
+    float       aglM = 0.f;
+    bool        aglKnown = false;
 };
 
 std::map<uint32_t, Remote> g_remote;
@@ -402,6 +408,11 @@ struct AtcStation {
     std::string callsign, icao;
     uint32_t    freqKhz = 0;
     uint8_t     kind = 0;       // xr::AtcKind
+    // where it transmits from and what it covers, as the server routes it
+    bool        hasPos = false;
+    double      lat = 0, lon = 0;
+    float       altMslM = 0.f, antennaM = 0.f;
+    uint16_t    rangeNm = 0, ceilingFt = 0;
 };
 std::vector<AtcStation> g_atcList;          // the last list the server sent
 float                   g_atcListAt = -1000.f;
@@ -479,20 +490,62 @@ bool  someoneElseIsTheSky();
 void handleWeather(const uint8_t* payload, int len);
 double distanceNm(double lat1, double lon1, double lat2, double lon2);
 
-// How well another pilot's radio reaches us, from distance against the VHF
-// horizon the server uses (1.23 * (sqrt(h1) + sqrt(h2)) nm, 15 nm minimum).
-// 1 up to about half the horizon, then falling to 0 at it: that is what the
-// voice code turns into rising noise and the transmission breaking up.
-float signalQuality(double distNm, float myAltFt, float theirAltFt) {
-    const double h1 = myAltFt < 0.f ? 0.0 : (double)myAltFt;
-    const double h2 = theirAltFt < 0.f ? 0.0 : (double)theirAltFt;
-    double horizon = 1.23 * (sqrt(h1) + sqrt(h2));
-    if (horizon < 15.0) horizon = 15.0;
-    const double f = distNm / horizon;
-    if (f <= 0.55) return 1.f;
-    if (f >= 1.0)  return 0.f;
-    const double t = (f - 0.55) / 0.45;
-    return (float)(1.0 - t * t * (3.0 - 2.0 * t));   // smoothstep down
+// ---------------------------------------------------------------------------
+// the radio model (docs/radio.md, radio.h)
+// ---------------------------------------------------------------------------
+// The flight's air is ducting tonight (the ATC list says so): VHF carries far
+// over the sea. Our own height above the ground, as last sent. And the terrain
+// on the path to each station, sampled from the scenery a few probes a frame.
+bool  g_ducting = false;
+float g_myAglM  = 0.f;
+xr::shadow::Tracker g_shadow(xr::terrainAt);
+// Probes per frame for the path sampler, and the time it may take at most:
+// a station's 100 km path is then sampled in three or four frames.
+constexpr int    kShadowProbesPerFrame = 32;
+constexpr double kShadowMaxMs          = 0.4;
+// Over this much water a duct carries the signal (the server relays the whole
+// extension; only a path over the sea gets it here).
+constexpr double kDuctWetShare = 0.7;
+
+xr::radio::Node aircraftNode(double lat, double lon, double altMslM, double aglM) {
+    xr::radio::Node n;
+    n.lat = lat; n.lon = lon; n.altMslM = altMslM;
+    n.heightFt = xr::radio::aircraftHeightFt(aglM);
+    return n;
+}
+
+xr::radio::Node remoteNode(const Remote& r) {
+    return aircraftNode(r.lat, r.lon, r.altMslM,
+                        xr::radio::effectiveAglM(r.aglKnown, r.aglM, r.onGround != 0, r.altMslM));
+}
+
+xr::radio::Node stationNode(const AtcStation& s) {
+    xr::radio::Node n;
+    n.lat = s.lat; n.lon = s.lon; n.altMslM = s.altMslM;
+    n.heightFt = (double)s.antennaM * xr::radio::kFtPerM;
+    n.atc = true; n.rangeNm = s.rangeNm; n.ceilingFt = s.ceilingFt;
+    return n;
+}
+
+// One station's signal at our receiver: the model's link, less what the
+// terrain on the path costs -- except inside a station's service volume, which
+// its own antennas are placed to cover -- with the duct only over the sea.
+// Into the voice mixer, which makes the noise, flutter, break-up and the
+// capture of one transmission by a stronger one out of it.
+void applySignal(uint32_t sid, const xr::radio::Node& tx, const xr::radio::Node& rx, double txAntMslM,
+                 double rxAntMslM, uint32_t freqKhz, bool urgent, double now) {
+    const double dist = xr::radio::distanceNm(tx.lat, tx.lon, rx.lat, rx.lon);
+    xr::radio::Shadow sh;
+    bool known = false;
+    if (!xr::radio::inServiceVolume(tx, rx) && dist < xr::radio::coverageNm(tx, rx, g_ducting)) {
+        g_shadow.want(sid, {rx.lat, rx.lon, rxAntMslM}, {tx.lat, tx.lon, txAntMslM}, freqKhz, urgent, now);
+        sh = g_shadow.result(sid, &known);
+    }
+    const bool duct = g_ducting && known && sh.wetFraction >= kDuctWetShare;
+    const bool shadowed = known && !duct;           // a duct carries it round the bulge, over water
+    const xr::radio::Link l = xr::radio::link(tx, rx, freqKhz, duct, shadowed ? sh.lossDb : 0.0);
+    const double q = shadowed ? std::min(l.quality, sh.cap) : l.quality;
+    xr::voice::setSignal(sid, (float)q, (float)l.levelDbm);
 }
 
 // ---------------------------------------------------------------------------
@@ -756,6 +809,18 @@ void sendPosition() {
     // back to heading if the sim does not expose the path.
     p.trackTrue = g_ref.hpath ? fd(g_ref.hpath) : p.headingTrue;
     p.vsMs      = fd(g_ref.vh);
+    // v6, the radio model: our height above the ground -- the sim's own, the
+    // centre of gravity over the terrain or the water; on the ground 0. The
+    // server works the VHF horizon out from it (docs/radio.md): from the
+    // altitude, two aircraft on Innsbruck's apron at 1900 ft would talk over
+    // a hundred miles.
+    float agl = onGnd ? 0.f : fd(g_ref.yAgl);
+    if (!std::isfinite(agl) || agl < 0.f) agl = 0.f;
+    if (agl > 30000.f) agl = 30000.f;
+    p.aglM = agl;
+    p.svcRangeNm = 0;          // an aircraft has no service volume
+    p.svcCeilingFt = 0;
+    g_myAglM = agl;
 
     uint8_t buf[sizeof(xr::Header) + sizeof(p)];
     int off = writeHeader(buf, xr::PT_POSITION, sizeof(p));
@@ -844,6 +909,7 @@ bool sane(const xr::TrafficEntry& e) {
     if (!std::isfinite(e.gearRatio) || !std::isfinite(e.flapRatio)) return false;
     if (!std::isfinite(e.trackTrue) || !std::isfinite(e.vsMs) ||
         e.vsMs < -200.f || e.vsMs > 200.f)                        return false;
+    if (!std::isfinite(e.aglM) || e.aglM < -1000.f || e.aglM > 40000.f) return false;
     return true;
 }
 
@@ -866,11 +932,15 @@ void handleTraffic(const uint8_t* payload, int len) {
     memcpy(&th, payload, sizeof(th));
 
     int off = (int)sizeof(th);
+    // v6 entries end with the aircraft's height above the ground; a server
+    // from before that sends them 108 bytes long, and then it is not known.
+    const bool v6 = len - off >= (int)th.count * (int)sizeof(xr::TrafficEntry);
+    const int esize = v6 ? (int)sizeof(xr::TrafficEntry) : xr::kTrafficEntrySizeV5;
     for (int i = 0; i < th.count; ++i) {
-        if (off + (int)sizeof(xr::TrafficEntry) > len) break;
+        if (off + esize > len) break;
         xr::TrafficEntry e{};
-        memcpy(&e, payload + off, sizeof(e));
-        off += (int)sizeof(e);
+        memcpy(&e, payload + off, (size_t)esize);
+        off += esize;
 
         if (!sane(e)) {
             ++g_rejected;
@@ -907,6 +977,8 @@ void handleTraffic(const uint8_t* payload, int len) {
         r.squawk    = xr::validSquawk(e.squawk) ? e.squawk : 0;
         r.xpdrMode  = e.xpdrMode <= xr::XPDR_TA_RA ? e.xpdrMode : (uint8_t)xr::XPDR_OFF;
         r.xpdrIdent = e.xpdrIdent ? 1 : 0;
+        r.aglM      = e.aglM;
+        r.aglKnown  = v6;
         r.lastSeen  = g_elapsed;
 
         xr::RemoteState st;
@@ -995,7 +1067,29 @@ void handleAtcList(const uint8_t* payload, int len) {
         s.icao     = sanitizeText(e.icao, sizeof(e.icao));
         s.freqKhz  = e.freqKhz;
         s.kind     = e.kind;
+        // where it transmits from and what it covers -- checked like a traffic
+        // entry, since it decides what the radio sounds like
+        s.hasPos   = (e.flags & xr::AE_POSITION) && std::isfinite(e.lat) && std::isfinite(e.lon) &&
+                     e.lat >= -90.0 && e.lat <= 90.0 && e.lon >= -180.0 && e.lon <= 180.0 &&
+                     std::isfinite(e.altMslM) && e.altMslM > -1000.f && e.altMslM < 40000.f &&
+                     std::isfinite(e.antennaM) && e.antennaM >= 0.f && e.antennaM < 40000.f;
+        if (s.hasPos) {
+            s.lat = e.lat; s.lon = e.lon; s.altMslM = e.altMslM; s.antennaM = e.antennaM;
+            s.rangeNm = e.rangeNm; s.ceilingFt = e.ceilingFt;
+        }
         if (!s.callsign.empty()) list.push_back(s);
+    }
+    // The flight's air: when it starts carrying VHF far over the sea, and when
+    // it stops, the radio log says so -- otherwise a station from across the
+    // gulf would come in for no reason a pilot could see.
+    const bool duct = (lh.flags & xr::AL_DUCTING) != 0;
+    if (duct != g_ducting) {
+        g_ducting = duct;
+        const char* line = duct
+            ? "Tropospheric ducting tonight: VHF carries far past the horizon over the sea"
+            : "The duct has gone: VHF reaches as far as the horizon again";
+        addChat(line);
+        pushNotice(line, duct ? 1 : 0);
     }
     // A station that was not in the last list is news worth a line: the
     // pilot may have been waiting for exactly that controller.
@@ -1612,15 +1706,37 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
     }
     updateNotices();
 
-    // Tell the voice mixer how far away everyone is, so they sound like it.
+    // The radio model (docs/radio.md): every station's signal at our
+    // receiver, so a near one is clean, a far one noisy and one behind a
+    // mountain weak or gone -- and two at once fight it out in the mixer by
+    // level. The path sampler then spends its few probes for the frame.
     {
-        const double myLat = dd(g_ref.lat), myLon = dd(g_ref.lon);
-        const float  myAltFt = (float)(dd(g_ref.elev) * 3.28084);
+        const double myAlt = dd(g_ref.elev);
+        const xr::radio::Node me = aircraftNode(dd(g_ref.lat), dd(g_ref.lon), myAlt, g_myAglM);
+        const double myAnt = myAlt + xr::radio::kAircraftAntennaM;
+        const std::vector<uint32_t> talking = xr::voice::activeSpeakers();
+        auto isTalking = [&](uint32_t sid) {
+            return std::find(talking.begin(), talking.end(), sid) != talking.end();
+        };
+        const uint32_t myKhz = comKhz(txCom());
+        auto freqOf = [&](uint32_t sid, uint32_t fallback) {
+            const uint32_t f = xr::voice::speakerFreq(sid);
+            return f ? f : (fallback ? fallback : xr::kGuardKhz);
+        };
         for (const auto& kv : g_remote) {
             const Remote& rm = kv.second;
-            const double d = distanceNm(myLat, myLon, rm.lat, rm.lon);
-            xr::voice::setSignalQuality(rm.sid, signalQuality(d, myAltFt, rm.altMslM * 3.28084f));
+            applySignal(rm.sid, remoteNode(rm), me, rm.altMslM + xr::radio::kAircraftAntennaM, myAnt,
+                        freqOf(rm.sid, myKhz), isTalking(rm.sid), g_elapsed);
         }
+        const uint32_t c1 = comKhz(1), c2 = comKhz(2);
+        for (const AtcStation& st : g_atcList) {
+            if (!st.sid || !st.hasPos) continue;   // an ATIS row, or no position yet: as strong as ever
+            const bool tuned = st.freqKhz && (st.freqKhz == c1 || st.freqKhz == c2);
+            applySignal(st.sid, stationNode(st), me, (double)st.altMslM + st.antennaM, myAnt,
+                        freqOf(st.sid, st.freqKhz), tuned || isTalking(st.sid), g_elapsed);
+        }
+        g_shadow.tick(g_elapsed, kShadowProbesPerFrame, kShadowMaxMs);
+        g_shadow.forgetIdle(g_elapsed, 30.0);
     }
 
     // Which COM the PTT keys, published for the network thread's voice packets.
@@ -1705,6 +1821,8 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
         xr::csl::removeAll();
         g_lastWeatherRx   = -1000.f;
         g_lastWeatherSend = -1000.f;
+        g_ducting = false;
+        g_shadow.clear();
         g_status = "lost server, retrying...";
         logMsg("server went quiet, re-logging in");
     }
@@ -2369,7 +2487,7 @@ void applyHosting() {
 
     xr::relay::stop();
     std::string err;
-    if (!xr::relay::start(port, g_cfg.password, &err)) {
+    if (!xr::relay::start(port, g_cfg.password, &err, g_cfg.hostDucting)) {
         g_hostNote = "cannot host: " + err;
         logMsg("%s", g_hostNote.c_str());
         return;
@@ -2451,6 +2569,8 @@ void reconnect() {
     g_remote.clear();
     xr::csl::removeAll();
     g_atcList.clear(); g_atcListAt = -1000.f;   // another server, another set of controllers
+    g_ducting = false;                            // ...and another sky
+    g_shadow.clear();
     g_atis.clear();
     g_fp = FlightPlanState{};
     // A new connection knows nothing about who holds the sky, so offer again
@@ -2524,6 +2644,7 @@ void refreshDeviceLists() {
 // Push the live settings into the subsystems that care about them. Called on
 // save and at startup, so there is one path rather than two.
 void applyLiveSettings() {
+    xr::relay::setDucting(g_cfg.hostDucting);     // realism for the flight we host: no restart
     xr::voice::setVolume(g_cfg.volume);
     xr::voice::setSidetone(g_cfg.sidetone);
     xr::voice::setHiss(g_cfg.hiss);
@@ -3244,6 +3365,7 @@ xr::ui2::Model buildModel() {
         x.callsign = st.callsign; x.kindName = atcKindName(st.kind); x.icao = st.icao; x.freqKhz = st.freqKhz;
         x.atis = st.kind == xr::ATC_ATIS; x.tuned = st.freqKhz && (st.freqKhz == c1 || st.freqKhz == c2);
         x.ai = st.callsign.find("TTRAIN") != std::string::npos;
+        if (st.hasPos) x.distNm = distanceNm(dd(g_ref.lat), dd(g_ref.lon), st.lat, st.lon);
         m.atc.push_back(x);
     }
     for (const auto& kv : g_atis) {
@@ -3454,6 +3576,7 @@ PLUGIN_API void XPluginDisable(void) {
     g_connected = false;
     g_sessionId.store(0);
     g_remote.clear();
+    g_shadow.clear();
     xr::csl::disable();
     XPLMScheduleFlightLoop(g_loop, 0, 1);
 }

@@ -6,13 +6,18 @@ means no alignment padding, which matches #pragma pack(1) on the C++ side).
 v6 adds air traffic control: ATC stations (LF_ATC), one session that drives
 many computer-flown aircraft (LF_INJECTOR + PT_AI_TRAFFIC), flight plans
 (PT_FLIGHTPLAN), a published ATIS (PT_ATIS) and the list of stations online
-(PT_ATC_LIST). Read protocol.h for the reasoning behind each.
+(PT_ATC_LIST) -- and the radio model's fields: heights above the ground, the
+stations' antennas and service volumes (docs/radio.md). Read protocol.h for the
+reasoning behind each.
 """
 
 import struct
 
 MAGIC = 0x31435258  # b"XRC1" little-endian
-PROTO_VERSION = 6   # v6: ATC stations, injected AI traffic, flight plans, ATIS
+PROTO_VERSION = 6   # v6: ATC stations, injected AI traffic, flight plans, ATIS, the radio model
+# The oldest client a server still lets in: a v5 pilot (XRadio 0.5) flies in a
+# v6 flight on what v5 knew -- v5 headers, v5-sized records, no v6-only packets.
+MIN_PROTO_VERSION = 5
 
 # packet types
 PT_LOGIN = 1
@@ -69,6 +74,9 @@ def ai_owner(sid: int) -> int:
 
 AI_REMOVE = 1 << 0            # TRAFFIC_ENTRY.reserved in PT_AI_TRAFFIC: drop this aircraft now
 
+AL_DUCTING = 1 << 0           # ATC_LIST_HDR.flags: VHF carries far over the sea tonight (docs/radio.md)
+AE_POSITION = 1 << 0          # ATC_ENTRY.flags: lat, lon and altitude are real
+
 # FlightPlanPayload.rules / .status
 FP_IFR, FP_VFR, FP_Y, FP_Z = ord("I"), ord("V"), ord("Y"), ord("Z")
 FP_FILED, FP_ACK, FP_CLEARED, FP_CANCELLED = 1, 2, 3, 4
@@ -114,21 +122,26 @@ def xpdr_transmitting(mode: int) -> bool:
 MAX_PACKET = 1200
 
 # How many aircraft fit in one traffic packet, worked out rather than written
-# down. Must equal xr::kMaxTrafficEntries.
-MAX_TRAFFIC_ENTRIES = (MAX_PACKET - 12 - 4) // 108
+# down. Must equal xr::kMaxTrafficEntries -- and, for a v5 client's shorter
+# entries, xr::kMaxTrafficEntriesV5.
+MAX_TRAFFIC_ENTRIES = (MAX_PACKET - 12 - 4) // 112
+MAX_TRAFFIC_ENTRIES_V5 = (MAX_PACKET - 12 - 4) // 108
 
 # And how many pilots fit in one roster packet. Must equal xr::kMaxRosterEntries.
 MAX_ROSTER_ENTRIES = (MAX_PACKET - 12 - 8) // 28
 # v6: stations in one ATC list packet. Must equal xr::kMaxAtcEntries.
-MAX_ATC_ENTRIES = (MAX_PACKET - 12 - 4) // 36
+MAX_ATC_ENTRIES = (MAX_PACKET - 12 - 4) // 64
 
 HEADER = struct.Struct("<IBBHI")          # magic, type, version, payloadLen, sessionId
 LOGIN = struct.Struct("<16s8sHH16s32s")   # callsign, acIcao, protoVer, flags, livery, password
 LOGIN_ACK = struct.Struct("<II")          # sessionId, serverTimeMs
 LOGIN_REJECT = struct.Struct("<HH")       # reason, reserved
-POSITION = struct.Struct("<2d7f2I4BI2fHBB")  # see PositionPayload
+# see PositionPayload: ... squawk, xpdrMode, xpdrIdent, then v6 aglM, svcRangeNm, svcCeilingFt
+POSITION = struct.Struct("<2d7f2I4BI2fHBBfHH")
+POSITION_V5 = struct.Struct("<2d7f2I4BI2fHBB")   # the same without the v6 radio fields (v5 clients)
 TRAFFIC_HDR = struct.Struct("<HH")        # count, reserved
-TRAFFIC_ENTRY = struct.Struct("<I16s8s2d7f4BI2f16sHBB")  # ... + livery, squawk
+TRAFFIC_ENTRY = struct.Struct("<I16s8s2d7f4BI2f16sHBBf")  # ... + livery, squawk, ident, reserved, v6 aglM
+TRAFFIC_ENTRY_V5 = struct.Struct("<I16s8s2d7f4BI2f16sHBB")  # without aglM: what a v5 client reads
 TEXT_HDR = struct.Struct("<II16sH16s")    # freqKhz, fromSession, from, textLen, to
 VOICE_HDR = struct.Struct("<IIHH")        # freqKhz, fromSession, seq, opusLen
 ROSTER_HDR = struct.Struct("<HBBHH")      # epoch, part, parts, count, reserved
@@ -136,8 +149,10 @@ ROSTER_ENTRY = struct.Struct("<I16s8s")   # sessionId, callsign, acIcao
 # v6
 FLIGHTPLAN = struct.Struct("<I16s8sBBH8s8s8sI128s64sHH")   # see FlightPlanPayload
 ATIS_HDR = struct.Struct("<I8scBH")       # freqKhz, icao, letter, reserved, textLen (+ text)
-ATC_LIST_HDR = struct.Struct("<HH")       # count, reserved
-ATC_ENTRY = struct.Struct("<I16s8sIB3s")  # sessionId, callsign, icao, freqKhz, kind, reserved
+ATC_LIST_HDR = struct.Struct("<HH")       # count, flags (AL_*)
+# sessionId, callsign, icao, freqKhz, kind, flags (AE_*), reserved,
+# lat, lon, altMslM, antennaM, rangeNm, ceilingFt -- see AtcEntry
+ATC_ENTRY = struct.Struct("<I16s8sIBB2s2d2fHH")
 
 # The flight's shared sky: time, then X-Plane 12's region weather whole --
 # three cloud layers and thirteen altitude levels, the sim's own counts.
@@ -148,13 +163,13 @@ WEATHER = struct.Struct("<Ififfffffi" + f"{4 * CLOUD_LAYERS}f" + f"{7 * AIR_LAYE
 # Sanity: these sizes are asserted against the C++ structs in tools/check_sizes.py
 assert HEADER.size == 12
 assert LOGIN.size == 76
-assert POSITION.size == 72
-assert TRAFFIC_ENTRY.size == 108
+assert POSITION.size == 80 and POSITION_V5.size == 72
+assert TRAFFIC_ENTRY.size == 112 and TRAFFIC_ENTRY_V5.size == 108
 assert TEXT_HDR.size == 42
 assert WEATHER.size == 452
 assert FLIGHTPLAN.size == 256
 assert ATIS_HDR.size == 16
-assert ATC_ENTRY.size == 36
+assert ATC_ENTRY.size == 64
 
 
 def pack(ptype: int, session_id: int, payload: bytes = b"", version: int = PROTO_VERSION) -> bytes:
