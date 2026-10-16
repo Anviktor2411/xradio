@@ -144,6 +144,9 @@ that pass on Linux and macOS and fail on Windows ten minutes later:
 
 `bash release.sh` (or `release.bat`) asks for the version, runs every check
 this machine can run, sets the number in `brand.h`, writes the source zip and
-a release-notes skeleton into `dist/`. The binaries pilots install come from
+a release-notes skeleton into `dist/`. One check reads the import tables of
+the Windows plugin and server in `build*/` (`tools/check_win_imports.py`): a
+MinGW build that needs `libstdc++-6.dll` loads on the machine that built it
+and nowhere else, so the release stops there. The binaries pilots install come from
 the CI run's `XRadio-all-platforms` artifact. Everyone in a flight must run
 the same build, so the version is checked at login.

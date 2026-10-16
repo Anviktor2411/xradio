@@ -33,6 +33,21 @@ if(NOT EXISTS "${XPLANE_SDK}/CHeaders/XPLM/XPLMPlugin.h")
         "-DXPLANE_SDK=<path to the SDK folder>.")
 endif()
 
+# --- MinGW: the compiler's runtime goes inside every binary -----------------
+# Otherwise each one imports libstdc++-6.dll, libgcc_s_seh-1.dll and
+# libwinpthread-1.dll, plus libssp-0.dll for Opus's stack protector and
+# _FORTIFY_SOURCE. Those exist only where the compiler is installed, so the
+# plugin loads on the machine that built it and nowhere else: Windows refuses
+# it, and all X-Plane's Log.txt says is "Error Code = 126 : The specified
+# module could not be found." With -static the linker takes libstdc++.a,
+# libgcc_eh.a, libwinpthread.a and libssp.a instead; kernel32, ws2_32 and the
+# other system libraries are import libraries either way and stay DLL imports.
+# Set for the whole tree, so the plugin, xradio_server.exe and every test
+# executable get it. tools/check_win_imports.py checks the result.
+if(MINGW)
+    add_link_options(-static -static-libgcc -static-libstdc++)
+endif()
+
 # --- dependencies -----------------------------------------------------------
 if(XRADIO_USE_XPMP2)
     if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/lib/XPMP2/CMakeLists.txt")
@@ -273,6 +288,26 @@ if(XRADIO_USE_XPMP2)
                 "${CMAKE_CURRENT_SOURCE_DIR}/lib/XPMP2/Resources"
                 "${CMAKE_BINARY_DIR}/XRadio/Resources"
         COMMENT "Copying XPMP2 resources into XRadio/Resources")
+endif()
+
+# Windows refuses a plugin when any DLL it imports is missing, so the build
+# reads the import table instead of handing over a plugin that only loads on
+# this machine: tools/check_win_imports.py fails on the MinGW runtime and on
+# anything else neither Windows nor X-Plane provides. A target of its own runs
+# on every build, so a plugin that failed cannot pass the next build just
+# because it is already up to date.
+if(WIN32)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_custom_target(xradio_import_check ALL
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/check_win_imports.py"
+                    "$<TARGET_FILE:XRadio>"
+            COMMENT "Checking that XRadio.xpl needs no DLL a pilot's PC lacks"
+            VERBATIM)
+        add_dependencies(xradio_import_check XRadio)
+    else()
+        message(STATUS "XRadio: no Python 3 here, so the build does not check the plugin's DLL imports")
+    endif()
 endif()
 
 message(STATUS "XRadio -> ${XR_OUTDIR}  (XPMP2: ${XRADIO_USE_XPMP2}, voice: ${XRADIO_USE_VOICE})")

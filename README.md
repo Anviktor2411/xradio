@@ -183,7 +183,8 @@ It asks for the version number, suggesting the next patch:
 
 Then it runs every check this machine is equipped for -- the portability
 scan, the Windows cross-compile, the C++ tests, the differential server
-test -- and only if they all pass does it set the version in
+test, the DLL imports of whatever is built for Windows in `build*/` -- and
+only if they all pass does it set the version in
 `plugin/src/brand.h` (the one place it lives; the window and the tests both
 read it from there), write `dist/xradio-v0.6.0-source.zip`, and leave a
 release-notes skeleton beside it with the compare link filled in. A failed
@@ -201,6 +202,7 @@ bash tools/check_portability.sh       # instant: MSVC-only pitfalls
 bash tools/check_windows_build.sh     # ~20s: compile everything for Windows
 python3 tools/test_server.py          # server: protocol and routing, ATC (v6) included
 bash tools/check_simbrief.sh          # SimBrief: parser, .fms writer, a live fetch against tools/fake_simbrief.py
+python3 tools/check_win_imports.py build/XRadio/win_x64/XRadio.xpl   # Windows: no DLL a pilot's PC lacks
 ```
 
 `check_portability.sh` catches the mistakes that pass on Linux and macOS and
@@ -394,6 +396,15 @@ The `.xpl` must be named after the plugin folder — `XRadio/win_x64/XRadio.xpl`
 not `win_x64/win.xpl`. That is the SDK 3.0 rule; with the wrong name X-Plane
 skips the folder without writing anything to `Log.txt`, so it looks as though
 the plugin does not exist.
+
+Windows also refuses a plugin when a DLL it imports cannot be found, and all
+`Log.txt` then says is `Error Code = 126 : The specified module could not be
+found.` That is why a MinGW-w64 build (`-G "MinGW Makefiles"`) links the
+compiler's runtime -- libstdc++, libgcc, winpthreads, libssp -- into every
+binary: linked dynamically, the plugin needs `libstdc++-6.dll` and friends
+and loads only on the PC that has the compiler. After every Windows build
+`tools/check_win_imports.py` reads the plugin's import table and fails the
+build if it names a DLL that neither Windows nor X-Plane provides.
 
 ### Building with parts switched off
 

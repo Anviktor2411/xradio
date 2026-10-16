@@ -168,6 +168,19 @@ def checks(skipped):
 
     ok &= run("server protocol and routing", [PY, "tools/test_server.py"])
 
+    # Windows refuses a binary when a DLL it imports is missing, and all
+    # X-Plane's Log.txt says then is "Error Code = 126". A MinGW build that does
+    # not link its runtime statically needs libstdc++-6.dll and friends, which
+    # only the machine that compiled it has: it loads there and nowhere else.
+    # Reading the import tables needs no compiler, so this runs here too.
+    wins = windows_binaries()
+    if wins:
+        ok &= run("the Windows binaries need no MinGW DLL",
+                  [PY, "tools/check_win_imports.py"] + [str(p.relative_to(ROOT)) for p in wins])
+    else:
+        say("  the Windows binaries need no MinGW DLL ... skipped (nothing built for Windows here)")
+        skipped.append("the DLL check of the Windows plugin (nothing built for Windows here)")
+
     # Cheap, and the one check that catches the two protocol files describing
     # different bytes -- which every other test would then agree about, because
     # they all use one side or the other.
@@ -211,10 +224,24 @@ def checks(skipped):
     ]:
         ok &= run(name, [str(build / exe)] + args)
 
+    server = build / ("xradio_server.exe" if os.name == "nt" else "xradio_server")
     ok &= run("the two servers agree",
-              [PY, "tools/test_server_parity.py",
-               "--cpp", str(build / "xradio_server")])
+              [PY, "tools/test_server_parity.py", "--cpp", str(server)])
     return ok
+
+
+def windows_binaries():
+    """The Windows plugin and relay server in every build folder: what a copy
+    into X-Plane or an upload would be made from. The test build ships nothing,
+    so it is left out."""
+    found = []
+    for build in sorted(ROOT.glob("build*")):
+        if build.is_dir() and build.name != "build-tests":
+            for rel in ("XRadio/win_x64/XRadio.xpl", "xradio_server.exe",
+                        "Release/xradio_server.exe"):
+                if (build / rel).is_file():
+                    found.append(build / rel)
+    return found
 
 
 def package(version, dry):
@@ -225,7 +252,8 @@ def package(version, dry):
         if not path.is_file():
             continue
         rel = path.relative_to(ROOT)
-        if any(part in SKIP_DIRS for part in rel.parts):
+        # build-win/ and the like too, as .gitignore has them
+        if any(part in SKIP_DIRS or part.startswith("build-") for part in rel.parts):
             continue
         if rel.suffix in (".zip", ".xpl", ".o", ".pyc"):
             continue
