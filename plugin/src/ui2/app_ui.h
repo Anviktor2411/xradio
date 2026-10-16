@@ -11,7 +11,7 @@
 namespace xr {
 namespace ui2 {
 
-struct Fonts { void* body = nullptr; void* heading = nullptr; void* big = nullptr; void* mono = nullptr; };   // ImFont*
+struct Fonts { void* body = nullptr; void* heading = nullptr; void* big = nullptr; void* mono = nullptr; void* small = nullptr; };   // ImFont*
 
 struct UiState {
     int         tab = 0;                    // 0 Radio, 1 ATC, 2 Pilots, 3 Messages, 4 Flight plan, 5 Host, 6 Settings, 7 Tower

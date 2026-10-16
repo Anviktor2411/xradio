@@ -105,6 +105,7 @@ set(XR_PLUGIN_SOURCES
     plugin/src/simbrief.cpp
     plugin/src/tcp.cpp
     plugin/src/tower.cpp
+    plugin/src/tower_parse.cpp
     plugin/src/ui.cpp
     plugin/src/update.cpp
     plugin/src/upnp.cpp
@@ -190,7 +191,7 @@ endif()
 set(XR_IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/imgui")
 set(XR_UI2_SOURCES
     plugin/src/ui2/app_ui.cpp plugin/src/ui2/host.cpp plugin/src/ui2/i18n.cpp plugin/src/ui2/imgui_xp.cpp
-    plugin/src/ui2/model.cpp plugin/src/ui2/theme.cpp)
+    plugin/src/ui2/model.cpp plugin/src/ui2/theme.cpp plugin/src/ui2/tower_model.cpp plugin/src/ui2/tower_ui.cpp)
 set(XR_IMGUI_SOURCES "${XR_IMGUI_DIR}/imgui.cpp" "${XR_IMGUI_DIR}/imgui_draw.cpp" "${XR_IMGUI_DIR}/imgui_tables.cpp" "${XR_IMGUI_DIR}/imgui_widgets.cpp")
 
 if(XR_BUILD_PLUGIN)
@@ -351,16 +352,23 @@ if(XRADIO_BUILD_TESTS)
     xradio_test_exe(settings_test  tools/harness/settings_test.cpp)
     xradio_test_exe(hosting_test   tools/harness/hosting_test.cpp)
     xradio_test_exe(tower_test     tools/harness/tower_test.cpp)
-    # the new window's logic, without ImGui or X-Plane
-    add_executable(ui_logic_test tools/harness/ui_logic_test.cpp plugin/src/ui2/model.cpp)
+    # the new window's logic (and the tower windows'), without ImGui or X-Plane
+    add_executable(ui_logic_test tools/harness/ui_logic_test.cpp plugin/src/ui2/model.cpp plugin/src/ui2/tower_model.cpp plugin/src/ui2/i18n.cpp)
     target_include_directories(ui_logic_test PRIVATE plugin/src)
     target_compile_features(ui_logic_test PRIVATE cxx_std_17)
     # the window rendered to PNG files for the documentation (needs lib/imgui, no OpenGL)
     if(EXISTS "${XR_IMGUI_DIR}/imgui.cpp")
-        add_executable(ui_preview tools/ui_preview/main.cpp plugin/src/ui2/app_ui.cpp plugin/src/ui2/i18n.cpp plugin/src/ui2/model.cpp plugin/src/ui2/theme.cpp ${XR_IMGUI_SOURCES})
+        add_executable(ui_preview tools/ui_preview/main.cpp plugin/src/ui2/app_ui.cpp plugin/src/ui2/i18n.cpp plugin/src/ui2/model.cpp plugin/src/ui2/theme.cpp
+                                  plugin/src/ui2/tower_model.cpp plugin/src/ui2/tower_ui.cpp plugin/src/tower_parse.cpp ${XR_IMGUI_SOURCES})
         target_include_directories(ui_preview PRIVATE plugin/src "${XR_IMGUI_DIR}")
         target_compile_definitions(ui_preview PRIVATE IMGUI_DISABLE_OBSOLETE_FUNCTIONS=1)
         target_compile_features(ui_preview PRIVATE cxx_std_17)
+        # the tower windows clicked through headless: the real ImGui code, fake input, the actions recorded
+        add_executable(tower_ui_test tools/harness/tower_ui_test.cpp plugin/src/ui2/i18n.cpp plugin/src/ui2/theme.cpp
+                                     plugin/src/ui2/tower_model.cpp plugin/src/ui2/tower_ui.cpp plugin/src/tower_parse.cpp ${XR_IMGUI_SOURCES})
+        target_include_directories(tower_ui_test PRIVATE plugin/src "${XR_IMGUI_DIR}")
+        target_compile_definitions(tower_ui_test PRIVATE IMGUI_DISABLE_OBSOLETE_FUNCTIONS=1)
+        target_compile_features(tower_ui_test PRIVATE cxx_std_17)
     endif()
     # Not a test: renders a WAV through the radio chain so it can be listened to.
     xradio_test_exe(radio_demo     tools/harness/radio_demo.cpp)

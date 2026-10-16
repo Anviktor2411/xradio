@@ -36,7 +36,7 @@ FLAGS=(-std=c++17 -fsyntax-only -Wall -Wextra
 UI2=""
 if [ -f lib/imgui/imgui.h ]; then
     FLAGS+=(-DXRADIO_UI_IMGUI=1 -Ilib/imgui)
-    UI2="plugin/src/ui2/app_ui.cpp plugin/src/ui2/host.cpp plugin/src/ui2/i18n.cpp plugin/src/ui2/imgui_xp.cpp plugin/src/ui2/model.cpp plugin/src/ui2/theme.cpp"
+    UI2="plugin/src/ui2/app_ui.cpp plugin/src/ui2/host.cpp plugin/src/ui2/i18n.cpp plugin/src/ui2/imgui_xp.cpp plugin/src/ui2/model.cpp plugin/src/ui2/theme.cpp plugin/src/ui2/tower_model.cpp plugin/src/ui2/tower_ui.cpp"
 else
     echo "  note  lib/imgui not fetched -- skipping the ImGui window"
 fi
@@ -46,7 +46,7 @@ if [ -f lib/miniaudio/miniaudio.h ] && [ -d lib/opus/include ]; then
     FLAGS+=(-DXRADIO_USE_VOICE=1 -Ilib/miniaudio -Ilib/opus/include)
     SOURCES="plugin/src/clipboard.cpp plugin/src/main.cpp plugin/src/net.cpp
              plugin/src/server.cpp plugin/src/simbrief.cpp plugin/src/ui.cpp plugin/src/upnp.cpp
-             plugin/src/voice.cpp plugin/src/xpmp_bridge.cpp plugin/src/tcp.cpp plugin/src/tower.cpp
+             plugin/src/voice.cpp plugin/src/xpmp_bridge.cpp plugin/src/tcp.cpp plugin/src/tower.cpp plugin/src/tower_parse.cpp
              tools/server_main.cpp $UI2"
 else
     echo "  note  Opus/miniaudio not fetched -- skipping voice.cpp"

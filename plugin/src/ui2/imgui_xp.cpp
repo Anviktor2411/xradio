@@ -97,6 +97,7 @@ void rebuildFonts(float scale) {
     g_fonts.body = g_atlas->AddFontFromMemoryCompressedTTF(InterRegular_compressed_data, (int)InterRegular_compressed_size, body, &cfg, glyphRanges());
     g_fonts.heading = g_atlas->AddFontFromMemoryCompressedTTF(InterSemiBold_compressed_data, (int)InterSemiBold_compressed_size, 17.f * scale, &cfg, glyphRanges());
     g_fonts.big = g_atlas->AddFontFromMemoryCompressedTTF(InterSemiBold_compressed_data, (int)InterSemiBold_compressed_size, 26.f * scale, &cfg, glyphRanges());
+    g_fonts.small = g_atlas->AddFontFromMemoryCompressedTTF(InterRegular_compressed_data, (int)InterRegular_compressed_size, 12.5f * scale, &cfg, glyphRanges());
     g_fonts.mono = g_fonts.body;
     g_atlas->Build();
     g_texUploaded = false;

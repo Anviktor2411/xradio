@@ -1,9 +1,12 @@
 // Renders the new window to PNG files without X-Plane: the same drawMain()/drawOverlay() as in the sim, a
 // sample model, and a small software rasteriser for ImGui's triangles (textured with the font atlas).
+// Tower mode's windows too, from tools/fixtures/tower_preview.jsonl (made by tools/fake_towertrainer.py --dump).
 // Used for the screenshots in docs/ui/ and to see the layout before it ever runs in the sim.
-//   ui_preview <outdir> [theme]      -> <outdir>/<tab>.png
+//   ui_preview <outdir> [theme] [tower fixture]     -> <outdir>/<tab>.png, <outdir>/tower-<window>.png
 #include <algorithm>
 #include <cmath>
+#include <fstream>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +18,8 @@
 #include "../../plugin/src/ui2/i18n.h"
 #include "../../plugin/src/ui2/theme.h"
 #include "../../plugin/src/ui2/font_inter.h"
+#include "../../plugin/src/ui2/tower_ui.h"
+#include "../../plugin/src/tower_parse.h"
 #include "png.h"
 
 namespace {
@@ -102,23 +107,26 @@ xr::ui2::Model sampleModel(double t) {
     return m;
 }
 
-void renderTo(const std::string& path, int w, int h, xr::ui2::Model& m, const xr::ui2::Actions& a, bool overlay, ImFontAtlas* atlas, const unsigned char* tex, int tw, int th) {
+// Draws a few frames into a fresh context (tables and child sizes settle) and writes the last one.
+void renderFrames(const std::string& path, int w, int h, const std::string& theme, bool overlay, ImFontAtlas* atlas, const unsigned char* tex, int tw, int th,
+                  const std::function<void()>& draw) {
     using namespace xr::ui2;
     ImGuiContext* ctx = ImGui::CreateContext(atlas);
     ImGui::SetCurrentContext(ctx);
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr; io.DisplaySize = ImVec2((float)w, (float)h); io.DeltaTime = 1.f / 60.f;
-    applyTheme(m.settings.uiTheme.c_str(), 1.f);
+    applyTheme(theme.c_str(), 1.f);
     Raster r(w, h); r.tex = tex; r.tw = tw; r.th = th;
     r.clear(overlay ? ImVec4(0.25f, 0.3f, 0.36f, 1) : palette().bg);
     for (int frame = 0; frame < 3; ++frame) {   // a few frames: tables and child sizes settle
         ImGui::NewFrame();
         ImGui::SetNextWindowPos(ImVec2(0, 0)); ImGui::SetNextWindowSize(ImVec2((float)w, (float)h));
         ImGui::Begin("##xr", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoSavedSettings | (overlay ? ImGuiWindowFlags_NoBackground : 0));
-        Fonts f; f.body = atlas->Fonts[0]; f.heading = atlas->Fonts[1]; f.big = atlas->Fonts[2]; f.mono = atlas->Fonts[0];
+        Fonts f; f.body = atlas->Fonts[0]; f.heading = atlas->Fonts[1]; f.big = atlas->Fonts[2]; f.mono = atlas->Fonts[0]; f.small = atlas->Fonts[3];
         setFonts(f);
+        setTowerFonts(f);
         ImGui::PushFont(atlas->Fonts[0]);
-        if (overlay) drawOverlay(m, a, (float)w); else drawMain(m, a);
+        draw();
         ImGui::PopFont();
         ImGui::End();
         ImGui::Render();
@@ -127,6 +135,27 @@ void renderTo(const std::string& path, int w, int h, xr::ui2::Model& m, const xr
     writePng(path, w, h, r.rgba.data());
     ImGui::DestroyContext(ctx);
     printf("wrote %s\n", path.c_str());
+}
+
+void renderTo(const std::string& path, int w, int h, xr::ui2::Model& m, const xr::ui2::Actions& a, bool overlay, ImFontAtlas* atlas, const unsigned char* tex, int tw, int th) {
+    renderFrames(path, w, h, m.settings.uiTheme, overlay, atlas, tex, tw, th, [&] { if (overlay) xr::ui2::drawOverlay(m, a, (float)w); else xr::ui2::drawMain(m, a); });
+}
+
+// Tower mode as it looks linked to a trainer: the fixture's airport and state, FIN321 selected, a pilot on the air.
+bool loadTower(const std::string& path, xr::tower::State* s) {
+    std::ifstream in(path);
+    std::string line;
+    bool airport = false, state = false;
+    s->myId = "x1";
+    while (std::getline(in, line)) {
+        airport |= xr::tower::parseAirportLine(line, *s);
+        state |= xr::tower::parseStateLine(line, *s, "TWR");
+    }
+    s->phase = xr::tower::Phase::Linked; s->linked = true; s->endpoint = "127.0.0.1:8781";
+    s->now = 100.f; s->selectedId = 1;
+    xr::tower::LiveCall c; c.from = "DLH5KM"; c.text = "Lufthansa five kilo mike, 3 miles, runway 26"; c.at = 99.f;
+    s->live.push_back(c);
+    return airport && state;
 }
 
 }  // namespace
@@ -140,6 +169,7 @@ int main(int argc, char** argv) {
     atlas.AddFontFromMemoryCompressedTTF(InterRegular_compressed_data, (int)InterRegular_compressed_size, 15.f, &cfg, ranges);
     atlas.AddFontFromMemoryCompressedTTF(InterSemiBold_compressed_data, (int)InterSemiBold_compressed_size, 17.f, &cfg, ranges);
     atlas.AddFontFromMemoryCompressedTTF(InterSemiBold_compressed_data, (int)InterSemiBold_compressed_size, 26.f, &cfg, ranges);
+    atlas.AddFontFromMemoryCompressedTTF(InterRegular_compressed_data, (int)InterRegular_compressed_size, 12.5f, &cfg, ranges);
     unsigned char* pixels = nullptr; int tw = 0, th = 0;
     atlas.GetTexDataAsRGBA32(&pixels, &tw, &th);
     std::vector<unsigned char> tex(pixels, pixels + (size_t)tw * th * 4);
@@ -164,6 +194,31 @@ int main(int argc, char** argv) {
         xr::ui2::state() = xr::ui2::UiState();
         xr::ui2::toast("EETN_TWR: ESXYZ, hold position, traffic on short final", 2, 399.0);
         renderTo(out + "/overlay" + (theme == "light" ? "-light" : "") + ".png", 560, 96, m, a, true, &atlas, tex.data(), tw, th);
+    }
+    {   // Tower mode's windows
+        const std::string fixture = argc > 3 ? argv[3] : "tools/fixtures/tower_preview.jsonl";
+        xr::tower::State s;
+        if (!loadTower(fixture, &s)) { fprintf(stderr, "no tower fixture at %s -- run from the repo root or pass its path\n", fixture.c_str()); return 1; }
+        xr::ui2::TowerActions ta;
+        const char* names[xr::ui2::kTwCount] = {"radar", "strips", "delivery", "frequency", "ops", "banner"};
+        const int sizes[xr::ui2::kTwCount][2] = {{960, 620}, {560, 560}, {760, 250}, {720, 330}, {640, 360}, {640, 128}};
+        for (int i = 0; i < xr::ui2::kTwCount; ++i) {
+            xr::tower::State v = s;
+            if (i == xr::ui2::kTwBanner) { v.phase = xr::tower::Phase::Unreachable; v.linkError = "connection refused"; v.retryInS = 4.f; }
+            xr::ui2::towerUi() = xr::ui2::TowerUi();
+            if (i == xr::ui2::kTwFrequency) snprintf(xr::ui2::towerUi().cmd, sizeof xr::ui2::towerUi().cmd, "FIN");
+            xr::ui2::TowerFrame f; f.which = i; f.code = "TOWER"; f.position = "TWR";
+            renderFrames(out + "/tower-" + names[i] + (theme == "light" ? "-light" : "") + ".png", sizes[i][0], sizes[i][1], theme, false, &atlas, tex.data(), tw, th,
+                         [&] { xr::ui2::drawTower(f, v, ta); });
+        }
+        {   // the radar close up: the apron, with taxiway names, stand names and aircraft at their real size
+            xr::ui2::towerUi() = xr::ui2::TowerUi();
+            xr::ui2::TowerUi& u = xr::ui2::towerUi();
+            u.view.cx = 1050.f; u.view.cy = -230.f; u.view.ppm = 1.15f; u.viewIcao = s.icao; u.viewFitted = true;
+            xr::ui2::TowerFrame f; f.which = xr::ui2::kTwRadar;
+            renderFrames(out + "/tower-radar-close" + (theme == "light" ? "-light" : "") + ".png", 960, 620, theme, false, &atlas, tex.data(), tw, th,
+                         [&] { xr::ui2::drawTower(f, s, ta); });
+        }
     }
     return 0;
 }

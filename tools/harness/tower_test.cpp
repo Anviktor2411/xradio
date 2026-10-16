@@ -1,7 +1,9 @@
 // Tower mode (v0.6.0) without X-Plane: the JSON reader, the apt.dat tower viewpoint from a fixture, the METAR
-// parser, and -- with XR_TOWER_PORT set to a running tools/fake_towertrainer.py -- the whole thing: entering
-// takes the camera to the trainer's tower and freezes the user's aircraft, the windows show the traffic, an
-// ACCEPT click and a typed instruction reach the trainer, and leaving restores the aircraft exactly.
+// parser, and -- with XR_TOWER_PORT set to a running tools/fake_towertrainer.py -- the whole thing: with nobody
+// at the port the link reports why and backs off (and Retry jumps the queue), then entering takes the camera to
+// the trainer's tower and freezes the user's aircraft, the airport and traffic arrive, every action the windows
+// have (accept, transmit, a strip to another bay, LVP, runway, stop bars, light gun) reaches the trainer as one
+// message, and leaving restores the aircraft exactly. The windows themselves: tools/harness/tower_ui_test.
 //   tools/fake_towertrainer.py --port 8781 --log received.txt &
 //   XR_TOWER_PORT=8781 XR_TOWER_LOG=received.txt ./tower_test
 #include <chrono>
@@ -9,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -87,11 +90,12 @@ int main(int argc, char** argv) {
         return fails ? 1 : 0;
     }
     harness::setEnv("XR_HARNESS", "1");
-    {
+    auto writeCfg = [](const std::string& port) {
         std::ofstream cfg(harness::cfgPath());
         cfg << "callsign = ESXYZ\nhost = 127.0.0.1\nport = 49199\nautoconnect = no\n"
-            << "towerhost = 127.0.0.1\ntowerport = " << portEnv << "\ntowercode = TOWER\ntowerpos = TWR\ntowername = X-Plane\ntowerpark = yes\ntowerweather = yes\ntower3d = no\n";
-    }
+            << "towerhost = 127.0.0.1\ntowerport = " << port << "\ntowercode = TOWER\ntowerpos = TWR\ntowername = X-Plane\ntowerpark = yes\ntowerweather = yes\ntower3d = no\n";
+    };
+    writeCfg("1");     // nothing listens there: the trainer is "not running" until the config points at the fake
     harness::set("sim/flightmodel/position/local_x", 1234.5);
     harness::set("sim/flightmodel/position/local_y", 42.25);
     harness::set("sim/flightmodel/position/local_z", -987.125);
@@ -107,22 +111,45 @@ int main(int argc, char** argv) {
     char n[256], sg[256], d[256];
     XPluginStart(n, sg, d);
     XPluginEnable();
-    check(!xr::tower::active(), "tower mode starts off");
+    check(!xr::tower::active() && xr::tower::state().phase == xr::tower::Phase::Off, "tower mode starts off");
     xr::tower::toggle();
     check(xr::tower::active(), "toggle enters tower mode");
-    bool linked = false;
-    for (int i = 0; i < 100 && !linked; ++i) {
-        harness::tick(0.1f);
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        linked = xr::tower::state().linked && xr::tower::state().haveAirport && !xr::tower::state().ac.empty() && xr::tower::state().myPos == "TWR";
-    }
-    check(linked, ("linked to the fake trainer, airport and traffic received, TWR claimed (" + xr::tower::state().linkStatus + ")").c_str());
+    auto tickUntil = [](float seconds, const std::function<bool()>& done) {
+        for (int i = 0; i < (int)(seconds * 10) && !done(); ++i) { harness::tick(0.1f); std::this_thread::sleep_for(std::chrono::milliseconds(100)); }
+        return done();
+    };
+    // ---- TowerTrainer not running: the banner's facts, the back-off, Retry jumping it
     const xr::tower::State& st = xr::tower::state();
+    const bool down = tickUntil(5.f, [&] { return st.phase == xr::tower::Phase::Unreachable && !st.linkError.empty(); });
+    check(down && st.endpoint == "127.0.0.1:1", ("nobody at the port: Unreachable, with the address and why (" + st.linkError + ")").c_str());
+    check(tickUntil(12.f, [&] { return st.retryInS > 2.5f; }), "the next try backs off (1 s, 2 s, 4 s ...)");
+    const int attemptsBefore = st.linkAttempts;
+    xr::tower::retry();
+    check(tickUntil(0.6f, [&] { return st.linkAttempts > attemptsBefore; }), "Retry tries at once instead of waiting out the back-off");
+    float nextWait = -1.f;     // the first wait after that attempt (a refused connect takes a while on Windows)
+    tickUntil(5.f, [&] { if (st.linkAttempts > attemptsBefore && st.retryInS > 0.f && nextWait < 0.f) nextWait = st.retryInS; return nextWait >= 0.f; });
+    check(nextWait > 0.f && nextWait <= 1.05f, ("...and starts the back-off over at one second (" + std::to_string(nextWait) + " s)").c_str());
+    check(xr::tower::windowsVisible(), "the windows are wanted (the user interface opens them once linked)");
+    // ---- the fake trainer
+    {
+        xr::tower::Config c = xr::tower::config();
+        c.port = portEnv;
+        xr::tower::applyConfig(c);
+    }
+    const bool linked = tickUntil(10.f, [&] { return st.linked && st.haveAirport && !st.ac.empty() && st.myPos == "TWR" && st.phase == xr::tower::Phase::Linked; });
+    check(linked, ("linked to the fake trainer, airport and traffic received, TWR claimed (" + st.linkStatus + ")").c_str());
     check(st.icao == "EETN" && st.runways.size() == 1 && st.runways[0].ends[0].name == "08" && st.haveTower, "airport line parsed: EETN, runway 08/26, OSM tower");
-    const xr::tower::Aircraft* fin = nullptr; const xr::tower::Aircraft* sas = nullptr;
-    for (const auto& ac : st.ac) { if (ac.cs == "FIN321") fin = &ac; if (ac.cs == "SAS123") sas = &ac; }
-    check(fin && sas && fin->freq == "TWR" && std::fabs(fin->lat - (59.413333 + (-40.0) / 110540.0)) < 1e-6 && std::fabs(fin->lon - (24.8325 + 1900.0 / (cos(59.413333 * 3.14159265 / 180) * 111320.0))) < 1e-6, "aircraft positions converted from the trainer's metres to lat/lon");
-    check(sas && sas->handoffIn && sas->handoffFrom == "GND", "an incoming handoff is marked on the strip");
+    check(st.stands.size() == 11 && st.taxiNodes.size() == 16 && st.taxiEdges.size() == 14 && st.pavement.size() == 2 && st.holdLines.size() == 5,
+          "and what the ground radar draws: stands, the taxi network, the pavement, the holding points");
+    check(st.delivery.size() == 3 && st.delivery[1].cs == "BTI4KT" && st.delivery[1].clearance.rfind("Air Baltic four kilo tango cleared to Riga", 0) == 0 && st.delivery[2].cleared,
+          "the trainer's Delivery list: requests with its clearance text, a cleared one marked");
+    check(st.haveStopBars && st.stopBars && st.positions.count("TWR") && st.positions.at("TWR").freq == "135.905", "stop bars lit, the positions' frequencies");
+    check(st.log.size() == 9 && st.log[3].from == "FIN321" && st.log[3].cls == "pilot dep" && st.log[4].from == "EETN_TWR", "the TWR log in entries: sender, class, text");
+    const xr::tower::Aircraft* fin = nullptr; const xr::tower::Aircraft* sas = nullptr; const xr::tower::Aircraft* lot = nullptr; const xr::tower::Aircraft* dlh = nullptr;
+    for (const auto& ac : st.ac) { if (ac.cs == "FIN321") fin = &ac; if (ac.cs == "SAS123") sas = &ac; if (ac.cs == "LOT789") lot = &ac; if (ac.cs == "DLH5KM") dlh = &ac; }
+    check(fin && sas && lot && dlh && fin->freq == "TWR" && std::fabs(fin->lat - (59.413333 + (-40.0) / 110540.0)) < 1e-6 && std::fabs(fin->lon - (24.8325 + 1900.0 / (cos(59.413333 * 3.14159265 / 180) * 111320.0))) < 1e-6,
+          "aircraft positions converted from the trainer's metres to lat/lon");
+    check(sas && sas->handoffIn && sas->handoffFrom == "GND" && fin && fin->sid == "ULGOT1G" && fin->cfl == 4000 && fin->tel == "Finnair", "an incoming handoff; SID, cleared level and telephony on the strip");
     xr::tower::CamView cam = xr::tower::camera();
     const double towerLat = 59.413333 + (-250.0) / 110540.0, towerLon = 24.8325 + 600.0 / (cos(59.413333 * 3.14159265 / 180) * 111320.0);
     check(harness::cameraControlled() && cam.on && std::fabs(cam.lat - towerLat) < 1e-6 && std::fabs(cam.lon - towerLon) < 1e-6 && std::fabs(cam.altM - 70.0) < 0.01,
@@ -135,59 +162,61 @@ int main(int argc, char** argv) {
     check(harness::get("sim/flightmodel/position/local_x") == 1234.5 && harness::get("sim/flightmodel/position/local_vx") == 0.0, "the aircraft stays where it was, with no velocity");
     // the weather sync wrote visibility and wind from the METAR
     check(std::fabs(harness::get("sim/weather/region/visibility_reported_sm") - 10000.f / 1609.34f) < 0.01 && harness::getArray("sim/weather/region/wind_direction_degt").size() >= 1 && harness::getArray("sim/weather/region/wind_direction_degt")[0] == 200.f, "visibility and wind from the trainer's METAR");
-    // windows: 4 radar, 5 strips, 6 delivery, 7 log, 8 ops
-    auto radar = harness::drawWindow(4);
-    check(harness::windowVisible(4) && contains(radar, "FIN3") && contains(radar, "EETN"), "radar window shows the airport and the traffic");
-    auto strips = harness::drawWindow(5);
-    check(contains(strips, "SAS123") && contains(strips, "ACCEPT from GND") && contains(strips, "FIN321"), "strip window shows the incoming handoff with ACCEPT");
-    int sx = 0, sy = 0;
-    bool accepted = false;
-    if (harness::drawnAt(" SAS123", &sx, &sy)) {
-        int wl = 0, wt = 0, wr = 0, wb = 0; harness::windowRect(5, &wl, &wt, &wr, &wb);
-        harness::click(5, wl + 400, sy);
-        harness::tick(0.1f);
-        std::this_thread::sleep_for(std::chrono::milliseconds(400));
-        harness::tick(0.1f);
-        const std::string got = readAll(getenv("XR_TOWER_LOG") ? getenv("XR_TOWER_LOG") : "received.txt");
-        accepted = got.find("\"type\":\"strip\"") != std::string::npos && got.find("\"accept\":true") != std::string::npos;
-    }
-    check(accepted, "clicking ACCEPT sends the strip acceptance to the trainer");
-    // select FIN321 in the strips and type an instruction into the log window
-    int fxp = 0, fyp = 0;
-    if (harness::drawnAt(" FIN321", &fxp, &fyp)) { int wl, wt, wr, wb; harness::windowRect(5, &wl, &wt, &wr, &wb); harness::click(5, wl + 30, fyp); }
-    harness::drawWindow(7);
-    harness::typeText(7, "runway 26 cleared for takeoff");
-    harness::pressVk(7, 0x0D);
-    harness::tick(0.1f);
-    std::this_thread::sleep_for(std::chrono::milliseconds(400));
-    harness::tick(0.1f);
-    std::string got = readAll(getenv("XR_TOWER_LOG") ? getenv("XR_TOWER_LOG") : "received.txt");
-    check(got.find("\"type\":\"tx\"") != std::string::npos && got.find("FIN321 runway 26 cleared for takeoff") != std::string::npos, "a typed instruction goes to the trainer as my transmission (callsign filled in)");
-    auto log = harness::drawWindow(7);
-    check(contains(log, "> FIN321 runway 26 cleared for takeoff") && contains(log, "Roger"), "the log shows my call and the pilot's answer from the trainer");
-    // ops: LVP button
-    auto ops = harness::drawWindow(8);
-    check(contains(ops, "ATIS") || contains(ops, "RWY 26"), "ops window shows the ATIS / runway");
-    int lx = 0, ly = 0;
-    if (harness::drawnAt("LVP on", &lx, &ly)) { harness::click(8, lx + 4, ly + 2); harness::drawWindow(8); harness::tick(0.1f); std::this_thread::sleep_for(std::chrono::milliseconds(400)); }
-    got = readAll(getenv("XR_TOWER_LOG") ? getenv("XR_TOWER_LOG") : "received.txt");
-    check(got.find("\"type\":\"ops\",\"what\":\"lvp\",\"value\":true") != std::string::npos, "the LVP button sends an ops request");
-    // look / zoom / lock
+    // ---- what the windows do, each one message to the trainer
+    const std::string logPath = getenv("XR_TOWER_LOG") ? getenv("XR_TOWER_LOG") : "received.txt";
+    auto received = [&](const std::string& needle) { return tickUntil(3.f, [&] { return readAll(logPath).find(needle) != std::string::npos; }); };
+    const int sasId = sas ? sas->id : -1, finId = fin ? fin->id : -1, lotId = lot ? lot->id : -1, dlhId = dlh ? dlh->id : -1;
+    xr::tower::acceptHandoff(sasId);
+    check(received("{\"type\":\"strip\",\"id\":2,\"accept\":true}"), "Accept on the incoming strip sends the acceptance to the trainer");
+    xr::tower::select(finId);
+    check(st.selectedId == finId, "selecting an aircraft");
+    xr::tower::transmit("FIN321 runway 26 cleared for takeoff");
+    check(received("\"type\":\"tx\",\"pos\":\"TWR\",\"text\":\"FIN321 runway 26 cleared for takeoff\""), "a typed instruction goes to the trainer as my transmission on TWR");
+    bool mine = false, roger = false;
+    tickUntil(3.f, [&] { for (const auto& c : st.live) { mine |= c.mine && c.text == "FIN321 runway 26 cleared for takeoff"; roger |= c.from == "FIN321" && c.text.rfind("Roger", 0) == 0; } return mine && roger; });
+    check(mine && roger, "the live feed shows my call and the pilot's answer until the trainer's log carries them");
+    xr::tower::moveStrip(lotId, "holding");
+    check(received("{\"type\":\"strip\",\"id\":9,\"bay\":\"holding\"}"), "dropping a strip on another bay asks the trainer to move it");
+    check(tickUntil(3.f, [&] { for (const auto& a : st.ac) if (a.cs == "LOT789") return a.stripBay == "holding" && a.stripState == a.state; return false; }),
+          "the trainer's next state has LOT789 in the Holding bay");
+    xr::tower::setLvp(true);
+    check(received("\"type\":\"ops\",\"what\":\"lvp\",\"value\":true"), "the LVP switch sends an ops request");
+    xr::tower::setRunway("08");
+    check(received("\"type\":\"ops\",\"what\":\"runway\",\"value\":\"08\""), "picking a runway sends it");
+    xr::tower::setStopBars(false);
+    check(received("\"type\":\"ops\",\"what\":\"stopbars\",\"value\":false"), "the stop bars switch sends it");
+    xr::tower::lightGun(finId, "green steady");
+    check(received("\"text\":\"FIN321 light green steady\""), "the light gun is an instruction to the selected aircraft");
+    xr::tower::lightGun(9999, "red steady");
+    xr::tower::moveStrip(9999, "holding");
+    xr::tower::acceptHandoff(9999);
+    harness::tick(0.1f); std::this_thread::sleep_for(std::chrono::milliseconds(300)); harness::tick(0.1f);
+    const std::string got = readAll(logPath);
+    check(got.find("9999") == std::string::npos, "nothing is sent about an aircraft the trainer does not have");
+    // ---- the camera
     xr::tower::look(30.f, 5.f);
     check(xr::tower::camera().yaw != cam.yaw && xr::tower::camera().pitch == cam.pitch + 5.f, "look() turns the camera");
     xr::tower::zoom(2.f);
     check(xr::tower::camera().zoom == 2.f, "zoom() for the binoculars");
+    xr::tower::follow(dlhId);
+    harness::tick(0.1f);
+    check(xr::tower::camera().locked == dlhId && st.followId == dlhId, "follow() locks the camera on an aircraft (the radar shows it followed)");
+    xr::tower::follow(-1);
+    check(xr::tower::camera().locked == -1, "follow(-1) lets go");
+    const float yawBefore = xr::tower::camera().yaw;
+    xr::tower::lookAt(finId);
+    check(xr::tower::camera().yaw != yawBefore && xr::tower::camera().locked == -1, "lookAt() turns towards an aircraft once, without following it");
     xr::tower::nextTarget();
     harness::tick(0.1f);
     check(xr::tower::camera().locked >= 0, "nextTarget() follows an aircraft");
     check(!xr::tower::statusLine().empty() && xr::tower::statusLine().find("EETN") != std::string::npos, ("status line: " + xr::tower::statusLine()).c_str());
-    // leave: everything back
+    // ---- leave: everything back
     xr::tower::toggle();
-    check(!xr::tower::active() && !harness::cameraControlled(), "leaving releases the camera");
+    check(!xr::tower::active() && !harness::cameraControlled() && st.phase == xr::tower::Phase::Off, "leaving releases the camera");
     check(harness::getArray("sim/operation/override/override_planepath")[0] == 0.f && harness::get("sim/flightmodel/position/local_x") == 1234.5 && harness::get("sim/flightmodel/position/local_y") == 42.25 &&
           harness::get("sim/flightmodel/position/local_z") == -987.125 && harness::get("sim/flightmodel/position/psi") == 123.5 && harness::get("sim/flightmodel/position/local_vx") == 3.0 && harness::get("sim/flightmodel/position/local_vz") == -4.0 &&
           harness::getArray("sim/flightmodel/position/q")[1] == 0.1f, "the aircraft is restored exactly: position, attitude, quaternion, velocities, override off");
-    check(!harness::windowVisible(4) && !harness::windowVisible(7), "the tower windows are hidden again");
+    check(!xr::tower::windowsVisible(), "the tower windows are not wanted any more");
     XPluginDisable();
     XPluginStop();
     printf(fails ? "%d FAILED\n" : "tower_test OK\n", fails);

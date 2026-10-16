@@ -63,6 +63,20 @@ The light theme: ![radio light](ui/radio-light.png)
   SimBrief (username or Pilot ID).
 * **Tower** — enter or leave TowerTrainer's tower cab (`docs/tower-mode.md`).
 
+## Tower mode's windows
+
+The ground radar, strips, Delivery, frequency, ATIS / operations and the connection banner are drawn the
+same way, with the same theme and fonts, in windows of their own that resize, pop out, go into VR and
+remember where they were (`docs/tower-mode.md` has what each does):
+
+| Ground radar | Strips |
+|---|---|
+| ![radar](ui/tower-radar.png) | ![strips](ui/tower-strips.png) |
+
+| Delivery | Frequency |
+|---|---|
+| ![delivery](ui/tower-delivery.png) | ![frequency](ui/tower-frequency.png) |
+
 ## First run
 
 The wizard opens when there is no callsign yet: who you are (callsign, aircraft type), audio (devices and
@@ -79,7 +93,10 @@ tabs, overlay, toasts and wizard with ImGui only; `imgui_xp.cpp` is the X-Plane 
 window, the shared font atlas uploaded through `XPLMGenerateTextureNumbers` / `XPLMBindTexture2d`,
 fixed-pipeline OpenGL rendering, input from the window callbacks, pop-out and VR positioning modes) --
 the approach ImgWindow (xsquawkbox / LiveTraffic, BSD) made standard, written fresh here under XRadio's
-MIT licence; `host.cpp` owns the two windows and the model; `theme.cpp` the palettes; `i18n.cpp` the
+MIT licence; `host.cpp` owns the windows and the model; `theme.cpp` the palettes; `i18n.cpp` the
 Estonian texts. The network never touches the window: `main.cpp` builds the model from its own state once
-per frame. `tools/ui_preview` renders the same drawing functions with a small software rasteriser to the
+per frame. Tower mode's windows follow the same split: `tower.cpp` keeps the logic and the link,
+`tower_parse.cpp` turns the trainer's lines into `tower::State`, `ui2/tower_model.cpp` holds what is
+logic in the windows (the strip bays, history and callsign completion, the radar's projection and label
+filter, the banner's words; tested by `ui_logic_test`), and `ui2/tower_ui.cpp` draws them. `tools/ui_preview` renders the same drawing functions with a small software rasteriser to the
 PNG files in this folder, so the layout can be seen (and reviewed) without the simulator.

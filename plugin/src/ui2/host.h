@@ -1,10 +1,11 @@
 // The glue between the plugin and the new window (Phase U): owns the X-Plane windows (main + the cockpit
-// overlay), the model the plugin fills every frame, the actions, toasts, theme and scale.
+// overlay, and Tower mode's six), the model the plugin fills every frame, the actions, toasts, theme and scale.
 #pragma once
 
 #include <string>
 
 #include "model.h"
+#include "tower_ui.h"
 
 namespace xr {
 namespace ui2 {
@@ -23,6 +24,14 @@ void resetPositions();
 std::string mainGeometry();                                     // "l,t,r,b"
 std::string overlayPosition();                                  // "l,t"
 int  currentTab();
+
+// Tower mode's windows (ground radar, strips, Delivery, frequency, ATIS / operations, the connection banner):
+// created hidden, shown and hidden every frame from the tower's state. The five work windows open once the
+// link and the airport are there; until then only the banner says what is missing.
+void initTower(const TowerActions& actions, const std::string& layout);
+void updateTower(const tower::State& s, bool active, bool windowsOn, const std::string& code, const std::string& position);
+std::string towerLayout();                                      // "l,t,r,b|..." in window order, for the settings file
+void resetTowerPositions();
 
 }  // namespace host
 

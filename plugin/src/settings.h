@@ -117,6 +117,7 @@ struct Settings {
     std::string uiWin;                     // remembered window geometry "l,t,r,b"
     std::string uiOverlayPos;              // remembered overlay position "l,t"
     std::string uiTab = "0";               // remembered tab
+    std::string towerLayout;               // remembered Tower windows "l,t,r,b|..." (radar, strips, Delivery, frequency, ops, banner)
 
     int         port_i() const { return atoi(port.c_str()); }
     int         hostPort_i() const { return atoi(hostPort.c_str()); }
@@ -230,6 +231,7 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"uiwin",       "Window geometry", Kind::Text, 6, &s.uiWin, 0,0,"",0, 40},
         {"uioverlaypos", "Overlay position", Kind::Text, 6, &s.uiOverlayPos, 0,0,"",0, 20},
         {"uitab",       "Last tab",       Kind::Text, 6, &s.uiTab, 0,0,"",0, 2, true},
+        {"towerlayout", "Tower windows",  Kind::Text, 6, &s.towerLayout, 0,0,"",0, 255},
     };
 }
 

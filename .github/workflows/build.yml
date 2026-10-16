@@ -209,6 +209,12 @@ jobs:
       - name: The window's logic
         run: ASAN_OPTIONS=detect_leaks=0 ./build-tests/ui_logic_test
 
+      # Tower mode's windows clicked through in ImGui contexts of their own, without X-Plane
+      # or OpenGL: Clear in Delivery, the command line, strips dragged between bays, the radar,
+      # the light gun, the banner's Retry -- each checked to ask tower.cpp for the right thing.
+      - name: Tower mode's windows
+        run: ASAN_OPTIONS=detect_leaks=0 ./build-tests/tower_ui_test
+
       - name: SimBrief import against a fake SimBrief
         run: ASAN_OPTIONS=detect_leaks=0 bash tools/check_simbrief.sh build-tests
 

@@ -14,8 +14,8 @@
 namespace xr {
 namespace ui2 {
 
-// Fonts for every window: Inter (OFL), body / heading / big / mono-ish, at the UI scale.
-struct FontSet { ImFont* body = nullptr; ImFont* heading = nullptr; ImFont* big = nullptr; ImFont* mono = nullptr; };
+// Fonts for every window: Inter (OFL), body / heading / big / mono-ish / small (radar labels), at the UI scale.
+struct FontSet { ImFont* body = nullptr; ImFont* heading = nullptr; ImFont* big = nullptr; ImFont* mono = nullptr; ImFont* small = nullptr; };
 ImFontAtlas* sharedAtlas();                 // built on first use
 const FontSet& fonts();
 void   rebuildFonts(float scale);           // after the UI scale changed (re-uploads the texture)

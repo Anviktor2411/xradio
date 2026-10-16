@@ -1,11 +1,15 @@
 // The window's logic without the window (Phase U): frequency formatting and parsing, callsign checks,
 // signal bars, the stuck-mic warning, unread counts, pilot filtering and station ordering, the toast queue,
-// the first-run wizard's blockers and the flight-plan form's checks. No ImGui, no X-Plane.
+// the first-run wizard's blockers and the flight-plan form's checks, and Tower mode's strip bays, command line,
+// radar maths and banner (ui2/tower_model.h). No ImGui, no X-Plane.
 //   ./ui_logic_test
+#include <cmath>
 #include <cstdio>
 #include <string>
 
+#include "../../plugin/src/ui2/i18n.h"
 #include "../../plugin/src/ui2/model.h"
+#include "../../plugin/src/ui2/tower_model.h"
 
 static int fails = 0;
 static void check(bool ok, const char* what) { printf("%s  %s\n", ok ? "PASS" : "FAIL", what); if (!ok) ++fails; }
@@ -97,6 +101,105 @@ int main() {
         check(rows[1].differs && rows[2].differs && rows[3].differs, "clearanceRows: another SID, cruise level and destination are marked");
         c.ofp.present = true; c.ofp.sid = "ULGOT2W"; rows = clearanceRows(c);
         check(!rows[1].differs && rows[1].plan == "ULGOT2W", "clearanceRows: the OFP's SID wins over the route's first token");
+    }
+
+    {   // Tower mode's windows: the logic under them (ui2/tower_model.h)
+        using namespace xr::ui2::tw;
+        using xr::tower::Aircraft;
+        check(baysFor("TWR", true).front() == "incoming" && baysFor("TWR", true).size() == 9 && baysFor("TWR", false).size() == 13 && baysFor("DEL", true).size() == 3,
+              "tower: the bays of a position's board, the whole board when positions are not split");
+        Aircraft dep; dep.kind = "dep"; dep.state = "clr_req"; dep.freq = "DEL";
+        Aircraft ga = dep; ga.ga = true;
+        Aircraft arr; arr.kind = "arr"; arr.state = "final"; arr.freq = "APP";
+        Aircraft veh; veh.veh = true; veh.state = "idle"; veh.freq = "GND";
+        Aircraft live; live.human = true; live.freq = "GND"; live.kind = "dep"; live.state = "taxi";
+        check(autoBay(dep) == "pending" && autoBay(ga) == "taxi" && autoBay(arr) == "approach" && autoBay(live) == "live", "tower: the bay a state puts a strip in (TowerTrainer's rules)");
+        arr.freq = "TWR";
+        check(autoBay(arr) == "final", "tower: an arrival on Tower's frequency is in Final, on Approach's in Approach");
+        check(onBoard(dep, "DEL", true) && !onBoard(dep, "TWR", true) && onBoard(dep, "TWR", false) && !onBoard(veh, "GND", true) && onBoard(live, "TWR", true) && !onBoard(live, "DEL", true),
+              "tower: who is on a position's board (its frequency, live pilots but not at Delivery, no idle vehicles)");
+        Aircraft hand = dep; hand.handoffTo = "TWR"; hand.handoffFrom = "GND"; hand.freq = "GND";
+        check(incomingFor(hand, "TWR") && onBoard(hand, "TWR", true) && !incomingFor(hand, "GND"), "tower: a strip handed to TWR is on TWR's board, in Incoming");
+        std::vector<Aircraft> ac(3);
+        ac[0].cs = "FIN321"; ac[1].cs = "FIN1AB"; ac[2].cs = "SAS123";
+        check(callsignMatches("fi", ac).size() == 2 && callsignMatches("123", ac).size() == 1 && callsignMatches("FIN321 run", ac).empty() && callsignMatches("", ac).empty(),
+              "tower: callsign matches while the first word is typed, case-insensitive, also inside a callsign");
+        check(completeCallsign("FI", ac) == "FIN" && completeCallsign("FIN3", ac) == "FIN321 " && completeCallsign("SA", ac) == "SAS123 " && completeCallsign("XX", ac) == "XX",
+              "tower: Tab completes as far as the candidates agree, all the way when one is left");
+        History h;
+        std::string out;
+        check(!h.up("x", &out), "tower: no history, nothing to recall");
+        h.push("one"); h.push("two"); h.push("two"); h.push("   ");
+        check(h.size() == 2 && h.up("draft", &out) && out == "two" && h.up("", &out) && out == "one" && !h.up("", &out) && h.down(&out) && out == "two" && h.down(&out) && out == "draft" && !h.down(&out),
+              "tower: history up and down, the line being typed kept, no repeats, no blank lines");
+        View v; v.cx = 100.f; v.cy = -50.f; v.ppm = 0.5f;
+        const Vec o{10.f, 20.f}, size{800.f, 600.f};
+        const Vec sp = toScreen(v, o, size, 300.f, 150.f), back = toWorld(v, o, size, sp.x, sp.y);
+        check(std::fabs(back.x - 300.f) < 0.01f && std::fabs(back.y - 150.f) < 0.01f && sp.y < o.y + size.y * 0.5f, "tower radar: screen and world agree, north is up");
+        const Vec mouse{600.f, 200.f}, under = toWorld(v, o, size, mouse.x, mouse.y);
+        zoomAt(v, o, size, 2.f, mouse);
+        const Vec still = toWorld(v, o, size, mouse.x, mouse.y);
+        check(std::fabs(v.ppm - 1.f) < 1e-5f && std::fabs(still.x - under.x) < 0.01f && std::fabs(still.y - under.y) < 0.01f, "tower radar: zooming keeps the point under the mouse where it is");
+        pan(v, 50.f, -20.f);
+        const Vec moved = toWorld(v, o, size, mouse.x + 50.f, mouse.y - 20.f);
+        check(std::fabs(moved.x - under.x) < 0.01f && std::fabs(moved.y - under.y) < 0.01f, "tower radar: dragging carries the picture with the mouse");
+        check(ringStep(0.5f) == 200.f && ringStep(0.05f) == 2000.f && ringStep(0.001f) > 1852.f * 49 && rangeText(500) == "500 m" && rangeText(2000) == "2 km" && rangeText(1852 * 10) == "10 nm",
+              "tower radar: round range rings about 70 px apart, labelled in m, km, nm");
+        xr::tower::State st;
+        View f = fit(st, size);
+        check(f.ppm > 0.f && f.cx == 0.f, "tower radar: fitting an airport with nothing in it does not divide by zero");
+        st.runways.push_back({"08/26", 45.f, {{"08", -1500.f, 0.f}, {"26", 1500.f, 0.f}}});
+        f = fit(st, size);
+        check(std::fabs(f.ppm - (800.f - 140.f) / 3000.f) < 1e-4f, "tower radar: fitting shows the whole runway, with room for labels at its ends");
+        st.ac.resize(2);
+        st.ac[0].x = 2400.f; st.ac[1].x = 9000.f;
+        f = fit(st, size);
+        check(std::fabs(f.ppm - (800.f - 140.f) / 3900.f) < 1e-4f, "tower radar: an aircraft just past the runway end is in the picture, one 7 km out is not");
+        {   // the label filter: a busy apron stays readable
+            Aircraft parked; parked.kind = "dep"; parked.state = "parked"; parked.cs = "FIN321";
+            Aircraft quiet; quiet.veh = true; quiet.quiet = true; quiet.state = "roam";
+            Aircraft taxi = parked; taxi.state = "taxi";
+            Aircraft air = parked; air.state = "airborne"; air.onGround = false;
+            check(labelLines(parked, false, false, false, 0.5f, true) == 2 && labelLines(parked, false, false, false, 0.2f, true) == 1 && labelLines(parked, false, false, false, 0.05f, true) == 0,
+                  "tower radar: a parked aircraft's label shrinks to its callsign zoomed out, and goes further out still");
+            Aircraft dormant = parked; dormant.dormant = true;
+            check(labelLines(dormant, false, false, false, 0.5f, true) == 1 && labelLines(parked, true, false, false, 0.05f, true) == 2 && labelLines(parked, false, true, false, 0.05f, true) == 2 &&
+                  labelLines(parked, false, false, true, 0.05f, true) == 2,
+                  "tower radar: a dormant aircraft shows its callsign only; selected, under the mouse or calling it has its whole label");
+            check(labelLines(quiet, false, false, false, 1.f, true) == 0 && labelLines(quiet, false, true, false, 1.f, true) == 2 && labelLines(taxi, false, false, false, 0.05f, false) == 1 &&
+                  labelLines(taxi, false, false, false, 0.05f, true) == 2,
+                  "tower radar: a service vehicle's label on hover only; with Labels off, the callsign alone");
+            Aircraft sick = parked; sick.warn.push_back("EMG");
+            check(labelLines(sick, false, false, false, 0.05f, true) == 2 && labelPriority(sick, false, false) > labelPriority(air, false, false) &&
+                  labelPriority(air, false, false) > labelPriority(taxi, false, false) && labelPriority(taxi, false, false) > labelPriority(parked, false, false) &&
+                  labelPriority(parked, false, false) > labelPriority(quiet, false, false) && labelPriority(quiet, true, false) == 5,
+                  "tower radar: room goes to the selected aircraft, trouble, airborne, moving, parked, vehicles -- in that order");
+            check(labelMayHide(parked, false, false) && labelMayHide(quiet, false, false) && !labelMayHide(parked, true, false) && !labelMayHide(parked, false, true) && !labelMayHide(taxi, false, false),
+                  "tower radar: only parked aircraft and vehicles give their label up for want of room");
+        }
+        xr::tower::State s;
+        s.endpoint = "127.0.0.1:8781";
+        check(!bannerFor(s, "TOWER").show, "tower banner: none when Tower mode is off");
+        s.phase = xr::tower::Phase::Unreachable; s.retryInS = 3.2f;
+        Banner b = bannerFor(s, "TOWER");
+        check(b.show && b.retry && b.level == 1 && b.title.find("server.py") != std::string::npos && b.title.find("127.0.0.1:8781") != std::string::npos && b.detail.find("4 s") != std::string::npos,
+              "tower banner: unreachable -- start TowerTrainer, the address, when it tries again");
+        xr::ui2::setLanguage("et");
+        b = bannerFor(s, "TOWER");
+        check(b.title.rfind("Käivita TowerTrainer (server.py)", 0) == 0 && b.title.find("127.0.0.1:8781") != std::string::npos && b.detail.find("4 s") != std::string::npos &&
+              std::string(xr::ui2::tr("Steady green")) == "Püsiv roheline" && std::string(xr::ui2::tr(bayTitle("holding"))) == "Ootepunkt",
+              "tower in Estonian: the banner with the address and seconds filled in, the light gun, the bays");
+        xr::ui2::setLanguage("en");
+        s.phase = xr::tower::Phase::HostAway;
+        check(bannerFor(s, "TOWER").show && !bannerFor(s, "TOWER").retry, "tower banner: the trainer's window away, nothing to retry");
+        check(std::string(signalMeaning("green steady", true)) == "cleared for takeoff" && std::string(signalMeaning("green steady", false)) == "cleared to land" && signals().size() == 5,
+              "tower: the five light signals and what they mean on the ground and in the air");
+        xr::tower::LogEntry e; e.cls = "pilot human";
+        check(senderOf(e) == Sender::LivePilot && (e.cls = "ai", senderOf(e) == Sender::AiAtc) && (e.cls = "blk", senderOf(e) == Sender::Problem) && (e.cls = "sys", senderOf(e) == Sender::System),
+              "tower: whose line a log entry is, from the trainer's class");
+        xr::tower::LiveCall c; c.text = "runway 26 cleared for takeoff";
+        std::vector<xr::tower::LogEntry> lg(1); lg[0].text = "Finnair 321, runway 26 cleared for takeoff, wind calm";
+        check(inLog(c, lg) && (c.text = "line up", !inLog(c, lg)), "tower: a live call disappears once the trainer's log has it");
     }
 
     printf(fails ? "%d FAILED\n" : "ui_logic_test OK\n", fails);

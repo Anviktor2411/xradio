@@ -1560,6 +1560,7 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
     }
 #ifdef XRADIO_UI_IMGUI
     xr::ui2::host::update(buildModel());
+    xr::ui2::host::updateTower(xr::tower::state(), xr::tower::active(), xr::tower::windowsVisible(), g_cfg.towerCode, g_cfg.towerPos);
 #endif
 
     if (!g_sockReady.load()) {
@@ -3078,6 +3079,7 @@ void createSettingsWindow() {
 void resetWindowPositions() {
 #ifdef XRADIO_UI_IMGUI
     xr::ui2::host::resetPositions();
+    xr::ui2::host::resetTowerPositions();
 #endif
     int l, t, r, b;
     if (g_window) {
@@ -3171,6 +3173,27 @@ xr::ui2::Actions makeActions() {
     a.importSimbrief = []() { importSimbrief(); };
     a.writeFms = []() { return writeOfpFms(); };
     a.checkUpdate = []() {};
+    return a;
+}
+
+// What the tower windows do: each is one of tower.cpp's actions (the logic stays there).
+xr::ui2::TowerActions makeTowerActions() {
+    xr::ui2::TowerActions a;
+    a.select = [](int id) { xr::tower::select(id); };
+    a.transmit = [](const std::string& t) { xr::tower::transmit(t); };
+    a.accept = [](int id) { xr::tower::acceptHandoff(id); };
+    a.moveStrip = [](int id, const std::string& bay) { xr::tower::moveStrip(id, bay); };
+    a.setLvp = [](bool on) { xr::tower::setLvp(on); };
+    a.setRunway = [](const std::string& end) { xr::tower::setRunway(end); };
+    a.setStopBars = [](bool on) { xr::tower::setStopBars(on); };
+    a.lightGun = [](int id, const std::string& signal) { xr::tower::lightGun(id, signal); };
+    a.retry = []() { xr::tower::retry(); };
+    a.leave = []() { xr::tower::leave(); };
+    a.settings = []() { xr::ui2::host::showSettings(); xr::ui2::state().settingsGroup = 5; };
+    a.look = [](float dYaw, float dPitch) { xr::tower::look(dYaw, dPitch); };
+    a.binoculars = [](float f) { xr::tower::zoom(f); };
+    a.follow = [](int id) { xr::tower::follow(id); };
+    a.lookAt = [](int id) { xr::tower::lookAt(id); };
     return a;
 }
 
@@ -3348,12 +3371,13 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     // Third, deliberately: the test harness numbers windows in creation order
     // and two suites already know the settings window as number two.
     createNoticeWindow();
-    xr::tower::createWindows();     // windows 4..8 in the harness's numbering
 #ifdef XRADIO_UI_IMGUI
     // the text windows stay as the fallback build; with the ImGui window they are never shown
     if (g_window) XPLMSetWindowIsVisible(g_window, 0);
     if (g_noticeWin) XPLMSetWindowIsVisible(g_noticeWin, 0);
     xr::ui2::host::init(makeActions(), g_cfg);
+    // Tower mode's windows exist only here: a build without ImGui runs Tower mode (camera, link, traffic) headless
+    xr::ui2::host::initTower(makeTowerActions(), g_cfg.towerLayout);
 #endif
 
     std::string cslErr;
@@ -3441,6 +3465,7 @@ PLUGIN_API void XPluginStop(void) {
         if (!g.empty()) g_cfg.uiWin = g;
         if (!o.empty()) g_cfg.uiOverlayPos = o;
         g_cfg.uiTab = std::to_string(xr::ui2::host::currentTab());
+        g_cfg.towerLayout = xr::ui2::host::towerLayout();
         xr::saveSettings(g_cfg, g_cfgPath);
     }
     xr::ui2::host::shutdown();

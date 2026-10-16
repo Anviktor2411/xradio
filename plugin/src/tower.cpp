@@ -15,14 +15,12 @@
 
 #include "XPLMCamera.h"
 #include "XPLMDataAccess.h"
-#include "XPLMDisplay.h"
 #include "XPLMGraphics.h"
 #include "XPLMScenery.h"
-#include "XPLMUtilities.h"
 
 #include "json.h"
 #include "tcp.h"
-#include "ui.h"
+#include "tower_parse.h"
 #include "xpmp_bridge.h"
 
 namespace xr {
@@ -32,7 +30,11 @@ namespace {
 
 constexpr float kDegToRad = 3.14159265f / 180.f;
 constexpr uint32_t kSidBase = 0x7E000000u;        // CSL ids of the trainer's traffic, away from XRadio's
-constexpr int kMaxLog = 14;
+
+long long steadyMs() {
+    using namespace std::chrono;
+    return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
+}
 
 // ------------------------------------------------------------------ the link thread
 class Link {
@@ -41,6 +43,7 @@ public:
         stop();
         cfg_ = cfg;
         run_ = true;
+        kick_ = false;
         th_ = std::thread([this] { loop(); });
     }
     void stop() {
@@ -48,9 +51,13 @@ public:
         sock_.close();
         if (th_.joinable()) th_.join();
         connected_ = false;
+        unreachable_ = false;
     }
-    bool running() const { return run_; }
+    void kick() { kick_ = true; }                  // the next attempt now, not after the back-off
     bool connected() const { return connected_; }
+    bool unreachable() const { return unreachable_; }
+    int attempts() const { return attempts_; }
+    float retryIn() const { const long long d = nextTryMs_ - steadyMs(); return d > 0 ? d / 1000.f : 0.f; }
     void send(const std::string& line) {
         std::lock_guard<std::mutex> lk(mx_);
         if (outbox_.size() < 200) outbox_.push_back(line);
@@ -62,22 +69,35 @@ public:
         return out;
     }
     std::string status() { std::lock_guard<std::mutex> lk(mx_); return status_; }
-    int linesIn() const { return linesIn_; }
+    std::string error() { std::lock_guard<std::mutex> lk(mx_); return err_; }
 
 private:
     void setStatus(const std::string& s) { std::lock_guard<std::mutex> lk(mx_); status_ = s; }
+    // Sleep until the next attempt, or until retry() asks for it now. Returns true when it was asked.
+    bool wait(int ms) {
+        nextTryMs_ = steadyMs() + ms;
+        while (run_ && !kick_ && steadyMs() < nextTryMs_) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        nextTryMs_ = 0;
+        const bool kicked = kick_;
+        kick_ = false;
+        return kicked;
+    }
     void loop() {
         int backoffMs = 1000;
         while (run_) {
             std::string err;
+            ++attempts_;
             setStatus("connecting to " + cfg_.host + ":" + cfg_.port);
             if (!sock_.connect(cfg_.host, (uint16_t)atoi(cfg_.port.c_str()), 3000, &err)) {
+                { std::lock_guard<std::mutex> lk(mx_); err_ = err; }
+                unreachable_ = true;
                 setStatus("TowerTrainer not reachable at " + cfg_.host + ":" + cfg_.port + " (" + err + ") -- is server.py running?");
-                for (int i = 0; i < backoffMs / 100 && run_; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                backoffMs = std::min(10000, backoffMs * 2);
+                if (wait(backoffMs)) backoffMs = 1000; else backoffMs = std::min(10000, backoffMs * 2);
                 continue;
             }
             backoffMs = 1000;
+            unreachable_ = false;
+            { std::lock_guard<std::mutex> lk(mx_); err_.clear(); }
             sock_.sendLine("{\"type\":\"hello\",\"code\":" + json::quote(cfg_.code) + ",\"name\":" + json::quote(cfg_.name) +
                            ",\"pos\":" + json::quote(cfg_.position) + ",\"version\":\"0.6.0\"}");
             connected_ = true;
@@ -105,14 +125,13 @@ private:
                     std::lock_guard<std::mutex> lk(mx_);
                     if (inbox_.size() > 400) inbox_.pop_front();
                     inbox_.push_back(std::move(line));
-                    ++linesIn_;
                 }
                 if (buf.size() > 8 * 1024 * 1024) buf.clear();
             }
             connected_ = false;
             sock_.close();
             if (run_) setStatus("link lost -- reconnecting");
-            for (int i = 0; i < 20 && run_; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            wait(2000);
         }
     }
 
@@ -121,10 +140,13 @@ private:
     std::thread             th_;
     std::atomic<bool>       run_{false};
     std::atomic<bool>       connected_{false};
-    std::atomic<int>        linesIn_{0};
+    std::atomic<bool>       unreachable_{false};
+    std::atomic<bool>       kick_{false};
+    std::atomic<long long>  nextTryMs_{0};
+    std::atomic<int>        attempts_{0};
     std::mutex              mx_;
     std::deque<std::string> inbox_, outbox_;
-    std::string             status_;
+    std::string             status_, err_;
 };
 
 // ------------------------------------------------------------------ everything else
@@ -145,15 +167,6 @@ struct Refs {
 struct Sample { float x = 0, y = 0, altFt = 0, hdg = 0; float t = 0; };
 struct Track { Sample a, b; bool have = false; };
 
-struct Win {
-    XPLMWindowID id = nullptr;
-    int kind = 0;                  // 0 radar, 1 strips, 2 delivery, 3 log, 4 ops
-    ui::Ctx ctx;
-    bool dragging = false; int dragX = 0, dragY = 0; bool dragMoved = false;
-    std::vector<std::pair<int, int>> rowAc;    // y -> aircraft id, for clicks
-    std::vector<std::pair<int, std::pair<int, int>>> cellAc; // radar: (ac id, (col,row))
-};
-
 struct G {
     Hooks   hooks;
     Config  cfg;
@@ -163,6 +176,8 @@ struct G {
     Parked  parked;
     bool    active = false;
     bool    windowsOn = false;
+    bool    sessionMissing = false;    // the trainer answered "no such session": sticky until a welcome
+    bool    hostAway = false;
     float   elapsed = 0.f;
     float   lastPing = 0.f;
     float   lastWx = -1000.f;
@@ -183,11 +198,6 @@ struct G {
     std::map<int, Track> tracks;
     std::map<int, uint32_t> drawn;
     bool        drewAny = false;
-    // windows
-    Win     win[5];
-    std::string cmd;
-    int     radarRange = 0;        // 0 ground (3 km), 1 tower (15 nm)
-    bool    windowsCreated = false;
 };
 G& g() { static G inst; return inst; }
 
@@ -200,94 +210,33 @@ void logf(const char* fmt, ...) {
 inline double latOf(float y) { return g().st.lat0 + y / g().st.ky; }
 inline double lonOf(float x) { return g().st.lon0 + x / g().st.kx; }
 
-// ------------------------------------------------------------------ messages from the trainer
+std::string trim(const std::string& s) {
+    const size_t a = s.find_first_not_of(" \t\r\n");
+    if (a == std::string::npos) return "";
+    return s.substr(a, s.find_last_not_of(" \t\r\n") - a + 1);
+}
+
+// ------------------------------------------------------------------ messages to and from the trainer
 void sendLine(const std::string& l) { g().link.send(l); }
 void sendClaim() {
     if (!g().cfg.position.empty()) sendLine("{\"type\":\"claim\",\"pos\":" + json::quote(g().cfg.position) + "}");
 }
-
-std::vector<std::string> htmlLines(const std::string& html) {
-    std::vector<std::string> out;
-    size_t pos = 0;
-    while (pos < html.size()) {
-        size_t e = html.find("</div>", pos);
-        std::string part = html.substr(pos, e == std::string::npos ? std::string::npos : e - pos);
-        std::string t = json::stripHtml(part);
-        if (!t.empty()) out.push_back(t);
-        if (e == std::string::npos) break;
-        pos = e + 6;
-    }
-    return out;
+std::string myPosition() { return !g().st.myPos.empty() ? g().st.myPos : g().cfg.position; }
+const Aircraft* findAc(int id) {
+    for (const auto& a : g().st.ac) if (a.id == id) return &a;
+    return nullptr;
 }
 
 void onAirport(const json::Value& m) {
     State& s = g().st;
-    s.icao = m.s("icao");
-    s.aptName = m.s("name");
-    s.lat0 = m.n("lat"); s.lon0 = m.n("lon");
-    s.kx = cos(s.lat0 * kDegToRad) * 111320.0;
-    s.ky = 110540.0;
-    s.runways.clear();
-    for (size_t i = 0; i < m.a("runways").size(); ++i) {
-        const json::Value& r = m.a("runways")[i];
-        Runway rw; rw.name = r.s("name"); rw.width = (float)r.n("width", 45);
-        for (size_t k = 0; k < r.a("ends").size(); ++k) {
-            const json::Value& e = r.a("ends")[k];
-            rw.ends.push_back({e.s("name"), (float)e.n("x"), (float)e.n("y")});
-        }
-        if (rw.ends.size() == 2) s.runways.push_back(rw);
-    }
-    s.holdLines.clear();
-    for (size_t i = 0; i < m.a("holdLines").size(); ++i) s.holdLines.emplace_back((float)m.a("holdLines")[i].n("x"), (float)m.a("holdLines")[i].n("y"));
-    const json::Value* tw = m.at("tower");
-    s.haveTower = tw && tw->isArray() && tw->size() >= 2;
-    if (s.haveTower) { s.towerX = (float)(*tw)[0].num; s.towerY = (float)(*tw)[1].num; }
-    s.haveAirport = true;
-    logf("airport %s (%s) datum %.5f %.5f, %d runways, tower %s", s.icao.c_str(), s.aptName.c_str(), s.lat0, s.lon0, (int)s.runways.size(), s.haveTower ? "from OSM" : "unknown");
+    applyAirport(s, m);
+    logf("airport %s (%s) datum %.5f %.5f, %d runways, %d stands, %d taxiway segments, %d pavement areas, tower %s", s.icao.c_str(), s.aptName.c_str(), s.lat0, s.lon0,
+         (int)s.runways.size(), (int)s.stands.size(), (int)s.taxiEdges.size(), (int)s.pavement.size(), s.haveTower ? "from OSM" : "unknown");
 }
 
 void onState(const json::Value& m) {
     State& s = g().st;
-    s.rwy = m.s("rwy");
-    s.lvp = m.truthy("lvp");
-    s.atis = json::stripHtml(m.s("atis"));
-    s.metar = m.s("metar");
-    s.hostNick = m.s("hostNick");
-    s.utcMs = (long long)m.n("utc");
-    const json::Value* claims = m.at("claims");
-    if (claims && !g().st.myId.empty()) { const json::Value* mine = claims->at(g().st.myId.c_str()); if (mine && mine->isString()) s.myPos = mine->str; }
-    s.positionFreq.clear();
-    for (const auto& kv : m.o("positions").obj) s.positionFreq[kv.first] = kv.second.s("freq");
-    const std::string key = !s.myPos.empty() ? s.myPos : (m.truthy("split") ? g().cfg.position : "ALL");
-    s.logLines.clear();
-    const json::Value& lg = m.o("logs").a(key.c_str());
-    const size_t n = lg.size();
-    for (size_t i = n > (size_t)kMaxLog ? n - kMaxLog : 0; i < n; ++i) {
-        std::string t = json::stripHtml(lg[i].s("html"));
-        if (!t.empty()) s.logLines.push_back(t);
-    }
-    s.delLines = htmlLines(m.s("del"));
-    std::vector<Aircraft> list;
-    const json::Value& ac = m.a("ac");
-    bool selStill = false;
-    for (size_t i = 0; i < ac.size(); ++i) {
-        const json::Value& a = ac[i];
-        Aircraft r;
-        r.id = (int)a.n("id");
-        r.cs = a.s("cs"); r.type = a.s("type"); r.kind = a.s("kind"); r.state = a.s("state"); r.freq = a.s("freq"); r.squawk = a.s("squawk");
-        const json::Value& other = a.a("other");
-        r.dest = other.size() ? other[0].str : "";
-        r.x = (float)a.a("pos")[0].num; r.y = (float)a.a("pos")[1].num;
-        r.lat = latOf(r.y); r.lon = lonOf(r.x);
-        r.altFt = (float)a.n("alt"); r.hdg = (float)a.n("hdg"); r.gsKt = (float)(a.n("spd") / 0.514444);
-        r.onGround = a.truthy("onGround"); r.veh = a.truthy("veh"); r.human = a.truthy("human");
-        const json::Value& h = a.o("handoff");
-        if (h.isObject() && !h.truthy("accepted")) { r.handoffIn = h.s("to") == key; r.handoffFrom = h.s("from"); r.handoffAge = (int)h.n("age"); }
-        if (r.id == s.selectedId) selStill = true;
-        list.push_back(std::move(r));
-    }
-    s.ac.swap(list);
-    if (!selStill) s.selectedId = -1;
+    applyState(s, m, g().cfg.position);
     s.lastStateAt = g().elapsed;
     // samples for the 3D traffic
     for (const auto& a : s.ac) {
@@ -306,6 +255,8 @@ void handleLine(const std::string& line) {
     State& s = g().st;
     if (type == "welcome") {
         s.myId = m.s("id");
+        g().sessionMissing = false;
+        g().hostAway = false;
         s.linkStatus = "in session " + m.s("name") + (m.truthy("host") || !m.at("host") ? "" : " (host away)");
         sendClaim();
     } else if (type == "airport") onAirport(m);
@@ -320,21 +271,28 @@ void handleLine(const std::string& line) {
         if (s.alerts.size() > 6) s.alerts.erase(s.alerts.begin());
     } else if (type == "error" || type == "kicked") {
         const std::string e = m.s(type == "error" ? "error" : "reason");
-        s.linkStatus = e.find("no such session") != std::string::npos
-            ? "no session " + g().cfg.code + " -- in TowerTrainer tick Settings > XRadio > X-Plane tower link"
-            : type + ": " + e;
+        if (e.find("no such session") != std::string::npos) {
+            g().sessionMissing = true;
+            s.linkStatus = "no session " + g().cfg.code + " -- in TowerTrainer tick Settings > XRadio > X-Plane tower link";
+        } else {
+            s.linkStatus = type + ": " + e;
+        }
         logf("%s", s.linkStatus.c_str());
     } else if (type == "radio") {
         // relayed radio calls on my frequency: a live feed under the trainer's log (which carries them a moment later)
         const json::Value& r = m.o("m");
-        const std::string pos = r.s("pos"), my = !s.myPos.empty() ? s.myPos : g().cfg.position;
+        const std::string pos = r.s("pos"), my = myPosition();
         if (pos.empty() || pos == my || pos == "ALL" || pos == "GUARD") {
-            const std::string who = r.s("from") == "atc" ? std::string("ATC") : r.o("ac").s("cs", "?");
-            s.live.emplace_back(who + ": " + r.s("text"), g().elapsed);
-            if (s.live.size() > 6) s.live.erase(s.live.begin());
+            LiveCall c;
+            c.atc = r.s("from") == "atc";
+            c.from = c.atc ? std::string("ATC") : r.o("ac").s("cs", "?");
+            c.text = r.s("text");
+            c.at = g().elapsed;
+            s.live.push_back(c);
+            if (s.live.size() > 8) s.live.erase(s.live.begin());
         }
-    } else if (type == "hostLeft") s.linkStatus = "the trainer's window is away";
-    else if (type == "hostBack") { s.linkStatus = "linked"; sendClaim(); }
+    } else if (type == "hostLeft") { g().hostAway = true; s.linkStatus = "the trainer's window is away"; }
+    else if (type == "hostBack") { g().hostAway = false; s.linkStatus = "linked"; sendClaim(); }
 }
 
 // ------------------------------------------------------------------ camera
@@ -503,286 +461,15 @@ void syncWeather() {
     logf("weather from the trainer: vis %.0f m, wind %03.0f/%.0f kt", w.visM, w.windDeg, w.windKt);
 }
 
-// ------------------------------------------------------------------ windows
-const char* kTitles[5] = {"Tower: radar", "Tower: strips", "Tower: Delivery", "Tower: frequency", "Tower: ATIS / operations"};
-
-void sendTx(const std::string& text) {
-    G& G_ = g();
-    if (text.empty()) return;
-    const std::string pos = !G_.st.myPos.empty() ? G_.st.myPos : G_.cfg.position;
-    sendLine("{\"type\":\"tx\",\"pos\":" + json::quote(pos) + ",\"text\":" + json::quote(text) + "}");
-    G_.st.live.emplace_back("> " + text, G_.elapsed);      // my own call, until the trainer's log carries it
-    if (G_.st.live.size() > 6) G_.st.live.erase(G_.st.live.begin());
-}
 void sendOps(const std::string& what, const std::string& valueJson) {
     sendLine("{\"type\":\"ops\",\"what\":" + json::quote(what) + ",\"value\":" + valueJson + "}");
 }
-const Aircraft* selected() {
-    for (const auto& a : g().st.ac) if (a.id == g().st.selectedId) return &a;
-    return nullptr;
-}
-std::string fit(const std::string& s, size_t n) { return s.size() <= n ? s : s.substr(0, n - 1) + "~"; }
 
-// A character picture of the airport: runways as '=' and aircraft as the first letters of their callsign.
-void drawRadar(Win& w) {
-    G& G_ = g(); State& s = G_.st;
-    ui::Ctx& c = w.ctx;
-    const int cols = std::max(20, std::min(90, (c.right - c.left - 12) / 7)), rows = std::max(8, std::min(30, (c.top - c.bottom - 40) / 13));
-    std::vector<std::string> grid((size_t)rows, std::string((size_t)cols, ' '));
-    const float cx = s.haveTower ? s.towerX : 0.f, cy = s.haveTower ? s.towerY : 0.f;
-    const float rangeM = G_.radarRange == 0 ? 3000.f : 15.f * 1852.f;
-    auto cell = [&](float x, float y, int* col, int* row) {
-        const float fx = (x - cx) / rangeM, fy = (y - cy) / rangeM;
-        *col = (int)std::lround(cols / 2.0 + fx * cols / 2.0);
-        *row = (int)std::lround(rows / 2.0 - fy * rows / 2.0);
-        return *col >= 0 && *col < cols && *row >= 0 && *row < rows;
-    };
-    for (const auto& r : s.runways) {
-        for (int i = 0; i <= 60; ++i) {
-            const float f = i / 60.f;
-            int col, row;
-            if (cell(r.ends[0].x + (r.ends[1].x - r.ends[0].x) * f, r.ends[0].y + (r.ends[1].y - r.ends[0].y) * f, &col, &row)) grid[(size_t)row][(size_t)col] = '=';
-        }
-    }
-    if (G_.radarRange == 0) for (const auto& h : s.holdLines) { int col, row; if (cell(h.first, h.second, &col, &row) && grid[(size_t)row][(size_t)col] == ' ') grid[(size_t)row][(size_t)col] = '.'; }
-    int tc, tr;
-    if (cell(cx, cy, &tc, &tr)) grid[(size_t)tr][(size_t)tc] = 'T';
-    w.cellAc.clear();
-    for (const auto& a : s.ac) {
-        if (a.veh && G_.radarRange == 1) continue;
-        if (G_.radarRange == 0 && !a.onGround && a.altFt > 3000) continue;
-        int col, row;
-        if (!cell(a.x, a.y, &col, &row)) continue;
-        const std::string tag = a.cs.substr(0, (size_t)std::min<int>(4, (int)a.cs.size()));
-        for (size_t i = 0; i < tag.size() && col + (int)i < cols; ++i) grid[(size_t)row][(size_t)(col + (int)i)] = tag[i];
-        w.cellAc.emplace_back(a.id, std::make_pair(col, row));
-    }
-    char head[160];
-    snprintf(head, sizeof head, "%s %s  range %s  %d aircraft  %s%s", s.icao.empty() ? "--" : s.icao.c_str(), s.rwy.empty() ? "" : ("RWY " + s.rwy).c_str(),
-             G_.radarRange == 0 ? "3 km" : "15 nm", (int)s.ac.size(), G_.locked >= 0 ? "following " : "", G_.locked >= 0 ? (selected() ? selected()->cs.c_str() : "") : "");
-    ui::text(c, head, 2);
-    int fw = 7, fh = 10, dig = 0;
-    XPLMGetFontDimensions(xplmFont_Basic, &fw, &fh, &dig);
-    const int gridTop = c.y;
-    float white[3] = {0.9f, 0.95f, 1.f}, green[3] = {0.4f, 1.f, 0.5f};
-    for (int r = 0; r < rows; ++r) {
-        XPLMDrawString(white, c.left + 6, gridTop - r * 13, (char*)grid[(size_t)r].c_str(), nullptr, xplmFont_Basic);
-    }
-    const Aircraft* sel = selected();
-    if (sel) {
-        int col, row;
-        if (cell(sel->x, sel->y, &col, &row)) {
-            std::string tag = sel->cs.substr(0, (size_t)std::min<int>(4, (int)sel->cs.size()));
-            XPLMDrawString(green, c.left + 6 + col * fw, gridTop - row * 13, (char*)tag.c_str(), nullptr, xplmFont_Basic);
-        }
-    }
-    // remember the geometry for clicks
-    w.rowAc.clear();
-    w.rowAc.emplace_back(gridTop, fw);           // misuse: first entry carries gridTop and the cell width
-    w.rowAc.emplace_back(rows, cols);
-    c.y = gridTop - rows * 13 - 6;
-    const char* btn[2] = {"Range", "Follow / release"};
-    const int b = ui::buttons(c, btn, 2);
-    if (b == 0) G_.radarRange = 1 - G_.radarRange;
-    if (b == 1) { if (G_.locked >= 0) G_.locked = -1; else if (sel) G_.locked = sel->id; }
-    ui::text(c, "click an aircraft to select, drag to look around, wheel = binoculars", 1);
-}
-
-void drawStrips(Win& w) {
-    G& G_ = g(); State& s = G_.st;
-    ui::Ctx& c = w.ctx;
-    const std::string my = !s.myPos.empty() ? s.myPos : G_.cfg.position;
-    w.rowAc.clear();
-    char head[120];
-    snprintf(head, sizeof head, "Strips %s %s", my.c_str(), s.positionFreq.count(my) ? s.positionFreq[my].c_str() : "");
-    ui::text(c, head, 2);
-    const char* bays[4] = {"INCOMING", "DEPARTURES", "ARRIVALS", "OTHER"};
-    for (int bay = 0; bay < 4; ++bay) {
-        std::vector<const Aircraft*> list;
-        for (const auto& a : s.ac) {
-            if (a.veh) continue;
-            const bool mine = a.freq == my || my == "ALL";
-            if (bay == 0 ? a.handoffIn : (!mine || a.handoffIn) ? false : bay == 1 ? a.kind == "dep" : bay == 2 ? a.kind == "arr" : (a.kind != "dep" && a.kind != "arr")) list.push_back(&a);
-        }
-        if (list.empty() && bay != 1) continue;
-        ui::text(c, bays[bay], 1);
-        for (const Aircraft* a : list) {
-            char row[160];
-            snprintf(row, sizeof row, "%s%-8s %-4s %s%s %s%s", a->id == s.selectedId ? ">" : " ", a->cs.c_str(), a->type.c_str(), a->dest.empty() ? "" : a->dest.c_str(), a->dest.empty() ? "" : " ",
-                     a->state.c_str(), a->handoffIn ? ("  [ACCEPT from " + a->handoffFrom + "]").c_str() : "");
-            w.rowAc.emplace_back(c.y, a->id);
-            ui::text(c, row, a->handoffIn ? 3 : a->id == s.selectedId ? 2 : 0);
-            c.nextRow();
-        }
-    }
-}
-
-void drawDelivery(Win& w) {
-    G& G_ = g(); State& s = G_.st;
-    ui::Ctx& c = w.ctx;
-    w.rowAc.clear();
-    ui::text(c, "Delivery: clearance requests", 2);
-    int n = 0;
-    for (const auto& a : s.ac) {
-        if (a.kind != "dep" || !(a.state == "clr_req" || a.state == "parked" || a.state == "cleared")) continue;
-        char row[160];
-        snprintf(row, sizeof row, "%s%-8s %-4s -> %-4s  sq %s  %s", a.id == s.selectedId ? ">" : " ", a.cs.c_str(), a.type.c_str(), a.dest.c_str(), a.squawk.c_str(), a.state == "clr_req" ? "REQUESTING" : a.state.c_str());
-        w.rowAc.emplace_back(c.y, a.id);
-        ui::text(c, row, a.state == "clr_req" ? 3 : a.id == s.selectedId ? 2 : 0);
-        c.nextRow();
-        if (++n >= 14) break;
-    }
-    for (const auto& l : s.delLines) { ui::text(c, fit(l, 90).c_str(), 1); if (++n >= 20) break; }
-    if (n == 0) { ui::text(c, "nothing pending", 1); }
-}
-
-void drawLog(Win& w) {
-    G& G_ = g(); State& s = G_.st;
-    ui::Ctx& c = w.ctx;
-    const std::string my = !s.myPos.empty() ? s.myPos : G_.cfg.position;
-    const bool tx = G_.hooks.pttDown && G_.hooks.pttDown();
-    char head[160];
-    snprintf(head, sizeof head, "%s %s   %s", my.c_str(), s.positionFreq.count(my) ? s.positionFreq[my].c_str() : "", tx ? "TX *" : s.linked ? "RX" : s.linkStatus.c_str());
-    ui::text(c, head, tx ? 3 : 2);
-    const size_t maxCols = (size_t)std::max(30, (c.right - c.left - 12) / 7);
-    for (const auto& l : s.logLines) { ui::text(c, fit(l, maxCols).c_str(), l.rfind("> ", 0) == 0 ? 2 : 0); }
-    for (const auto& al : s.alerts) if (G_.elapsed - al.second < 20.f) { ui::text(c, fit("! " + al.first, maxCols).c_str(), 3); }
-    for (const auto& lv : s.live) if (G_.elapsed - lv.second < 25.f) ui::text(c, fit(lv.first, maxCols).c_str(), lv.first.rfind("ATC", 0) == 0 || lv.first.rfind("> ", 0) == 0 ? 2 : 0);
-    ui::text(c, ("Say: " + G_.cmd + ((int)(G_.elapsed * 2) % 2 ? "_" : " ")).c_str(), 2);
-    ui::text(c, "Enter sends it as your instruction; the selected aircraft's callsign is filled in", 1);
-}
-
-void drawOps(Win& w) {
-    G& G_ = g(); State& s = G_.st;
-    ui::Ctx& c = w.ctx;
-    char head[200];
-    snprintf(head, sizeof head, "%s  RWY %s  LVP %s  %s", s.icao.c_str(), s.rwy.c_str(), s.lvp ? "ON" : "off", s.hostNick.empty() ? "" : ("host " + s.hostNick).c_str());
-    ui::text(c, head, 2);
-    const size_t maxCols = (size_t)std::max(30, (c.right - c.left - 12) / 7);
-    std::string atis = s.atis.empty() ? "no ATIS yet" : s.atis;
-    for (size_t i = 0; i < atis.size() && i < maxCols * 4; i += maxCols) { ui::text(c, atis.substr(i, maxCols).c_str(), 0); }
-    if (!s.metar.empty()) { ui::text(c, fit(s.metar, maxCols).c_str(), 1); }
-    const char* row1[4] = {s.lvp ? "LVP off" : "LVP on", "Next runway", "Stop bars on", "Stop bars off"};
-    const int b1 = ui::buttons(c, row1, 4);
-    if (b1 == 0) sendOps("lvp", s.lvp ? "false" : "true");
-    if (b1 == 1) {
-        std::vector<std::string> ends;
-        for (const auto& r : s.runways) for (const auto& e : r.ends) ends.push_back(e.name);
-        if (!ends.empty()) {
-            size_t i = 0;
-            for (; i < ends.size(); ++i) if (ends[i] == s.rwy) break;
-            sendOps("runway", json::quote(ends[(i + 1) % ends.size()]));
-        }
-    }
-    if (b1 == 2) sendOps("stopbars", "true");
-    if (b1 == 3) sendOps("stopbars", "false");
-    const Aircraft* sel = selected();
-    char lg[120];
-    snprintf(lg, sizeof lg, "Light gun%s%s:", sel ? " for " : "", sel ? sel->cs.c_str() : " (select an aircraft)");
-    ui::text(c, lg, 1);
-    const char* row2[5] = {"green steady", "green flashing", "red steady", "red flashing", "white flashing"};
-    const int b2 = ui::buttons(c, row2, 5);
-    if (b2 >= 0 && sel) sendTx(sel->cs + " light " + row2[b2]);
-    ui::text(c, "TowerTrainer decides: these are requests to its simulation", 1);
-}
-
-// The window record of a callback: X-Plane passes the refcon, the test harness only the id.
-Win* winOf(XPLMWindowID id, void* ref) {
-    if (ref) return (Win*)ref;
-    for (auto& w : g().win) if (w.id == id) return &w;
-    return nullptr;
-}
-
-void drawCb(XPLMWindowID id, void* ref) {
-    Win* wp = winOf(id, ref);
-    if (!wp) return;
-    Win& w = *wp;
-    int l, t, r, b;
-    XPLMGetWindowGeometry(id, &l, &t, &r, &b);
-    w.ctx.begin(l, t, r, b, 18);
-    switch (w.kind) {
-        case 0: drawRadar(w); break;
-        case 1: drawStrips(w); break;
-        case 2: drawDelivery(w); break;
-        case 3: drawLog(w); break;
-        default: drawOps(w); break;
-    }
-    w.ctx.endInput();
-}
-
-void selectAircraft(int id) {
+void startLink() {
     G& G_ = g();
-    G_.st.selectedId = id;
-    const Aircraft* a = selected();
-    if (a && (G_.cmd.empty() || G_.cmd.find(' ') == std::string::npos)) G_.cmd = a->cs + " ";
-}
-
-int clickCb(XPLMWindowID id, int x, int y, XPLMMouseStatus status, void* ref) {
-    Win* wp = winOf(id, ref);
-    if (!wp) return 1;
-    Win& w = *wp;
-    G& G_ = g();
-    if (w.kind == 0) {
-        if (status == xplm_MouseDown) { w.dragging = true; w.dragX = x; w.dragY = y; w.dragMoved = false; return 1; }
-        if (status == xplm_MouseDrag && w.dragging) {
-            const int dx = x - w.dragX, dy = y - w.dragY;
-            if (abs(dx) + abs(dy) > 2) { w.dragMoved = true; look(dx * 0.25f, dy * 0.25f); w.dragX = x; w.dragY = y; }
-            return 1;
-        }
-        if (status == xplm_MouseUp) {
-            w.dragging = false;
-            if (!w.dragMoved) {
-                int l, t, r, b; XPLMGetWindowGeometry(id, &l, &t, &r, &b);
-                if (w.rowAc.size() >= 2) {
-                    const int gridTop = w.rowAc[0].first, fw = std::max(1, w.rowAc[0].second);
-                    const int col = (x - l - 6) / fw, row = (gridTop + 4 - y) / 13;
-                    int best = -1, bd = 99;
-                    for (const auto& ca : w.cellAc) { const int d = abs(ca.second.first - col) + abs(ca.second.second - row) * 2; if (ca.second.second == row && d < bd) { bd = d; best = ca.first; } }
-                    if (best >= 0 && bd <= 4) { selectAircraft(best); }
-                    else { w.ctx.clicked = true; w.ctx.clickX = x; w.ctx.clickY = y; }
-                }
-            }
-            return 1;
-        }
-        return 1;
-    }
-    if (status != xplm_MouseDown) return 1;
-    for (const auto& ra : w.rowAc) {
-        if (y >= ra.first - 6 && y <= ra.first + 15) {
-            int l, t, r, b; XPLMGetWindowGeometry(id, &l, &t, &r, &b);
-            if (w.kind == 1) {
-                const Aircraft* a = nullptr;
-                for (const auto& q : G_.st.ac) if (q.id == ra.second) a = &q;
-                if (a && a->handoffIn && x > l + 330) { sendLine("{\"type\":\"strip\",\"id\":" + std::to_string(a->id) + ",\"accept\":true}"); return 1; }
-            }
-            selectAircraft(ra.second);
-            return 1;
-        }
-    }
-    w.ctx.clicked = true; w.ctx.clickX = x; w.ctx.clickY = y;
-    return 1;
-}
-
-void keyCb(XPLMWindowID id, char key, XPLMKeyFlags flags, char vk, void* ref, int losingFocus) {
-    Win* wp = winOf(id, ref);
-    if (!wp) return;
-    Win& w = *wp;
-    if (losingFocus || !(flags & xplm_DownFlag)) return;
-    const unsigned char k = (unsigned char)vk;
-    if (k == 0x1B) { g().cmd.clear(); return; }
-    if (w.kind != 3) return;
-    if (k == 0x0D) { sendTx(g().cmd); g().cmd.clear(); return; }
-    if (k == 0x08) { if (!g().cmd.empty()) g().cmd.pop_back(); return; }
-    const unsigned char ch = (unsigned char)key;
-    if (ch >= 0x20 && ch < 0x7F && g().cmd.size() < 160) g().cmd.push_back((char)ch);
-}
-int cursorCb(XPLMWindowID, int, int, void*) { return xplm_CursorDefault; }
-int wheelCb(XPLMWindowID id, int, int, int, int clicks, void* ref) {
-    Win* wp = winOf(id, ref);
-    if (!wp) return 0;
-    Win& w = *wp;
-    if (w.kind == 0) { zoom(clicks > 0 ? 1.25f : 0.8f); return 1; }
-    return 0;
+    G_.sessionMissing = false;
+    G_.hostAway = false;
+    G_.link.start(G_.cfg);
 }
 
 }  // namespace
@@ -909,43 +596,9 @@ void applyConfig(const Config& cfg) {
     const bool linkChanged = cfg.host != G_.cfg.host || cfg.port != G_.cfg.port || cfg.code != G_.cfg.code || cfg.name != G_.cfg.name;
     const bool posChanged = cfg.position != G_.cfg.position;
     G_.cfg = cfg;
-    if (G_.active && linkChanged) G_.link.start(cfg);
+    if (G_.active && linkChanged) startLink();
     else if (G_.active && posChanged) sendClaim();
     if (G_.active && !G_.cfg.showWindows && G_.windowsOn) setWindowsVisible(false);
-}
-
-void createWindows() {
-    G& G_ = g();
-    if (G_.windowsCreated) return;
-    int sl, st, sr, sb;
-    XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);
-    const int W = std::max(900, sr - sl), H = std::max(600, st - sb);
-    const int rects[5][4] = {
-        {sl + 10, st - 40, sl + 10 + std::min(560, W / 2 - 20), st - 40 - std::min(330, H / 2 - 50)},          // radar, top left
-        {sr - 10 - std::min(520, W / 2 - 20), st - 40, sr - 10, st - 40 - std::min(300, H / 2 - 50)},          // strips, top right
-        {sl + 10, st - 40 - std::min(330, H / 2 - 50) - 10, sl + 10 + std::min(560, W / 2 - 20), sb + 190},    // delivery, left below radar
-        {sl + 10, sb + 180, sl + 10 + std::min(620, W / 2), sb + 10},                                           // log + command, bottom left
-        {sr - 10 - std::min(520, W / 2 - 20), st - 40 - std::min(300, H / 2 - 50) - 10, sr - 10, sb + 10},     // ops, right below strips
-    };
-    for (int i = 0; i < 5; ++i) {
-        Win& w = G_.win[i];
-        w.kind = i;
-        XPLMCreateWindow_t p{};
-        p.structSize = sizeof(p);
-        p.left = rects[i][0]; p.top = rects[i][1]; p.right = rects[i][2]; p.bottom = rects[i][3];
-        p.visible = 0;
-        p.drawWindowFunc = drawCb;
-        p.handleMouseClickFunc = clickCb;
-        p.handleKeyFunc = keyCb;
-        p.handleCursorFunc = cursorCb;
-        p.handleMouseWheelFunc = wheelCb;
-        p.refcon = &w;
-        p.decorateAsFloatingWindow = xplm_WindowDecorationRoundRectangle;
-        p.layer = xplm_WindowLayerFloatingWindows;
-        w.id = XPLMCreateWindowEx(&p);
-        if (w.id) { XPLMSetWindowTitle(w.id, kTitles[i]); XPLMSetWindowResizingLimits(w.id, 320, 120, 1600, 1200); }
-    }
-    G_.windowsCreated = true;
 }
 
 void shutdown() {
@@ -953,16 +606,10 @@ void shutdown() {
     if (G_.active) leave();
     G_.link.stop();
     if (G_.aptThread.joinable()) G_.aptThread.join();
-    for (auto& w : G_.win) if (w.id) { XPLMDestroyWindow(w.id); w.id = nullptr; }
-    G_.windowsCreated = false;
 }
 
-void setWindowsVisible(bool on) {
-    G& G_ = g();
-    G_.windowsOn = on;
-    for (auto& w : G_.win) if (w.id) XPLMSetWindowIsVisible(w.id, on ? 1 : 0);
-    if (on && G_.win[3].id) XPLMTakeKeyboardFocus(G_.win[3].id);
-}
+// The windows are the user interface's (ui2): this is only whether they should be open.
+void setWindowsVisible(bool on) { g().windowsOn = on; }
 bool windowsVisible() { return g().windowsOn; }
 
 void startAptScan() {
@@ -984,31 +631,44 @@ void tick(float dt, float elapsed) {
     (void)dt;
     G& G_ = g();
     G_.elapsed = elapsed;
-    if (!G_.active) return;
-    const bool wasLinked = G_.st.linked;
-    G_.st.linked = G_.link.connected();
-    if (!G_.st.linked) G_.st.linkStatus = G_.link.status();
-    else if (!wasLinked) G_.st.linkStatus = "linked";
+    State& s = G_.st;
+    s.now = elapsed;
+    if (!G_.active) { s.phase = Phase::Off; return; }
+    const bool wasLinked = s.linked;
+    s.linked = G_.link.connected();
+    if (!s.linked) s.linkStatus = G_.link.status();
+    else if (!wasLinked) s.linkStatus = "linked";
+    s.endpoint = G_.cfg.host + ":" + G_.cfg.port;
+    s.linkError = G_.link.error();
+    s.retryInS = G_.link.retryIn();
+    s.linkAttempts = G_.link.attempts();
+    s.pttDown = G_.hooks.pttDown && G_.hooks.pttDown();
     for (const auto& l : G_.link.drain()) handleLine(l);
+    // A trainer that stopped answering outranks a session error it gave while it was there.
+    s.phase = G_.link.unreachable() ? Phase::Unreachable
+            : G_.sessionMissing ? Phase::NoSession
+            : s.linked ? (G_.hostAway ? Phase::HostAway : Phase::Linked)
+            : Phase::Connecting;
     if (elapsed - G_.lastPing > 10.f) { G_.lastPing = elapsed; sendLine("{\"type\":\"ping\",\"t\":" + std::to_string((long long)(elapsed * 1000)) + "}"); }
-    if (G_.st.haveAirport) {
+    if (s.haveAirport) {
         startAptScan();
         bool aptNow = false;
-        { std::lock_guard<std::mutex> lk(G_.aptMx); aptNow = G_.aptView.found && G_.aptScanned == G_.st.icao && !G_.cabFromApt; }
+        { std::lock_guard<std::mutex> lk(G_.aptMx); aptNow = G_.aptView.found && G_.aptScanned == s.icao && !G_.cabFromApt; }
         static bool placed = false;
         if (G_.camOn && (!placed || aptNow)) {
             computeCab();
-            if (!placed && !G_.st.runways.empty()) {
-                const Runway& r = G_.st.runways[0];
+            if (!placed && !s.runways.empty()) {
+                const Runway& r = s.runways[0];
                 const double mx = (r.ends[0].x + r.ends[1].x) / 2.0, my = (r.ends[0].y + r.ends[1].y) / 2.0;
-                const double dx = (lonOf((float)mx) - G_.cabLon) * G_.st.kx, dy = (latOf((float)my) - G_.cabLat) * G_.st.ky;
+                const double dx = (lonOf((float)mx) - G_.cabLon) * s.kx, dy = (latOf((float)my) - G_.cabLat) * s.ky;
                 G_.yaw = (float)(std::atan2(dx, dy) / kDegToRad);
             }
             placed = true;
         }
         if (!G_.active) placed = false;
     }
-    if (G_.locked >= 0) { const Aircraft* a = nullptr; for (const auto& q : G_.st.ac) if (q.id == G_.locked) a = &q; if (a) aimAt(*a); else G_.locked = -1; }
+    if (G_.locked >= 0) { const Aircraft* a = findAc(G_.locked); if (a) aimAt(*a); else G_.locked = -1; }
+    s.followId = G_.locked;
     holdParked();
     updateTraffic();
     syncWeather();
@@ -1024,8 +684,10 @@ void enter() {
     G_.locked = -1;
     G_.zoomF = 1.f; G_.pitch = -3.f;
     G_.st = State();
+    G_.st.phase = Phase::Connecting;
+    G_.st.endpoint = G_.cfg.host + ":" + G_.cfg.port;
     G_.tracks.clear();
-    G_.link.start(G_.cfg);
+    startLink();
     if (G_.cfg.park) parkAircraft();
     takeCamera();
     if (G_.cfg.showWindows) setWindowsVisible(true);
@@ -1042,6 +704,7 @@ void leave() {
     setWindowsVisible(false);
     G_.link.stop();
     G_.st.linked = false;
+    G_.st.phase = Phase::Off;
     G_.st.linkStatus = "off";
     logf("left");
 }
@@ -1077,6 +740,56 @@ void nextTarget() {
     size_t i = 0;
     for (; i < G_.st.ac.size(); ++i) if (G_.st.ac[i].id == G_.locked) break;
     for (size_t k = 1; k <= G_.st.ac.size(); ++k) { const Aircraft& a = G_.st.ac[(i + k) % G_.st.ac.size()]; if (!a.veh) { G_.locked = a.id; G_.st.selectedId = a.id; return; } }
+}
+void follow(int id) {
+    G& G_ = g();
+    G_.locked = id >= 0 && findAc(id) ? id : -1;
+    G_.st.followId = G_.locked;
+}
+void lookAt(int id) {
+    const Aircraft* a = findAc(id);
+    if (!a || !g().active) return;
+    g().locked = -1;
+    aimAt(*a);
+}
+
+// ------------------------------------------------------------------ what the windows do
+void select(int id) { g().st.selectedId = id >= 0 && findAc(id) ? id : -1; }
+
+void transmit(const std::string& text) {
+    G& G_ = g();
+    const std::string t = trim(text);
+    if (t.empty()) return;
+    sendLine("{\"type\":\"tx\",\"pos\":" + json::quote(myPosition()) + ",\"text\":" + json::quote(t) + "}");
+    LiveCall c; c.from = "ATC"; c.text = t; c.at = G_.elapsed; c.mine = true; c.atc = true;
+    G_.st.live.push_back(c);      // my own call, until the trainer's log carries it
+    if (G_.st.live.size() > 8) G_.st.live.erase(G_.st.live.begin());
+}
+
+void acceptHandoff(int id) {
+    if (!findAc(id)) return;
+    sendLine("{\"type\":\"strip\",\"id\":" + std::to_string(id) + ",\"accept\":true}");
+}
+
+void moveStrip(int id, const std::string& bay) {
+    if (!findAc(id) || bay.empty()) return;
+    sendLine("{\"type\":\"strip\",\"id\":" + std::to_string(id) + ",\"bay\":" + json::quote(bay) + "}");
+}
+
+void setLvp(bool on) { sendOps("lvp", on ? "true" : "false"); }
+void setRunway(const std::string& end) { if (!end.empty()) sendOps("runway", json::quote(end)); }
+void setStopBars(bool on) { sendOps("stopbars", on ? "true" : "false"); }
+
+void lightGun(int id, const std::string& signal) {
+    const Aircraft* a = findAc(id);
+    if (a && !signal.empty()) transmit(a->cs + " light " + signal);
+}
+
+void retry() {
+    G& G_ = g();
+    if (!G_.active) return;
+    G_.link.kick();
+    logf("retrying the link to %s:%s now", G_.cfg.host.c_str(), G_.cfg.port.c_str());
 }
 
 std::string statusLine() {
