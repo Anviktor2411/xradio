@@ -11,6 +11,10 @@
 #include "XPLMDisplay.h"
 #include "imgui.h"
 
+#ifdef small
+#  undef small          // <rpcndr.h> (via <windows.h>): #define small char
+#endif
+
 namespace xr {
 namespace ui2 {
 

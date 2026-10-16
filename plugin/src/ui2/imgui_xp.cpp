@@ -25,6 +25,8 @@
 namespace xr {
 namespace ui2 {
 
+void noteKey(int vk, bool down);           // app_ui.cpp (here, not block scope: MSVC would look for ::noteKey)
+
 namespace {
 ImFontAtlas* g_atlas = nullptr;
 FontSet      g_fonts;
@@ -321,7 +323,6 @@ void XpWindow::keyCb(XPLMWindowID, char key, XPLMKeyFlags flags, char vk, void* 
     if (up && k != ImGuiKey_None) io.AddKeyEvent(k, false);
     const unsigned char ch = (unsigned char)key;
     if ((down || (!up && !down)) && ch >= 0x20 && ch != 0x7F && !(flags & xplm_ControlFlag)) io.AddInputCharacter(ch);
-    extern void noteKey(int vk, bool down);
     noteKey((unsigned char)vk, down || (!up && !down));
 }
 
