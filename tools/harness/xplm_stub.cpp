@@ -533,3 +533,12 @@ void XPLMSetDatavi(XPLMDataRef r, int* in, int inOffset, int inCount) {
     harness::setArray(refName(r), v);
 }
 void XPLMGetSystemPath(char* out) { if (out) { const std::string d = harness::tempDir() + "/"; strncpy(out, d.c_str(), 511); out[511] = 0; } }
+#include "XPLMPlanes.h"
+// The .acf the user flies: the test sets "harness/acf_path" (empty = the default Cessna's path).
+void XPLMGetNthAircraftModel(int, char* outFileName, char* outPath) {
+    std::string p = harness::getString("harness/acf_path");
+    if (p.empty()) p = "Aircraft/Laminar Research/Cessna 172 SP/Cessna_172SP.acf";
+    const size_t slash = p.find_last_of("/\\");
+    if (outFileName) { strncpy(outFileName, (slash == std::string::npos ? p : p.substr(slash + 1)).c_str(), 255); outFileName[255] = 0; }
+    if (outPath) { strncpy(outPath, p.c_str(), 511); outPath[511] = 0; }
+}

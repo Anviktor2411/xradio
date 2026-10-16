@@ -63,6 +63,21 @@ enum PacketType : uint8_t {
     // roster. What a pilot needs to find a controller: callsign, airport,
     // frequency. See AtcListHeader / AtcEntry.
     PT_ATC_LIST  = 16,
+    // --- v6, added without a protocol bump (an older peer drops an unknown type) ---
+    // pilot -> server: the aircraft just loaded in the sim -- detected ICAO type,
+    // tail number, airline, livery, size and weight. The server takes the new
+    // type and livery for this session (so every traffic packet carries them
+    // from then on), echoes the packet to the sender as the receipt, and hands
+    // it to every ATC station. A pilot that gets no echo is talking to a server
+    // that predates the packet and logs in again with the new type instead.
+    // See AircraftPayload.
+    PT_AIRCRAFT  = 17,
+    // pilot -> server -> every ATC station: the pilot's own TCAS, as X-Plane 12's
+    // TCAS II shows it (advisory, aural message, the green band on the VSI).
+    // Sent when it changes and every second while an advisory is up, so a
+    // controller -- or the AI pilots TowerTrainer flies -- can coordinate with
+    // a real pilot's resolution advisory. See TcasPayload.
+    PT_TCAS      = 18,
 };
 
 // The international emergency frequency, and in XRadio the one place everybody
@@ -418,6 +433,41 @@ struct AtcEntry {            // 64 bytes
     uint16_t ceilingFt;      // ...up to this many feet above the station
 };
 static const uint8_t AE_POSITION = 1 << 0;   // lat, lon and altMslM are real: it has reported one
+
+// AircraftPayload.source: how the type was found
+enum AircraftSource : uint8_t {
+    AS_DEFAULT  = 0,   // nothing usable from the sim: a default
+    AS_DETECTED = 1,   // sim/aircraft/view/acf_ICAO, a valid ICAO Doc 8643 designator
+    AS_MAPPED   = 2,   // a known add-on (Zibo, LevelUp, ToLiss...) or a known wrong value, mapped
+    AS_MANUAL   = 3,   // typed in the settings
+};
+
+struct AircraftPayload {     // 68 bytes
+    char     acIcao[8];      // ICAO Doc 8643 designator, "B738"
+    char     tailnum[12];    // sim/aircraft/view/acf_tailnum
+    char     airline[4];     // ICAO airline from the callsign, "" for a registration
+    char     livery[32];     // livery folder name (the login's is cut at 15)
+    uint16_t wingspanDm;     // decimetres, 0 = unknown
+    uint16_t lengthDm;
+    uint32_t mtowKg;         // 0 = unknown
+    char     wtc;            // 'L' 'M' 'H' 'J', 0 = unknown
+    uint8_t  source;         // AircraftSource
+    uint16_t reserved;
+};
+
+// TcasPayload.level
+enum TcasLevel : uint8_t { TCAS_NONE = 0, TCAS_TA = 1, TCAS_RA = 2, TCAS_CLEAR = 3 };
+
+struct TcasPayload {         // 20 bytes
+    uint32_t timeMs;         // sender's clock
+    uint8_t  level;          // TcasLevel
+    int8_t   sense;          // +1 climb, -1 descend, 0 level off / maintain / monitor
+    uint8_t  message;        // sim/cockpit2/tcas/indicators/tcas_message (0..16)
+    uint8_t  reserved;
+    float    vsTargetMs;     // the edge of the green band the RA asks for, m/s up positive
+    float    vsMs;           // what the aircraft is actually doing
+    uint32_t intruderSid;    // the session the RA is against, when it is one of ours; 0 = unknown
+};
 
 #pragma pack(pop)
 

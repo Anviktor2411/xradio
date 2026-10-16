@@ -122,6 +122,33 @@ what it covers: position, antenna, service volume, exactly what the server
 routes by) plus one per published ATIS. The header's `flags` carry the flight's
 radio conditions: `AL_DUCTING` while tropospheric ducting is on.
 
+### The pilot's aircraft and TCAS
+
+The plugin works out the loaded aircraft by itself (`plugin/src/acftype.h`):
+`sim/aircraft/view/acf_ICAO` when it is a real ICAO Doc 8643 designator
+(`Resources/Doc8643.txt`), else the add-on recognised from its `.acf` file
+(Zibo and LevelUp 737s, ToLiss A319/A320/A321/A346...) or a known wrong value
+mapped, else a default -- and the settings' type field overrides all of it. It
+does so at start and again on `XPLM_MSG_PLANE_LOADED` / `XPLM_MSG_LIVERY_LOADED`.
+The window shows "Aircraft: B738 (detected)".
+
+`PT_AIRCRAFT` (pilot -> server) carries the result -- type, tail number,
+airline from the callsign, livery, span, length, MTOW, wake category and how
+the type was found (`AircraftPayload`). The server takes the new type and
+livery for the session (traffic carries them from then on: other pilots get a
+matching CSL model, ICAO + airline + livery), echoes the packet to the sender
+as the receipt and hands it to every ATC station (also to a station that logs
+in later). A pilot that gets no echo within 3 s is on a server from before the
+packet and logs in again with the new type.
+
+`PT_TCAS` (pilot -> server -> ATC stations) is the pilot's own X-Plane 12.4+
+TCAS II: `tcas_active_advisory`, `tcas_message`, the green band of
+`tcas_vs_bands` and the intruder from `targets/threat` + `targets/modeS_id`
+(`plugin/src/tcasread.h`). Sent when it changes and every second while an
+advisory is up. TowerTrainer's AI pilots take the opposite sense to a real
+pilot's RA. Both packets were added without a protocol bump: an older peer
+drops an unknown type.
+
 ### Tests
 
 `python3 tools/test_server.py` drives all of the above against the Python

@@ -35,7 +35,8 @@ import server as S            # noqa: E402
 # Every struct whose layout both sides have to agree on.
 STRUCTS = ("HEADER", "LOGIN", "LOGIN_ACK", "LOGIN_REJECT", "POSITION",
            "TRAFFIC_HDR", "TRAFFIC_ENTRY", "TEXT_HDR", "VOICE_HDR", "WEATHER",
-           "ROSTER_HDR", "ROSTER_ENTRY", "FLIGHTPLAN", "ATIS_HDR", "ATC_LIST_HDR", "ATC_ENTRY")
+           "ROSTER_HDR", "ROSTER_ENTRY", "FLIGHTPLAN", "ATIS_HDR", "ATC_LIST_HDR", "ATC_ENTRY",
+           "AIRCRAFT", "TCAS")
 
 # Not structs, but the same class of mistake: a packet budget, an entry cap or
 # a well-known frequency that drifts apart shows up as traffic that thins out
@@ -53,6 +54,8 @@ CONSTANTS = (
     ("PT_FLIGHTPLAN", lambda: P.PT_FLIGHTPLAN),
     ("PT_ATIS", lambda: P.PT_ATIS),
     ("PT_ATC_LIST", lambda: P.PT_ATC_LIST),
+    ("PT_AIRCRAFT", lambda: P.PT_AIRCRAFT),
+    ("PT_TCAS", lambda: P.PT_TCAS),
     ("LF_ATC", lambda: P.LF_ATC),
     ("LF_INJECTOR", lambda: P.LF_INJECTOR),
     ("AI_SID", lambda: P.ai_sid(7, 12)),

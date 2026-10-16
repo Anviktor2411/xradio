@@ -384,6 +384,18 @@ if(XRADIO_BUILD_TESTS)
         target_link_options(radio_test    PRIVATE -fsanitize=address,undefined)
     endif()
 
+    # Which aircraft is loaded (acftype.h) and the pilot's own TCAS (tcasread.h): pure logic, no X-Plane.
+    add_executable(acftype_test tools/harness/acftype_test.cpp)
+    target_include_directories(acftype_test PRIVATE plugin/src)
+    target_compile_features(acftype_test PRIVATE cxx_std_17)
+    if(WIN32)
+        target_compile_definitions(acftype_test PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    endif()
+    if(XRADIO_SANITIZE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(acftype_test PRIVATE -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(acftype_test    PRIVATE -fsanitize=address,undefined)
+    endif()
+
     # The UPnP client alone, against tools/harness/fake_igd.py.
     add_executable(upnp_test tools/harness/upnp_test.cpp plugin/src/upnp.cpp
                              plugin/src/natpmp.cpp plugin/src/net.cpp)

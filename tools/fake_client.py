@@ -66,6 +66,25 @@ def run(args):
         return
     print(f"logged in as {args.callsign}, sid={sid}")
 
+    # v6: the aircraft "just loaded" (PT_AIRCRAFT), as the plugin sends it after detecting the type
+    if args.aircraft:
+        f = (args.aircraft.split(",") + ["", "", "0", "M"])[:4]
+        sock.sendto(P.pack(P.PT_AIRCRAFT, sid, P.aircraft(f[0], tailnum=f[1], livery=f[2] if not f[2].replace(".", "").isdigit() else "",
+                                                         span_m=float(f[2]) if f[2].replace(".", "").isdigit() else 0.0,
+                                                         wtc=f[3], source=P.AS_DETECTED)), dest)
+        print(f"aircraft {f[0]} sent")
+    # v6: our own TCAS shows an RA (PT_TCAS), every second for --tcas-for seconds
+    if args.tcas:
+        sense = 1 if args.tcas == "climb" else -1 if args.tcas == "descend" else 0
+
+        def tcas_loop():
+            t0 = time.time()
+            while time.time() - t0 < args.tcas_for:
+                sock.sendto(P.pack(P.PT_TCAS, sid, P.tcas(P.TCAS_RA, sense=sense, message=1 if sense > 0 else 6, vs_target_ms=7.62 * sense)), dest)
+                time.sleep(1.0)
+        threading.Thread(target=tcas_loop, daemon=True).start()
+        print(f"tcas RA {args.tcas}")
+
     # v6: file a flight plan straight after logging in ("EETN EFHK DCT ...")
     if args.file_plan:
         parts = args.file_plan.split()
@@ -375,6 +394,11 @@ if __name__ == "__main__":
                     help="with --atc: the service volume's radius (default 0: its facility's, e.g. 25 for a tower)")
     ap.add_argument("--svc-ceiling", type=int, default=0, metavar="FT",
                     help="with --atc: how high it reaches above the station (default 0: its facility's)")
+    ap.add_argument("--aircraft", default="", metavar="ICAO,TAIL,SPAN,WTC",
+                    help="v6: send PT_AIRCRAFT after logging in (e.g. B738,ES-ABC,35.8,M)")
+    ap.add_argument("--tcas", default="", choices=["", "climb", "descend", "level"],
+                    help="v6: report an own TCAS RA (PT_TCAS) for --tcas-for seconds")
+    ap.add_argument("--tcas-for", type=float, default=20.0)
     ap.add_argument("--direct", default="", metavar="'CALLSIGN message'",
                     help="send one direct message after logging in")
     run(ap.parse_args())

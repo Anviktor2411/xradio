@@ -38,6 +38,10 @@ struct RemoteState {
     bool        xpdrIdent = false;
 };
 
+// The session a TCAS target belongs to, from the mode S id XPMP2 gave it (0xF00000 | sid, see modeSFor);
+// 0 for traffic that is not ours.
+inline uint32_t sidForModeS(uint32_t modeS) { return (modeS & 0xF00000u) == 0xF00000u ? (modeS & 0x0FFFFFu) : 0; }
+
 namespace csl {
 
 // Returns true if XPMP2 was compiled in AND initialised successfully.

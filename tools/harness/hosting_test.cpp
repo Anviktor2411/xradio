@@ -36,6 +36,7 @@
 extern "C" {
 int  XPluginStart(char*, char*, char*);
 int  XPluginEnable(void);
+void XPluginReceiveMessage(int, int, void*);
 void XPluginDisable(void);
 void XPluginStop(void);
 }
@@ -678,6 +679,24 @@ int main(int argc, char** argv) {
             seen = contains(bag.sawTypes, "B738/Delta");
         }
         check("everyone sees the new aircraft within a few seconds", seen);
+    }
+
+    printf("\nloading the Zibo 737 (acf_ICAO empty): detected on XPLM_MSG_PLANE_LOADED, no new login\n");
+    {
+        harness::setString("sim/aircraft/view/acf_ICAO", "");
+        harness::setString("harness/acf_path", "Aircraft/B737-800X/b738_4k.acf");
+        harness::setString("sim/aircraft/view/acf_livery_path", "Aircraft/B737-800X/liveries/Ryanair/");
+        XPluginReceiveMessage(0, 102 /* XPLM_MSG_PLANE_LOADED */, nullptr);
+        bool seen = false;
+        for (int i = 0; i < 12 && !seen; ++i) {
+            for (int j = 0; j < 5; ++j) { peer.position(); fly(0.1); }
+            auto bag = peer.drain(200);
+            seen = contains(bag.sawTypes, "B738/Ryanair");
+        }
+        check("everyone sees B738 (mapped from the Zibo .acf)", seen);
+        auto w = harness::draw();
+        check("the window says how the type was found", shows(w, "B738") );
+        harness::setString("harness/acf_path", "");
     }
 
     printf("\nthe radio works through the hosted server\n");

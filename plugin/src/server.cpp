@@ -59,6 +59,7 @@ struct Session {
     bool     ai = false;             // this record is one of those aircraft, not a client
     uint32_t owner = 0;              // ...and this is the injector it belongs to
     std::vector<uint8_t> fp;         // a pilot's latest flight plan, as it will be relayed
+    std::vector<uint8_t> aircraft;   // the pilot's latest PT_AIRCRAFT, for stations that join later
     std::map<std::string, char> atisSeen;   // icao -> letter already sent to this pilot
     uint8_t  kind = ATC_OTHER;       // a station's facility, from its callsign
     uint16_t proto = kProtoVersion;  // what the client speaks: a v5 one gets v5 packets
@@ -235,6 +236,8 @@ private:
     void onAiTraffic(Session& s, const uint8_t* p, int len, double now);
     void onFlightPlan(Session& s, const uint8_t* p, int len);
     void onAtis(Session& s, const uint8_t* p, int len);
+    void onAircraft(Session& s, const uint8_t* p, int len);
+    void onTcas(Session& s, const uint8_t* p, int len);
     void offerAtis(Session& s);
     void broadcastAtcList(double now);
     Session* speaker(Session& s, uint32_t fromSid);
@@ -348,6 +351,8 @@ void Core::onPacket(const Peer& from, const uint8_t* data, int len, double now) 
         case PT_AI_TRAFFIC: onAiTraffic(s, payload, avail, now); break;
         case PT_FLIGHTPLAN: onFlightPlan(s, payload, avail); break;
         case PT_ATIS:     onAtis(s, payload, avail); break;
+        case PT_AIRCRAFT: onAircraft(s, payload, avail); break;
+        case PT_TCAS:     onTcas(s, payload, avail); break;
         case PT_LOGOUT:   drop(from); break;
         default: break;
     }
@@ -466,6 +471,32 @@ void Core::onFlightPlan(Session& s, const uint8_t* p, int len) {
     for (auto& kv : sessions_) {
         if (kv.second.atc) send(kv.first, PT_FLIGHTPLAN, kv.second.sid, &fp, (int)sizeof(fp));
     }
+}
+
+// The pilot loaded another aircraft: traffic carries the new type and livery
+// from now on, the pilot gets the packet back as its receipt, every station
+// gets it (tail number, size, weight). The header names the pilot's session.
+void Core::onAircraft(Session& s, const uint8_t* p, int len) {
+    if (len < (int)sizeof(AircraftPayload) || s.atc || s.injector || s.proto < 6) return;
+    AircraftPayload a{};
+    memcpy(&a, p, sizeof(a));
+    std::string icao = clean(a.acIcao, sizeof(a.acIcao), 7);
+    std::string ic;
+    for (char c : icao) if (isalnum((unsigned char)c)) ic += (char)toupper((unsigned char)c);
+    if (!ic.empty()) s.acIcao = ic;
+    s.livery = clean(a.livery, sizeof(a.livery), 15);
+    s.aircraft.assign((const uint8_t*)&a, (const uint8_t*)&a + sizeof(a));
+    rosterDirty_ = true;
+    send(s.peer, PT_AIRCRAFT, s.sid, &a, (int)sizeof(a));
+    for (auto& kv : sessions_)
+        if (kv.second.atc) send(kv.first, PT_AIRCRAFT, s.sid, &a, (int)sizeof(a));
+}
+
+// A pilot's own TCAS advisory, for the ATC stations.
+void Core::onTcas(Session& s, const uint8_t* p, int len) {
+    if (len < (int)sizeof(TcasPayload) || s.atc || s.injector) return;
+    for (auto& kv : sessions_)
+        if (kv.second.atc) send(kv.first, PT_TCAS, s.sid, p, (int)sizeof(TcasPayload));
 }
 
 // A station publishes the ATIS of an airport; it is offered to everyone
@@ -648,6 +679,8 @@ void Core::onLogin(const Peer& from, const uint8_t* p, int len, double now, uint
             const Session& p = kv.second;
             if (!p.fp.empty() && p.sid != sid)
                 send(from, PT_FLIGHTPLAN, sid, p.fp.data(), (int)p.fp.size());
+            if (!p.aircraft.empty() && p.sid != sid)
+                send(from, PT_AIRCRAFT, p.sid, p.aircraft.data(), (int)p.aircraft.size());
         }
     }
 }

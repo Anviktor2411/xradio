@@ -379,6 +379,15 @@ void drawHost(Model& m, const Actions& a) {
     light(m.conn.connected ? p.ok : (m.conn.connecting ? p.warn : p.err), true); ImGui::SameLine();
     ImGui::TextUnformatted(m.conn.status.c_str());
     if (!m.conn.endpoint.empty()) { muted(m.conn.endpoint.c_str()); ImGui::SameLine(); ImGui::Text("as %s (%s%s%s)", m.conn.callsign.c_str(), m.conn.icao.c_str(), m.conn.livery.empty() ? "" : " ", m.conn.livery.c_str()); }
+    // the aircraft as everybody sees it: "Aircraft: B738 (detected)"; amber when it is only a guess
+    if (!m.conn.icao.empty()) {
+        const bool guess = m.conn.acSource == "default" || m.conn.acSource.empty();
+        ImGui::TextColored(guess ? p.warn : p.ok, "%s: %s (%s)%s%s", tr("Aircraft"), m.conn.icao.c_str(),
+                           m.conn.acSource.empty() ? "?" : tr(m.conn.acSource.c_str()), m.conn.tailnum.empty() ? "" : "  ", m.conn.tailnum.c_str());
+        if (!m.conn.acNote.empty()) { ImGui::SameLine(); muted(m.conn.acNote.c_str()); }
+        if (guess) muted(tr("Type not recognised: set it in Settings > Aircraft type"));
+    }
+    if (!m.conn.tcas.empty()) ImGui::TextColored(m.conn.tcas.rfind("RA", 0) == 0 ? p.err : p.warn, "TCAS %s", m.conn.tcas.c_str());
     if (m.conn.connected) {
         ImGui::Text("%s: %.1f s  ·  %d %s  ·  %d pilots, %d AI", tr("last packet"), m.conn.lastPacketS, m.conn.packetsPerS, tr("packets/s"), m.conn.peers, m.conn.aiCount);
         ImGui::Text("%s: v%u (protocol %u)", tr("Server version"), m.conn.protoServer, m.conn.protoLocal);
@@ -512,7 +521,7 @@ void drawWizard(Model& m, const Actions& a) {
         char ty[8]; snprintf(ty, sizeof ty, "%s", e.acIcao.c_str());
         ImGui::SetNextItemWidth(100);
         if (ImGui::InputTextWithHint(tr("Aircraft type (ICAO)"), "C172", ty, sizeof ty, ImGuiInputTextFlags_CharsUppercase)) e.acIcao = ty;
-        muted("The type is what others see as your model; leave it empty to take X-Plane's.");
+        muted("The type is detected from the aircraft you load (shown in the main window); type one here only to override it.");
     } else if (w.step == 1) {
         auto fields = describe(e);
         for (auto& f : fields) if (f.kind == Kind::Choice) drawField(f, m, a);

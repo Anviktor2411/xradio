@@ -97,6 +97,7 @@ class Session:
     atis_seen: dict = field(default_factory=dict)   # icao -> letter already sent to this pilot
     kind: int = P.ATC_OTHER     # a station's facility, from its callsign
     proto: int = P.PROTO_VERSION   # what the client speaks: a v5 one gets v5 packets
+    aircraft: bytes = None      # the pilot's latest PT_AIRCRAFT, kept for stations that join later
     # v6: the radio model (docs/radio.md)
     agl_m: float = 0.0          # height above the terrain as reported (a station: its antenna)
     agl_known: bool = False     # the report carried it; a v5-sized one does not
@@ -452,6 +453,10 @@ class XRadioServer(asyncio.DatagramProtocol):
             self._on_flightplan(s, payload)
         elif ptype == P.PT_ATIS:
             self._on_atis(s, payload)
+        elif ptype == P.PT_AIRCRAFT:
+            self._on_aircraft(s, payload)
+        elif ptype == P.PT_TCAS:
+            self._on_tcas(s, payload)
         elif ptype == P.PT_LOGOUT:
             self._drop(s, "logout")
 
@@ -516,6 +521,8 @@ class XRadioServer(asyncio.DatagramProtocol):
             for p in self.sessions.values():
                 if p.fp and p.sid != sid:
                     self._send(addr, P.PT_FLIGHTPLAN, sid, p.fp)
+                if p.aircraft and p.sid != sid:      # ...and every pilot's aircraft, header = the pilot's session
+                    self._send(addr, P.PT_AIRCRAFT, p.sid, p.aircraft)
 
     def _on_position(self, s: Session, payload):
         # v6 adds the radio model's fields at the end; a v5-sized report is
@@ -693,6 +700,33 @@ class XRadioServer(asyncio.DatagramProtocol):
                 self._send(p.addr, P.PT_FLIGHTPLAN, p.sid, out)
         LOG.info("flight plan %s: %s %s -> %s %s", "cancelled" if fields[4] == P.FP_CANCELLED else "filed",
                  s.callsign, d["dep"], d["dest"], d["route"])
+
+    def _on_aircraft(self, s: Session, payload):
+        """The pilot loaded another aircraft: every traffic packet carries the new type and livery from now on,
+        the pilot gets the packet back as its receipt, every station gets it (tail number, size, weight)."""
+        d = P.unpack_aircraft(payload)
+        if d is None or s.atc or s.injector or s.proto < 6:
+            return
+        icao = "".join(c for c in d["ac_icao"].upper() if c.isalnum())[:7]
+        if icao:
+            s.ac_icao = icao
+        s.livery = "".join(c for c in d["livery"] if 32 <= ord(c) < 127)[:15]
+        out = payload[:P.AIRCRAFT.size]
+        s.aircraft = out
+        self._roster_dirty = True
+        self._send(s.addr, P.PT_AIRCRAFT, s.sid, out)
+        for p in self.sessions.values():
+            if p.atc:
+                self._send(p.addr, P.PT_AIRCRAFT, s.sid, out)
+        LOG.info("%s now flies %s%s%s", s.callsign, s.ac_icao, " " + d["tailnum"] if d["tailnum"] else "", " (" + s.livery + ")" if s.livery else "")
+
+    def _on_tcas(self, s: Session, payload):
+        """A pilot's own TCAS advisory, for the ATC stations (TowerTrainer's AI pilots coordinate with it)."""
+        if len(payload) < P.TCAS.size or s.atc or s.injector:
+            return
+        for p in self.sessions.values():
+            if p.atc:
+                self._send(p.addr, P.PT_TCAS, s.sid, payload[:P.TCAS.size])
 
     def _on_atis(self, s: Session, payload):
         """A station publishes the ATIS of an airport; it is offered to

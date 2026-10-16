@@ -26,6 +26,8 @@
 #include "xpmp_bridge.h"
 #include "tower.h"
 #include "simbrief.h"
+#include "acftype.h"
+#include "tcasread.h"
 #ifdef XRADIO_UI_IMGUI
 #  include "ui2/host.h"
 #endif
@@ -37,6 +39,7 @@
 #include "XPLMPlugin.h"
 #include "XPLMProcessing.h"
 #include "XPLMUtilities.h"
+#include "XPLMPlanes.h"
 
 #include <algorithm>
 #include <atomic>
@@ -134,7 +137,9 @@ struct Refs {
     XPLMDataRef ltNav, ltBeacon, ltStrobe, ltLanding, ltTaxi;
     XPLMDataRef avionicsOn, com1Power, com2Power, busVolts;
     XPLMDataRef xpdrMode, xpdrCode, xpdrIdent;
-    XPLMDataRef acfIcao, acfLivery;
+    XPLMDataRef acfIcao, acfLivery, acfTail, acfDescrip;
+    // X-Plane 12.4+ TCAS II (null on older sims: no TCAS state is sent then)
+    XPLMDataRef tcasAdvisory, tcasMessage, tcasBands, tcasThreat, tcasModeS;
 } g_ref;
 
 int g_missingRefs = 0;
@@ -230,6 +235,14 @@ void findRefs() {
     // loaded aircraft and the folder name of its livery.
     g_ref.acfIcao   = findRef("sim/aircraft/view/acf_ICAO");
     g_ref.acfLivery = findRef("sim/aircraft/view/acf_livery_path");
+    g_ref.acfTail   = findRef("sim/aircraft/view/acf_tailnum");
+    g_ref.acfDescrip = findRef("sim/aircraft/view/acf_descrip");
+    // the pilot's own TCAS (PART D): looked up quietly, X-Plane 11 and 12 before 12.4 do not have them
+    g_ref.tcasAdvisory = XPLMFindDataRef("sim/cockpit2/tcas/indicators/tcas_active_advisory");
+    g_ref.tcasMessage  = XPLMFindDataRef("sim/cockpit2/tcas/indicators/tcas_message");
+    g_ref.tcasBands    = XPLMFindDataRef("sim/cockpit2/tcas/indicators/tcas_vs_bands");
+    g_ref.tcasThreat   = XPLMFindDataRef("sim/cockpit2/tcas/targets/threat");
+    g_ref.tcasModeS    = XPLMFindDataRef("sim/cockpit2/tcas/targets/modeS_id");
 
     if (g_missingRefs) {
         logMsg("%d dataref(s) missing -- those values will be sent as zero",
@@ -330,18 +343,38 @@ std::string sd(XPLMDataRef r, int maxLen) {
     return v.substr(a, b - a + 1);
 }
 
-// The ICAO type to tell everyone: the settings override if set, else what
-// the sim says about the loaded aircraft, else a default so the CSL matcher
-// has something to work with.
+// ---------------------------------------------------------------------------
+// the aircraft we fly: detected from the sim (acf_ICAO, the .acf file, its
+// description), checked against ICAO Doc 8643, known add-ons mapped -- see
+// acftype.h. Main thread only.
+// ---------------------------------------------------------------------------
+xr::acftype::Doc8643 g_doc8643;
+xr::acftype::Info    g_acf;
+std::string          g_acfTail;
+bool                 g_acfDirty = true;    // re-detect next frame: start, plane or livery loaded, settings
+float                g_acfSentAt = -1.f;   // PT_AIRCRAFT sent at, waiting for the server's echo
+bool                 g_acfAcked = false;
+
+std::string acfModelPath() {
+    char file[512] = {0}, path[1024] = {0};
+    XPLMGetNthAircraftModel(0, file, path);
+    return std::string(path[0] ? path : file);
+}
+
+void detectAircraft() {
+    g_acfDirty = false;
+    const std::string before = g_acf.icao + "/" + g_acf.source;
+    g_acf = xr::acftype::resolve(sd(g_ref.acfIcao, 40), acfModelPath(), sd(g_ref.acfDescrip, 260), g_cfg.acIcao, &g_doc8643);
+    g_acfTail = trim(sd(g_ref.acfTail, 40));
+    if (before != g_acf.icao + "/" + g_acf.source)
+        logMsg("aircraft: %s (%s)%s%s%s%s", g_acf.icao.c_str(), g_acf.source.c_str(), g_acf.note.empty() ? "" : " -- ",
+               g_acf.note.c_str(), g_acfTail.empty() ? "" : ", tail ", g_acfTail.c_str());
+}
+
+// The ICAO type to tell everyone (acftype.h decides: the settings field, the sim, a known add-on, a default).
 std::string effectiveIcao() {
-    if (!g_cfg.acIcao.empty()) return g_cfg.acIcao;
-    std::string v = sd(g_ref.acfIcao, 40);
-    std::string out;
-    for (char c : v) {
-        if (isalnum((unsigned char)c)) out += (char)toupper((unsigned char)c);
-        if (out.size() >= 7) break;
-    }
-    return out.empty() ? std::string("C172") : out;
+    if (g_acf.icao.empty()) detectAircraft();
+    return g_acf.icao;
 }
 
 // The livery folder name: ".../liveries/Delta/" -> "Delta". Empty for the
@@ -357,6 +390,16 @@ std::string effectiveLivery() {
         if (u >= 32 && u < 127) out += c;
         if (out.size() >= 15) break;
     }
+    return out;
+}
+
+// The livery folder name in full (the login carries 15 characters, PT_AIRCRAFT 31).
+std::string liveryFull() {
+    std::string path = sd(g_ref.acfLivery, 1023);
+    while (!path.empty() && (path.back() == '/' || path.back() == '\\')) path.pop_back();
+    const size_t slash = path.find_last_of("/\\");
+    std::string name = slash == std::string::npos ? path : path.substr(slash + 1), out;
+    for (char c : name) { const unsigned char u = (unsigned char)c; if (u >= 32 && u < 127) out += c; if (out.size() >= 31) break; }
     return out;
 }
 
@@ -731,6 +774,66 @@ void sendLogin() {
     g_lastLogin = g_elapsed;
     if (g_firstLogin < 0.f) g_firstLogin = g_elapsed;
     if (g_loginProblem.empty()) g_status = "logging in to " + g_sock.endpoint() + "...";
+}
+
+// v6: the aircraft just loaded, without logging in again. A server that predates
+// PT_AIRCRAFT never echoes it; then the flight loop logs in again with the new type.
+void sendAircraft() {
+    if (!g_connected) return;
+    uint8_t buf[sizeof(xr::Header) + sizeof(xr::AircraftPayload)];
+    int off = writeHeader(buf, xr::PT_AIRCRAFT, sizeof(xr::AircraftPayload));
+    xr::AircraftPayload a{};
+    const std::string airline = xr::acftype::airlineOf(g_cfg.callsign), livery = liveryFull();
+    strncpy(a.acIcao,  g_acf.icao.c_str(), sizeof(a.acIcao) - 1);
+    strncpy(a.tailnum, g_acfTail.c_str(),  sizeof(a.tailnum) - 1);
+    strncpy(a.airline, airline.c_str(),    sizeof(a.airline) - 1);
+    strncpy(a.livery,  livery.c_str(),     sizeof(a.livery) - 1);
+    a.wingspanDm = (uint16_t)std::lround(g_acf.spanM * 10.f);
+    a.lengthDm   = (uint16_t)std::lround(g_acf.lengthM * 10.f);
+    a.mtowKg     = (uint32_t)g_acf.mtowKg;
+    a.wtc        = g_acf.wtc;
+    a.source     = g_acf.source == "manual" ? xr::AS_MANUAL : g_acf.source == "mapped" ? xr::AS_MAPPED
+                 : g_acf.source == "detected" ? xr::AS_DETECTED : xr::AS_DEFAULT;
+    memcpy(buf + off, &a, sizeof(a));
+    g_sock.send(buf, off + (int)sizeof(a));
+    g_acfSentAt = g_elapsed;
+    g_acfAcked = false;
+}
+
+// PART D: the pilot's own TCAS, for TowerTrainer's AI pilots and the controller. Sent when it changes and every
+// second while an advisory is up. The RA's intruder is named when it is one of our aircraft (XPMP2 mode S ids).
+xr::tcas::State g_tcas;
+float           g_tcasSentAt = -100.f;
+void tcasTick() {
+    if (!g_ref.tcasAdvisory) return;
+    const int adv = XPLMGetDatai(g_ref.tcasAdvisory);
+    const int msg = g_ref.tcasMessage ? XPLMGetDatai(g_ref.tcasMessage) : 0;
+    float bands[6] = {0, 0, 0, 0, 0, 0};
+    if (g_ref.tcasBands) XPLMGetDatavf(g_ref.tcasBands, bands, 0, 6);
+    int threat[64] = {0};
+    const int n = g_ref.tcasThreat ? XPLMGetDatavi(g_ref.tcasThreat, threat, 0, 64) : 0;
+    const xr::tcas::State s = xr::tcas::read(adv, msg, bands, threat, n, g_tcas.level, g_tcas.sense);
+    uint32_t intruder = 0;
+    std::string who;
+    if (s.threatIndex >= 0 && g_ref.tcasModeS) {
+        int id = 0;
+        if (XPLMGetDatavi(g_ref.tcasModeS, &id, s.threatIndex, 1) == 1)
+            for (const auto& kv : g_remote)
+                if ((0xF00000u | (kv.first & 0x0FFFFFu)) == (uint32_t)id) { intruder = kv.first; who = kv.second.callsign; }
+    }
+    const bool changed = s != g_tcas;
+    if (s.level == xr::TCAS_RA && g_tcas.level != xr::TCAS_RA)
+        pushNotice(std::string("TCAS RA") + (s.sense > 0 ? " CLIMB" : s.sense < 0 ? " DESCEND" : "") + (who.empty() ? "" : ": " + who), 3);
+    g_tcas = s;
+    if (!g_connected || !(changed || ((s.level == xr::TCAS_TA || s.level == xr::TCAS_RA) && g_elapsed - g_tcasSentAt > 1.f))) return;
+    g_tcasSentAt = g_elapsed;
+    uint8_t buf[sizeof(xr::Header) + sizeof(xr::TcasPayload)];
+    int off = writeHeader(buf, xr::PT_TCAS, sizeof(xr::TcasPayload));
+    xr::TcasPayload t{};
+    t.timeMs = nowMs(); t.level = s.level; t.sense = s.sense; t.message = s.message;
+    t.vsTargetMs = s.vsTargetMs; t.vsMs = fd(g_ref.vh); t.intruderSid = intruder;
+    memcpy(buf + off, &t, sizeof(t));
+    g_sock.send(buf, off + (int)sizeof(t));
 }
 
 void sendPosition() {
@@ -1562,6 +1665,16 @@ void pumpNetwork() {
                 logMsg("connected, session %u, as %s%s%s", (unsigned)g_sessionId.load(),
                        g_loginIcao.c_str(), g_loginLivery.empty() ? "" : " / ",
                        g_loginLivery.c_str());
+                sendAircraft();   // tail number, airline, size and weight for the ATC stations
+                break;
+            }
+            case xr::PT_AIRCRAFT: {
+                // the server's receipt: it flies the new type in every traffic packet from now on
+                if (h.sessionId == g_sessionId.load()) {
+                    g_acfAcked = true;
+                    g_loginIcao = g_acf.icao;
+                    g_loginLivery = effectiveLivery();
+                }
                 break;
             }
             case xr::PT_LOGIN_REJECT: {
@@ -1682,6 +1795,14 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
 
     pumpNetwork();
     xr::voice::tick();
+    if (g_acfDirty) {                       // a plane or livery was loaded (XPluginReceiveMessage)
+        detectAircraft();
+        if (g_connected && (g_acf.icao != g_loginIcao || effectiveLivery() != g_loginLivery)) {
+            pushNotice("Aircraft: " + g_acf.icao + " (" + g_acf.source + ")", 2);
+            sendAircraft();
+        }
+    }
+    tcasTick();
 
     // Somebody keying up is the other half of "I cannot see the window": you
     // can hear them, but not who they are or where they are calling from.
@@ -1795,10 +1916,19 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
     if (g_elapsed - g_lastAircraftCheck > 3.0f) {
         g_lastAircraftCheck = g_elapsed;
         if (xr::relay::running() && g_cfg.hostUpnp) xr::upnp::tick("XRadio");
-        if (effectiveIcao() != g_loginIcao || effectiveLivery() != g_loginLivery) {
-            logMsg("aircraft changed to %s, re-logging in", effectiveIcao().c_str());
-            reconnect();
-            return -1.0f;
+        detectAircraft();
+        if (g_connected && (effectiveIcao() != g_loginIcao || effectiveLivery() != g_loginLivery)) {
+            if (g_acfSentAt < 0.f || g_acfAcked) {
+                logMsg("aircraft changed to %s, telling the server", effectiveIcao().c_str());
+                pushNotice("Aircraft: " + g_acf.icao + " (" + g_acf.source + ")", 2);
+                sendAircraft();
+            } else if (g_elapsed - g_acfSentAt > 3.0f) {
+                // no receipt: a server from before PT_AIRCRAFT -- log in again with the new type
+                logMsg("aircraft changed to %s, the server did not take PT_AIRCRAFT: re-logging in", effectiveIcao().c_str());
+                g_acfSentAt = -1.f;
+                reconnect();
+                return -1.0f;
+            }
         }
     }
 
@@ -3327,6 +3457,8 @@ xr::ui2::Model buildModel() {
     m.conn.status = g_status;
     m.conn.endpoint = g_sockReady.load() ? g_sock.endpoint() : std::string();
     m.conn.callsign = g_cfg.callsign; m.conn.icao = effectiveIcao(); m.conn.livery = effectiveLivery();
+    m.conn.acSource = g_acf.source; m.conn.acNote = g_acf.note; m.conn.tailnum = g_acfTail;
+    m.conn.tcas = g_tcas.level == xr::TCAS_RA ? (g_tcas.sense > 0 ? "RA CLIMB" : g_tcas.sense < 0 ? "RA DESCEND" : "RA") : g_tcas.level == xr::TCAS_TA ? "TA" : "";
     m.conn.protoLocal = xr::kProtoVersion; m.conn.protoServer = g_connected ? xr::kProtoVersion : 0;
     if (g_status.find("another XRadio version") != std::string::npos) m.conn.versionMismatch = g_status;
     m.conn.lastPacketS = g_lastRxTime < 0 ? -1.f : g_elapsed - g_lastRxTime;
@@ -3502,6 +3634,10 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     xr::ui2::host::initTower(makeTowerActions(), g_cfg.towerLayout);
 #endif
 
+    // ICAO Doc 8643 (XPMP2 ships it in Resources/) to tell a real designator from a made-up one
+    if (!g_doc8643.loadFile(pluginRootDir() + "/Resources/Doc8643.txt"))
+        logMsg("Resources/Doc8643.txt not found: aircraft types are taken as the sim gives them");
+    detectAircraft();
     std::string cslErr;
     if (!xr::csl::init(pluginRootDir(), effectiveIcao(), g_cfg.cslPath, &cslErr)) {
         logMsg("3D traffic unavailable: %s", cslErr.c_str());
@@ -3611,4 +3747,7 @@ PLUGIN_API void XPluginStop(void) {
     if (g_menu)   { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
 }
 
-PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int, void*) {}
+PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int msg, void* param) {
+    // the user's aircraft (index 0) or its livery changed: detect the type again on the next frame
+    if ((msg == XPLM_MSG_PLANE_LOADED || msg == XPLM_MSG_LIVERY_LOADED) && (intptr_t)param == 0) g_acfDirty = true;
+}

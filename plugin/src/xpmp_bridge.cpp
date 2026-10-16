@@ -5,6 +5,7 @@
 // timeline. Built without XPMP2 (the tests), every function here is a stub
 // and other pilots exist only in the window's traffic list.
 #include "xpmp_bridge.h"
+#include "acftype.h"
 #include "protocol.h"
 #include "mathconst.h"
 #include "smoothing.h"
@@ -120,7 +121,9 @@ public:
     XRAircraft(const std::string& icaoType, const std::string& livery,
                const std::string& callsign, XPMPPlaneID id)
         : XPMP2::Aircraft(icaoType.empty() ? std::string("ZZZZ") : icaoType,
-                          /*icaoAirline=*/"", livery, id) {
+                          // the airline from an airline callsign ("BTI123" -> BTI): with the type and the
+                          // livery it is what XPMP2 matches a CSL model by
+                          xr::acftype::airlineOf(callsign), livery, id) {
         label = callsign;
         strncpy(acInfoTexts.tailNum,  callsign.c_str(), sizeof(acInfoTexts.tailNum)  - 1);
         strncpy(acInfoTexts.icaoAcType, icaoType.c_str(), sizeof(acInfoTexts.icaoAcType) - 1);
@@ -393,6 +396,15 @@ void upsert(const RemoteState& s) {
                    s.callsign.c_str(), s.acIcao.c_str(), e.what());
         }
         return;
+    }
+    // the pilot loaded another aircraft (PT_AIRCRAFT): the matching model, not the old one
+    if (it->second->st.acIcao != s.acIcao || it->second->st.livery != s.livery) {
+        try {
+            it->second->ChangeModel(s.acIcao.empty() ? std::string("ZZZZ") : s.acIcao, xr::acftype::airlineOf(s.callsign), s.livery);
+            logMsg("%s is now %s %s", s.callsign.c_str(), s.acIcao.c_str(), s.livery.c_str());
+        } catch (const XPMP2::XPMP2Error& e) {
+            logMsg("no model for %s (%s): %s", s.callsign.c_str(), s.acIcao.c_str(), e.what());
+        }
     }
     it->second->ApplyNetworkUpdate(s);
 }

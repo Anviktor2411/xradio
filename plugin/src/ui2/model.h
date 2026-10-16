@@ -86,6 +86,8 @@ struct HostInfo {
 struct Connection {
     bool        connected = false, connecting = false;
     std::string status, endpoint, callsign, icao, livery, skyLine;
+    std::string acSource, acNote, tailnum;   // how the type was found: detected / mapped / manual / default
+    std::string tcas;                        // the pilot's own TCAS: "", "TA", "RA CLIMB", "RA DESCEND"
     unsigned    protoLocal = 6, protoServer = 0;
     std::string versionMismatch;      // the message when the server speaks another version
     float       lastPacketS = -1.f;   // seconds since the last packet from the server

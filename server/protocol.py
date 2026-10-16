@@ -37,6 +37,13 @@ PT_AI_TRAFFIC = 13   # injector -> server: the aircraft it drives (TRAFFIC_HDR +
 PT_FLIGHTPLAN = 14   # pilot -> server -> ATC stations; ATC -> server -> pilot
 PT_ATIS = 15         # ATC -> server (publish); server -> pilot who tunes it
 PT_ATC_LIST = 16     # server -> everyone: the stations online and the ATIS frequencies
+PT_AIRCRAFT = 17     # pilot -> server (echoed back as the receipt) -> ATC stations: the loaded aircraft
+PT_TCAS = 18         # pilot -> server -> ATC stations: the pilot's own TCAS advisory
+
+# AIRCRAFT.source
+AS_DEFAULT, AS_DETECTED, AS_MAPPED, AS_MANUAL = 0, 1, 2, 3
+# TCAS.level
+TCAS_NONE, TCAS_TA, TCAS_RA, TCAS_CLEAR = 0, 1, 2, 3
 
 # The international emergency frequency, and in XRadio the one place everybody
 # can be reached: a transmission on it goes to every pilot within VHF range
@@ -153,6 +160,10 @@ ATC_LIST_HDR = struct.Struct("<HH")       # count, flags (AL_*)
 # sessionId, callsign, icao, freqKhz, kind, flags (AE_*), reserved,
 # lat, lon, altMslM, antennaM, rangeNm, ceilingFt -- see AtcEntry
 ATC_ENTRY = struct.Struct("<I16s8sIBB2s2d2fHH")
+# acIcao, tailnum, airline, livery, wingspanDm, lengthDm, mtowKg, wtc, source, reserved -- see AircraftPayload
+AIRCRAFT = struct.Struct("<8s12s4s32sHHIcBH")
+# timeMs, level, sense, message, reserved, vsTargetMs, vsMs, intruderSid -- see TcasPayload
+TCAS = struct.Struct("<IBbBBffI")
 
 # The flight's shared sky: time, then X-Plane 12's region weather whole --
 # three cloud layers and thirteen altitude levels, the sim's own counts.
@@ -170,6 +181,8 @@ assert WEATHER.size == 452
 assert FLIGHTPLAN.size == 256
 assert ATIS_HDR.size == 16
 assert ATC_ENTRY.size == 64
+assert AIRCRAFT.size == 68
+assert TCAS.size == 20
 
 
 def pack(ptype: int, session_id: int, payload: bytes = b"", version: int = PROTO_VERSION) -> bytes:
@@ -229,6 +242,36 @@ def atis(freq_khz: int, icao: str, letter: str, text: str) -> bytes:
     data = text.encode("utf-8")[:MAX_ATIS_BYTES]
     return ATIS_HDR.pack(freq_khz, pad(icao, 8), (letter[:1] or "A").encode("ascii", "replace"),
                          0, len(data)) + data
+
+
+def aircraft(ac_icao: str, tailnum: str = "", airline: str = "", livery: str = "", span_m: float = 0.0,
+             length_m: float = 0.0, mtow_kg: int = 0, wtc: str = "", source: int = AS_DETECTED) -> bytes:
+    """An AIRCRAFT payload: the type the sim has loaded, sent whenever it changes."""
+    return AIRCRAFT.pack(pad(ac_icao, 8), pad(tailnum, 12), pad(airline, 4), pad(livery, 32),
+                         int(round(span_m * 10)), int(round(length_m * 10)), int(mtow_kg),
+                         (wtc[:1] or "\0").encode("ascii", "replace"), source, 0)
+
+
+def unpack_aircraft(payload: bytes):
+    if len(payload) < AIRCRAFT.size:
+        return None
+    icao, tail, airline, livery, span, length, mtow, wtc, source, _r = AIRCRAFT.unpack_from(payload, 0)
+    w = wtc.decode("ascii", "replace").strip("\0")
+    return {"ac_icao": cstr(icao), "tailnum": cstr(tail), "airline": cstr(airline), "livery": cstr(livery),
+            "span_m": span / 10, "length_m": length / 10, "mtow_kg": mtow, "wtc": w, "source": source}
+
+
+def tcas(level: int, sense: int = 0, message: int = 0, vs_target_ms: float = 0.0, vs_ms: float = 0.0,
+         intruder_sid: int = 0, time_ms: int = 0) -> bytes:
+    return TCAS.pack(time_ms & 0xFFFFFFFF, level, sense, message, 0, vs_target_ms, vs_ms, intruder_sid)
+
+
+def unpack_tcas(payload: bytes):
+    if len(payload) < TCAS.size:
+        return None
+    t, level, sense, message, _r, vst, vs, intr = TCAS.unpack_from(payload, 0)
+    return {"time_ms": t, "level": level, "sense": sense, "message": message, "vs_target_ms": vst, "vs_ms": vs,
+            "intruder_sid": intr}
 
 
 def cstr(raw: bytes) -> str:

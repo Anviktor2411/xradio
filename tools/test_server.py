@@ -574,6 +574,49 @@ def run():
     pump(0.3)
     check("an injector cannot file", twr.recv(P.PT_FLIGHTPLAN, 0.3) is None)
 
+    print("\nv6: the aircraft a pilot loads (PT_AIRCRAFT)")
+    alive()
+    a.send(P.PT_AIRCRAFT, P.aircraft("B738", tailnum="ES-ABC", airline="", livery="Ryanair 2023 long name", span_m=35.8,
+                                     length_m=39.5, mtow_kg=79016, wtc="M", source=P.AS_MAPPED))
+    echo = a.recv(P.PT_AIRCRAFT)
+    check("the pilot gets the packet back as the receipt", echo is not None and P.unpack_aircraft(echo)["ac_icao"] == "B738")
+    st = twr.recv(P.PT_AIRCRAFT)
+    sd = P.unpack_aircraft(st) if st else None
+    check("the station gets type, tail number, size, weight and how the type was found",
+          sd is not None and sd["tailnum"] == "ES-ABC" and abs(sd["span_m"] - 35.8) < 0.05 and sd["mtow_kg"] == 79016
+          and sd["wtc"] == "M" and sd["source"] == P.AS_MAPPED, str(sd))
+    check("the server flies the new type for this session", srv.by_sid[a.sid].ac_icao == "B738")
+    check("other pilots do not get the record (they see the type in traffic)", b.recv(P.PT_AIRCRAFT, 0.3) is None)
+    a.position(); b.position()
+    pump(0.3)
+    seen = None
+    for _ in range(6):
+        tp = b.recv(P.PT_TRAFFIC, 0.5)
+        if tp:
+            n, _r = P.TRAFFIC_HDR.unpack_from(tp, 0)
+            for k in range(n):
+                e = P.TRAFFIC_ENTRY.unpack_from(tp, P.TRAFFIC_HDR.size + k * P.TRAFFIC_ENTRY.size)
+                if e[0] == a.sid:
+                    seen = (P.cstr(e[2]), P.cstr(e[19]))
+        if seen:
+            break
+    check("traffic carries the new type and livery without a new login", seen == ("B738", "Ryanair 2023 lo"), str(seen))
+    gnd2 = Client("EETN_DEL", 57.85, 27.02, alt_ft=100.0, agl_ft=0.0, com1=OTHER_FREQ)
+    login_flags(gnd2, "EETN_DEL", "ATC", P.LF_ATC)
+    keep.append(gnd2)
+    late_ac = gnd2.recv(P.PT_AIRCRAFT, 1.0)
+    check("a station that joins later gets every pilot's aircraft", late_ac is not None and P.unpack_aircraft(late_ac)["tailnum"] == "ES-ABC")
+
+    print("\nv6: a pilot's own TCAS (PT_TCAS)")
+    a.send(P.PT_TCAS, P.tcas(P.TCAS_RA, sense=1, message=1, vs_target_ms=7.62, vs_ms=2.0, intruder_sid=b.sid))
+    tc = twr.recv(P.PT_TCAS)
+    td = P.unpack_tcas(tc) if tc else None
+    check("the RA reaches the stations", td is not None and td["level"] == P.TCAS_RA and td["sense"] == 1 and td["intruder_sid"] == b.sid, str(td))
+    check("pilots do not get each other's TCAS", b.recv(P.PT_TCAS, 0.3) is None)
+    inj.send(P.PT_TCAS, P.tcas(P.TCAS_RA, sense=-1))
+    pump(0.3)
+    check("an injector's TCAS is not relayed", twr.recv(P.PT_TCAS, 0.3) is None)
+
     print("\nv6: ATIS")
     alive()
     twr.sock.sendto(P.pack(P.PT_ATIS, twr.sid, P.atis(ATIS_FREQ, "EETN", "C", "Tallinn information Charlie, runway 26")), twr.dest)

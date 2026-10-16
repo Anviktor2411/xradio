@@ -99,6 +99,8 @@ int main() {
     printf("ATIS_HDR %zu\n",      sizeof(xr::AtisPayload));
     printf("ATC_LIST_HDR %zu\n",  sizeof(xr::AtcListHeader));
     printf("ATC_ENTRY %zu\n",     sizeof(xr::AtcEntry));
+    printf("AIRCRAFT %zu\n",      sizeof(xr::AircraftPayload));
+    printf("TCAS %zu\n",          sizeof(xr::TcasPayload));
     // Not a struct, but the same class of mistake: a packet budget or an
     // entry cap that drifts apart between the two servers shows up as
     // traffic that thins out for clients of one of them.
@@ -114,6 +116,8 @@ int main() {
     printf("PT_FLIGHTPLAN %d\n",  (int)xr::PT_FLIGHTPLAN);
     printf("PT_ATIS %d\n",        (int)xr::PT_ATIS);
     printf("PT_ATC_LIST %d\n",    (int)xr::PT_ATC_LIST);
+    printf("PT_AIRCRAFT %d\n",    (int)xr::PT_AIRCRAFT);
+    printf("PT_TCAS %d\n",        (int)xr::PT_TCAS);
     printf("LF_ATC %d\n",         (int)xr::LF_ATC);
     printf("LF_INJECTOR %d\n",    (int)xr::LF_INJECTOR);
     printf("AI_SID %u\n",         (unsigned)xr::aiSid(7, 12));
