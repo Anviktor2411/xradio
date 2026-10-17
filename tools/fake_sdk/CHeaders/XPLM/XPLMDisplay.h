@@ -9,7 +9,9 @@ typedef int  (*XPLMHandleMouseWheel_f)(XPLMWindowID, int, int, int, int, void*);
 typedef enum { xplm_WindowLayerFloatingWindows = 0 } XPLMWindowLayer;
 typedef enum {
     xplm_WindowDecorationNone = 0,
-    xplm_WindowDecorationRoundRectangle = 1
+    xplm_WindowDecorationRoundRectangle = 1,
+    xplm_WindowDecorationSelfDecorated = 2,
+    xplm_WindowDecorationSelfDecoratedResizable = 3
 } XPLMWindowDecoration;
 typedef struct {
     int structSize;
@@ -43,3 +45,19 @@ void XPLMGetAllMonitorBoundsGlobal(XPLMReceiveMonitorBoundsGlobal_f, void*);
 void XPLMTakeKeyboardFocus(XPLMWindowID);
 int  XPLMHasKeyboardFocus(XPLMWindowID);
 typedef int (*XPLMCommandCallback_f)(XPLMCommandRef, XPLMCommandPhase, void*);
+
+// The Dear ImGui window (plugin/src/ui2/imgui_xp.cpp): pop-out, VR and the OS-window geometry.
+typedef enum {
+    xplm_WindowPositionFree = 0,
+    xplm_WindowCenterOnMonitor = 1,
+    xplm_WindowFullScreenOnMonitor = 2,
+    xplm_WindowFullScreenOnAllMonitors = 3,
+    xplm_WindowPopOut = 4,
+    xplm_WindowVR = 5
+} XPLMWindowPositioningMode;
+void XPLMSetWindowPositioningMode(XPLMWindowID, XPLMWindowPositioningMode, int inMonitorIndex);
+int  XPLMWindowIsPoppedOut(XPLMWindowID);
+int  XPLMWindowIsInVR(XPLMWindowID);
+void XPLMGetWindowGeometryOS(XPLMWindowID, int*, int*, int*, int*);
+void XPLMGetWindowGeometryVR(XPLMWindowID, int*, int*);
+void XPLMGetScreenSize(int* outWidth, int* outHeight);

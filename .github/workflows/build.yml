@@ -60,6 +60,10 @@ jobs:
           g++ -std=c++17 -Iplugin/src tools/check_sizes.cpp -o /tmp/check_sizes
           python3 tools/check_sizes.py --compare /tmp/check_sizes
 
+      # The plugin's Dear ImGui window draws with OpenGL, so the plugin target needs <GL/gl.h>.
+      - name: OpenGL headers
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq libgl-dev
+
       - name: Build the test executables
         run: |
           cmake -B build-tests -DCMAKE_BUILD_TYPE=Debug \

@@ -13,3 +13,9 @@ void XPLMWorldToLocal(double inLatitude, double inLongitude, double inAltitude,
                       double* outX, double* outY, double* outZ);
 void XPLMLocalToWorld(double inX, double inY, double inZ,
                       double* outLatitude, double* outLongitude, double* outAltitude);
+
+// OpenGL state and textures, for the Dear ImGui renderer.
+void XPLMSetGraphicsState(int inEnableFog, int inNumberTexUnits, int inEnableLighting, int inEnableAlphaTesting,
+                          int inEnableAlphaBlending, int inEnableDepthTesting, int inEnableDepthWriting);
+void XPLMBindTexture2d(int inTextureNum, int inTextureUnit);
+void XPLMGenerateTextureNumbers(int* outTextureIDs, int inCount);
