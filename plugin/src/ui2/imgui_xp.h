@@ -18,11 +18,31 @@
 namespace xr {
 namespace ui2 {
 
+// Makes `ctx` the current ImGui context for as long as this object lives and puts the previous one back
+// after, however the scope is left -- so a window drawing, or an input callback, never leaves its context
+// current for whoever runs next. Nests. v0.6.0 crashed X-Plane on Apply because one switch was not undone:
+// the rest of the main window's frame then ran against the overlay's context, which was not in a frame.
+class ContextGuard {
+public:
+    explicit ContextGuard(ImGuiContext* ctx) : prev_(ImGui::GetCurrentContext()) { ImGui::SetCurrentContext(ctx); }
+    ~ContextGuard() { ImGui::SetCurrentContext(prev_); }
+    ContextGuard(const ContextGuard&) = delete;
+    ContextGuard& operator=(const ContextGuard&) = delete;
+private:
+    ImGuiContext* prev_;
+};
+
 // Fonts for every window: Inter (OFL), body / heading / big / mono-ish / small (radar labels), at the UI scale.
 struct FontSet { ImFont* body = nullptr; ImFont* heading = nullptr; ImFont* big = nullptr; ImFont* mono = nullptr; ImFont* small = nullptr; };
 ImFontAtlas* sharedAtlas();                 // built on first use
 const FontSet& fonts();
-void   rebuildFonts(float scale);           // after the UI scale changed (re-uploads the texture)
+// The atlas is shared by every window's context, so it is only rebuilt between frames: requestFontRebuild()
+// marks it, and the next window to start a frame rebuilds it (and re-uploads the texture) before NewFrame.
+// rebuildFonts() is the same, done at once when no window is in the middle of a frame (startup).
+void   requestFontRebuild(float scale);
+void   rebuildFonts(float scale);
+bool   fontRebuildPending();
+int    framesInFlight();                    // windows between their NewFrame and Render right now
 void   uploadFontTexture();                 // (re)creates the GL texture from the atlas; main thread, GL context
 
 class XpWindow {
@@ -32,6 +52,10 @@ public:
     ~XpWindow();
     XpWindow(const XpWindow&) = delete;
     XpWindow& operator=(const XpWindow&) = delete;
+
+    // Runs in this window's own context just before its NewFrame: where the theme goes (host.cpp), since a
+    // style changed half-way through a frame is applied to half a window.
+    void setBeforeFrame(DrawFn fn) { before_ = std::move(fn); }
 
     void setVisible(bool on);
     bool visible() const;
@@ -66,6 +90,7 @@ private:
     XPLMWindowID  win_ = nullptr;
     ImGuiContext* ctx_ = nullptr;
     DrawFn        draw_;
+    DrawFn        before_;
     float         w_ = 0.f, h_ = 0.f;
     double        lastTime_ = 0.0;
     bool          passThrough_ = false;

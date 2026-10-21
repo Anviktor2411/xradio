@@ -8,6 +8,7 @@
 #include "imgui.h"
 #include "i18n.h"
 #include "theme.h"
+#include "tower_ui.h"     // probeLast(): where the tabs and the Apply buttons are, for the tests
 
 namespace xr {
 namespace ui2 {
@@ -370,7 +371,10 @@ void drawHost(Model& m, const Actions& a) {
     ImGui::SameLine(); ImGui::SetNextItemWidth(70);
     char cport[8]; snprintf(cport, sizeof cport, "%s", e.port.c_str());
     if (ImGui::InputText(tr("Port"), cport, sizeof cport, ImGuiInputTextFlags_CharsDecimal)) { e.port = cport; g_st.editDirty = true; }
-    if (ImGui::Button(g_st.editDirty ? tr("Apply") : tr("Reconnect"))) {
+    // Apply and Reconnect only ask: the plugin does the work from its flight loop, after this frame
+    const bool pressed = ImGui::Button(g_st.editDirty ? tr("Apply") : tr("Reconnect"));
+    if (probesOn()) probeLast("apply:host");
+    if (pressed) {
         if (g_st.editDirty && a.applySettings) { a.applySettings(e); g_st.editDirty = false; setNote(tr("Saved"), m.elapsed); }
         else if (a.reconnect) a.reconnect();
     }
@@ -450,7 +454,11 @@ void drawSettings(Model& m, const Actions& a) {
     if (!g_st.editLoaded) { g_st.edit = m.settings; g_st.editLoaded = true; }
     Settings& e = g_st.edit;
     const char* groups[7] = {tr("Audio"), tr("Controls"), tr("Display"), tr("Traffic"), tr("Language"), tr("Tower"), "SimBrief"};
-    for (int i = 0; i < 7; ++i) { if (i) ImGui::SameLine(); if (ImGui::RadioButton(groups[i], g_st.settingsGroup == i)) g_st.settingsGroup = i; }
+    for (int i = 0; i < 7; ++i) {
+        if (i) ImGui::SameLine();
+        if (ImGui::RadioButton(groups[i], g_st.settingsGroup == i)) g_st.settingsGroup = i;
+        if (probesOn()) probeLast("group:" + std::to_string(i));
+    }
     ImGui::Separator();
     ImGui::BeginChild("fields", ImVec2(0, -ImGui::GetFrameHeightWithSpacing() * 1.4f));
     auto fields = describe(e);
@@ -490,7 +498,10 @@ void drawSettings(Model& m, const Actions& a) {
     }
     ImGui::EndChild();
     ImGui::BeginDisabled(!g_st.editDirty);
-    if (ImGui::Button(tr("Apply"), ImVec2(120, 0)) && a.applySettings) { a.applySettings(e); g_st.editDirty = false; setNote(tr("Saved"), m.elapsed); }
+    // only asks: the plugin applies from its flight loop, outside this frame (see main.cpp, requestApply)
+    const bool apply = ImGui::Button(tr("Apply"), ImVec2(120, 0));
+    if (probesOn()) probeLast("apply:settings");
+    if (apply && a.applySettings) { a.applySettings(e); g_st.editDirty = false; setNote(tr("Saved"), m.elapsed); }
     ImGui::EndDisabled();
     ImGui::SameLine(); if (ImGui::Button("Reload")) { g_st.edit = m.settings; g_st.editDirty = false; }
 }
@@ -554,7 +565,9 @@ void drawWizard(Model& m, const Actions& a) {
     if (w.step > 0 && ImGui::Button(tr("Back"))) w.step--;
     if (w.step > 0) ImGui::SameLine();
     ImGui::BeginDisabled(!block.empty() && w.step != 1);
-    if (ImGui::Button(w.step == Wizard::kSteps - 1 ? tr("Finish") : tr("Next"), ImVec2(100, 0))) {
+    const bool next = ImGui::Button(w.step == Wizard::kSteps - 1 ? tr("Finish") : tr("Next"), ImVec2(100, 0));
+    if (probesOn()) probeLast(w.step == Wizard::kSteps - 1 ? "wizard:finish" : "wizard:next");
+    if (next) {
         if (w.step < Wizard::kSteps - 1) w.step++;
         else { e.uiWizardDone = true; if (a.applySettings) a.applySettings(e); g_st.editDirty = false; g_st.wizardOpen = false; setNote(tr("Done. Start by tuning a controller on the ATC tab."), m.elapsed); g_st.tab = 1; }
     }
@@ -600,6 +613,7 @@ void drawMain(Model& m, const Actions& a) {
         if (i == 3 && unread) snprintf(label, sizeof label, "%s (%d)", tabName(i), unread);
         else snprintf(label, sizeof label, "%s", tabName(i));
         if (ImGui::Button(label, ImVec2(-1, 0))) { g_st.tab = i; g_st.wizardOpen = false; }
+        if (probesOn()) probeLast("tab:" + std::to_string(i));
         ImGui::PopStyleColor();
     }
     ImGui::Spacing();

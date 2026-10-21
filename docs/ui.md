@@ -95,7 +95,12 @@ fixed-pipeline OpenGL rendering, input from the window callbacks, pop-out and VR
 the approach ImgWindow (xsquawkbox / LiveTraffic, BSD) made standard, written fresh here under XRadio's
 MIT licence; `host.cpp` owns the windows and the model; `theme.cpp` the palettes; `i18n.cpp` the
 Estonian texts. The network never touches the window: `main.cpp` builds the model from its own state once
-per frame. Tower mode's windows follow the same split: `tower.cpp` keeps the logic and the link,
+per frame. Nor does the window touch the plugin: a button runs inside the window's own frame, so *Apply*,
+*Reconnect*, the tower toggle and the rest only ask (`requestApply()` / `defer()` in `main.cpp`), and the
+flight loop does the work before the next frame. Inside `imgui_xp.cpp` every switch of ImGui context is a
+`ContextGuard` that puts the previous one back, the theme is taken by each window in its own context at
+the start of its frame, and the shared font atlas is rebuilt only between frames -- v0.6.0 did all of that
+from the button and crashed X-Plane. `IM_ASSERT` writes to Log.txt instead of aborting (`xr_imconfig.h`). Tower mode's windows follow the same split: `tower.cpp` keeps the logic and the link,
 `tower_parse.cpp` turns the trainer's lines into `tower::State`, `ui2/tower_model.cpp` holds what is
 logic in the windows (the strip bays, history and callsign completion, the radar's projection and label
 filter, the banner's words; tested by `ui_logic_test`), and `ui2/tower_ui.cpp` draws them. `tools/ui_preview` renders the same drawing functions with a small software rasteriser to the

@@ -34,8 +34,8 @@ Actions g_actions;
 std::string g_theme = "dark";
 float   g_scale = 1.f;
 bool    g_overlayOn = true;
-bool    g_themeApplied = false;
 int     g_themeGen = 1;           // bumped when the theme or the scale changes: each window re-applies it in its context
+int     g_mainThemeGen = 0, g_overlayThemeGen = 0;   // the generation each window's context has
 XPLMDataRef g_vr = nullptr;
 bool    g_wasVr = false;
 double  g_readUntil = 0;
@@ -52,6 +52,16 @@ int     g_twThemeGen[kTwCount] = {};
 int     g_twGeom[kTwCount][4] = {};        // where each was last seen inside X-Plane, for the settings file
 bool    g_twHaveGeom[kTwCount] = {};
 tower::Phase g_twPhase = tower::Phase::Off;
+// A tower window's pop-out button is pressed inside that window's own frame; changing its positioning mode
+// there would swap the window out from under the drawing, so it waits for update() on the flight loop.
+std::vector<std::pair<int, bool>> g_twPopOut;
+
+// XpWindow::setBeforeFrame: the theme, in the window's own context, before its frame starts.
+void themeFor(int& gen) {
+    if (gen == g_themeGen) return;
+    applyTheme(g_theme.c_str(), g_scale);
+    gen = g_themeGen;
+}
 
 Fonts uiFonts() {
     Fonts f; f.body = fonts().body; f.heading = fonts().heading; f.big = fonts().big; f.mono = fonts().mono; f.small = fonts().small;
@@ -72,7 +82,6 @@ void defaultMain(int* l, int* t, int* r, int* b) {
 
 void drawMainWin(XpWindow& w) {
     (void)w;
-    if (!g_themeApplied) { applyTheme(g_theme.c_str(), g_scale); g_themeApplied = true; }
     setFonts(uiFonts());
     ImGui::PushFont(fonts().body);
     g_model.readUntil = g_readUntil;
@@ -109,7 +118,6 @@ void defaultTowerRect(int which, int* l, int* t, int* r, int* b) {
 }
 
 void drawTowerWin(int which, XpWindow& w) {
-    if (g_twThemeGen[which] != g_themeGen) { applyTheme(g_theme.c_str(), g_scale); g_twThemeGen[which] = g_themeGen; }
     if (!g_twState) return;
     setTowerFonts(uiFonts());
     ImGui::PushFont(fonts().body);
@@ -133,10 +141,12 @@ void init(const Actions& actions, const Settings& settings) {
     parseGeom(settings.uiWin, &l, &t, &r, &b);
     g_main.reset(new XpWindow("XRadio", l, t, r, b, true, drawMainWin));
     g_main->setResizingLimits(560, 360, 2400, 1600);
+    g_main->setBeforeFrame([](XpWindow&) { themeFor(g_mainThemeGen); });
     int ol = l, ot = t + 60;
     { int a = 0, c = 0; if (sscanf(settings.uiOverlayPos.c_str(), "%d,%d", &a, &c) == 2 && a >= 0 && c > 40) { ol = a; ot = c; } }
     g_overlay.reset(new XpWindow("XRadio overlay", ol, ot, ol + 520, ot - 64, false, drawOverlayWin));
     g_overlay->setResizingLimits(260, 40, 1200, 200);
+    g_overlay->setBeforeFrame([](XpWindow&) { themeFor(g_overlayThemeGen); });
     g_overlay->setPassThrough(true);
     g_overlay->setVisible(g_overlayOn);
     state().tab = atoi(settings.uiTab.c_str());
@@ -148,13 +158,19 @@ void init(const Actions& actions, const Settings& settings) {
 void shutdown() {
     for (auto& w : g_tw) w.reset();
     g_twState = nullptr;
+    g_twPopOut.clear();
     g_overlay.reset();
     g_main.reset();
+    // a later init (the harness starts the plugin more than once) applies the theme to its new contexts
+    g_mainThemeGen = g_overlayThemeGen = 0;
+    for (auto& gen : g_twThemeGen) gen = 0;
 }
 
 void update(const Model& model) {
     g_model = model;
     g_model.readUntil = g_readUntil;
+    for (const auto& p : g_twPopOut) if (g_tw[p.first]) g_tw[p.first]->popOut(p.second);
+    g_twPopOut.clear();
     // VR: the windows follow the headset when VR starts, and come back when it stops
     const bool vr = g_vr && XPLMGetDatai(g_vr) != 0;
     if (vr != g_wasVr) {
@@ -172,17 +188,17 @@ void showSettings() { state().tab = 6; state().wizardOpen = false; showMain(true
 void toast(const std::string& text, int colour) { ui2::toast(text, colour, g_model.elapsed); }
 int  currentTab() { return state().tab; }
 
+// Called from the flight loop (the plugin's deferred Apply), never inside a window's frame -- and even so it
+// only notes what changed: every window takes the theme into its own context at the start of its next frame
+// (themeFor), and the fonts are rebuilt then too, between frames. Switching contexts here and rebuilding the
+// atlas on the spot is what crashed X-Plane on Apply in v0.6.0.
 void applyDisplay(const Settings& s) {
-    const bool scaleChanged = s.uiScale > 0.5f && s.uiScale != g_scale;
     g_theme = s.uiTheme;
     g_overlayOn = s.uiOverlay;
     setLanguage(s.uiLang);
-    if (scaleChanged) { g_scale = s.uiScale; setUiScale(g_scale); rebuildFonts(g_scale); }
-    g_themeApplied = false;    // re-applied inside the next frame of each window (needs its context)
+    if (s.uiScale > 0.5f && s.uiScale != g_scale) { g_scale = s.uiScale; setUiScale(g_scale); requestFontRebuild(g_scale); }
     ++g_themeGen;
-    if (g_main) { ImGui::SetCurrentContext(g_main->context()); applyTheme(g_theme.c_str(), g_scale); }
-    if (g_overlay) { ImGui::SetCurrentContext(g_overlay->context()); applyTheme(g_theme.c_str(), g_scale); g_overlay->setVisible(g_overlayOn); }
-    g_themeApplied = true;
+    if (g_overlay) g_overlay->setVisible(g_overlayOn);
 }
 
 void resetPositions() {
@@ -211,7 +227,7 @@ std::string overlayPosition() {
 // ---------------------------------------------------------------- Tower mode's windows
 void initTower(const TowerActions& actions, const std::string& layout) {
     g_twActions = actions;
-    g_twActions.popOut = [](int which, bool out) { if (which >= 0 && which < kTwCount && g_tw[which]) g_tw[which]->popOut(out); };
+    g_twActions.popOut = [](int which, bool out) { if (which >= 0 && which < kTwCount) g_twPopOut.emplace_back(which, out); };
     // the saved layout: "l,t,r,b|l,t,r,b|..." in window order; a missing or squashed one opens where it would by default
     std::vector<std::string> saved;
     for (size_t a = 0; a <= layout.size();) {
@@ -229,6 +245,7 @@ void initTower(const TowerActions& actions, const std::string& layout) {
             g[2] - g[0] >= minSize[i][0] && g[1] - g[3] >= minSize[i][1]) { l = g[0]; t = g[1]; r = g[2]; b = g[3]; }
         g_tw[i].reset(new XpWindow(tr(towerWindowTitle(i)), l, t, r, b, true, [i](XpWindow& w) { drawTowerWin(i, w); }));
         g_tw[i]->setResizingLimits(minSize[i][0], minSize[i][1], 2400, 1600);
+        g_tw[i]->setBeforeFrame([i](XpWindow&) { themeFor(g_twThemeGen[i]); });
         g_twGeom[i][0] = l; g_twGeom[i][1] = t; g_twGeom[i][2] = r; g_twGeom[i][3] = b;
         g_twHaveGeom[i] = true;
     }

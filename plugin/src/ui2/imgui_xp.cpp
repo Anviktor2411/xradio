@@ -1,25 +1,32 @@
 #include "imgui_xp.h"
 
 #include <chrono>
+#include <cstdio>
 #include <cstring>
+#include <exception>
 
-#ifdef _WIN32
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
+// XRADIO_UI_HEADLESS (the test builds): everything but the OpenGL calls, so the windows can be drawn and clicked
+// through tools/harness/xplm_stub.cpp on a machine with no GL context.
+#ifndef XRADIO_UI_HEADLESS
+#  ifdef _WIN32
+#    ifndef WIN32_LEAN_AND_MEAN
+#      define WIN32_LEAN_AND_MEAN
+#    endif
+#    include <windows.h>
+#    include <GL/gl.h>
+#  elif defined(__APPLE__)
+#    define GL_SILENCE_DEPRECATION 1
+#    include <OpenGL/gl.h>
+#  else
+#    include <GL/gl.h>
 #  endif
-#  include <windows.h>
-#  include <GL/gl.h>
-#elif defined(__APPLE__)
-#  define GL_SILENCE_DEPRECATION 1
-#  include <OpenGL/gl.h>
-#else
-#  include <GL/gl.h>
 #endif
 
 #include "XPLMDataAccess.h"
 #include "XPLMGraphics.h"
 #include "XPLMUtilities.h"
 
+#include "imgui_internal.h"    // ErrorRecoveryStoreState / ErrorRecoveryTryToRecoverState
 #include "font_inter.h"
 
 namespace xr {
@@ -33,7 +40,19 @@ FontSet      g_fonts;
 int          g_fontTex = 0;
 float        g_scale = 1.f;
 bool         g_texUploaded = false;
+bool         g_fontsDirty = false;         // requestFontRebuild(): rebuild before the next frame starts
+float        g_fontsWantScale = 1.f;
+int          g_framesInFlight = 0;          // windows between NewFrame and Render (the draw callbacks run one at a time)
 XPLMDataRef  g_fbW = nullptr;
+int          g_drawErrors = 0;              // exceptions out of a window's drawing, logged the first few times
+
+void logLine(const char* what, const char* detail) {
+    char line[600];
+    snprintf(line, sizeof line, "XRadio: %s%s%s\n", what, detail && *detail ? ": " : "", detail ? detail : "");
+    XPLMDebugString(line);
+}
+
+void buildFonts(float scale);
 
 const ImWchar* glyphRanges() {
     static const ImWchar ranges[] = {
@@ -54,6 +73,7 @@ double nowS() {
     return duration_cast<duration<double>>(steady_clock::now().time_since_epoch()).count();
 }
 
+#ifndef XRADIO_UI_HEADLESS
 // Framebuffer pixels per boxel (HiDPI): the scissor rectangle is in pixels, everything else in boxels.
 float pixelsPerBoxel() {
     int sw = 0, sh = 0;
@@ -63,6 +83,7 @@ float pixelsPerBoxel() {
     if (sw > 0 && fb > 0) { const float r = (float)fb / (float)sw; if (r > 0.5f && r < 4.f) return r; }
     return 1.f;
 }
+#endif
 
 ImGuiKey mapKey(unsigned char vk) {
     switch (vk) {
@@ -83,14 +104,27 @@ float uiScale() { return g_scale; }
 void  setUiScale(float s) { g_scale = s < 0.5f ? 0.5f : (s > 3.f ? 3.f : s); }
 
 ImFontAtlas* sharedAtlas() {
-    if (!g_atlas) { g_atlas = IM_NEW(ImFontAtlas)(); rebuildFonts(g_scale); }
+    if (!g_atlas) { g_atlas = IM_NEW(ImFontAtlas)(); buildFonts(g_scale); }
     return g_atlas;
 }
 
 const FontSet& fonts() { return g_fonts; }
+int framesInFlight() { return g_framesInFlight; }
+bool fontRebuildPending() { return g_fontsDirty; }
+
+void requestFontRebuild(float scale) { g_fontsWantScale = scale; g_fontsDirty = true; }
 
 void rebuildFonts(float scale) {
+    if (g_framesInFlight > 0) { requestFontRebuild(scale); return; }   // a frame still draws with the old fonts
+    buildFonts(scale);
+}
+
+namespace {
+// Clears the shared atlas and builds it again: every ImFont* handed out so far is gone afterwards. Only ever
+// called with no window in the middle of a frame (rebuildFonts / XpWindow::frame check).
+void buildFonts(float scale) {
     if (!g_atlas) g_atlas = IM_NEW(ImFontAtlas)();
+    g_fontsDirty = false;
     g_scale = scale;
     g_atlas->Clear();
     ImFontConfig cfg;
@@ -104,6 +138,7 @@ void rebuildFonts(float scale) {
     g_atlas->Build();
     g_texUploaded = false;
 }
+}  // namespace
 
 void uploadFontTexture() {
     if (!g_atlas) sharedAtlas();
@@ -111,11 +146,18 @@ void uploadFontTexture() {
     g_atlas->GetTexDataAsRGBA32(&pixels, &w, &h);
     if (!g_fontTex) XPLMGenerateTextureNumbers(&g_fontTex, 1);
     XPLMBindTexture2d(g_fontTex, 0);
+#ifndef XRADIO_UI_HEADLESS
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels);
-    g_atlas->SetTexID((ImTextureID)(intptr_t)g_fontTex);
+#else
+    // what glTexImage2D would read: every pixel, so a sanitizer sees an atlas freed under it
+    unsigned sum = 0;
+    for (int i = 0; pixels && i < w * h * 4; i += 4) sum += pixels[i + 3];
+    (void)sum;
+#endif
+    g_atlas->SetTexID((ImTextureID)(intptr_t)(g_fontTex ? g_fontTex : 1));
     g_atlas->ClearTexData();
     g_texUploaded = true;
 }
@@ -123,12 +165,15 @@ void uploadFontTexture() {
 // ---------------------------------------------------------------- the window
 XpWindow::XpWindow(const std::string& title, int left, int top, int right, int bottom, bool decorated, DrawFn draw)
     : draw_(std::move(draw)), decorated_(decorated) {
+    // CreateContext leaves the new context current when there was none; the guard puts back what was
+    ContextGuard keep(ImGui::GetCurrentContext());
     ctx_ = ImGui::CreateContext(sharedAtlas());
     ImGui::SetCurrentContext(ctx_);
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr; io.LogFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     io.BackendFlags |= ImGuiBackendFlags_HasMouseCursors;
+    io.ConfigErrorRecoveryEnableTooltip = false;   // a pilot is not the audience for ImGui's own error tooltip
     XPLMCreateWindow_t p{};
     p.structSize = sizeof(p);
     p.left = left; p.top = top; p.right = right; p.bottom = bottom;
@@ -189,32 +234,71 @@ void XpWindow::drawCb(XPLMWindowID, void* ref) { ((XpWindow*)ref)->frame(); }
 
 void XpWindow::frame() {
     if (!win_ || !ctx_) return;
-    ImGui::SetCurrentContext(ctx_);
+    ContextGuard guard(ctx_);
+    // The shared atlas changes only here, before this window's frame begins and with no other window in the
+    // middle of one: a frame in flight draws with the fonts it started with, and clearing them under it frees
+    // what its draw lists still point at.
+    if (g_fontsDirty && g_framesInFlight == 0) buildFonts(g_fontsWantScale);
     if (!g_texUploaded) uploadFontTexture();
     int l, t, r, b;
     geometry(&l, &t, &r, &b);
     w_ = (float)(r - l); h_ = (float)(t - b);
     if (w_ < 10.f || h_ < 10.f) return;
+    if (before_) before_(*this);
     ImGuiIO& io = ImGui::GetIO();
     io.DisplaySize = ImVec2(w_, h_);
     const double now = nowS();
     io.DeltaTime = (float)(now - lastTime_ > 0.0005 ? now - lastTime_ : 0.0005);
     lastTime_ = now;
     ImGui::NewFrame();
+    ++g_framesInFlight;
     ImGui::SetNextWindowPos(ImVec2(0, 0));
     ImGui::SetNextWindowSize(ImVec2(w_, h_));
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoBringToFrontOnFocus;
     if (!decorated_) flags |= ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar;
     if (ImGui::Begin("##xr", nullptr, flags)) {
-        if (draw_) draw_(*this);
+        // An exception must not leave through X-Plane's draw callback (that ends the sim), nor leave this
+        // context with windows and stacks half pushed: ImGui unwinds to where the drawing started.
+        ImGuiErrorRecoveryState before;
+        ImGui::ErrorRecoveryStoreState(&before);
+        try {
+            if (draw_) draw_(*this);
+        } catch (const std::exception& e) {
+            ImGui::ErrorRecoveryTryToRecoverState(&before);
+            if (++g_drawErrors <= 5) logLine("window drawing failed", e.what());
+        } catch (...) {
+            ImGui::ErrorRecoveryTryToRecoverState(&before);
+            if (++g_drawErrors <= 5) logLine("window drawing failed", "unknown exception");
+        }
     }
     ImGui::End();
     ImGui::Render();
+    --g_framesInFlight;
     render(ImGui::GetDrawData(), l, t, r, b);
     // keyboard: take X-Plane's keys only while a text field wants them
     requestFocus(io.WantTextInput);
 }
 
+#ifdef XRADIO_UI_HEADLESS
+// No OpenGL in the test builds: read everything the renderer would read -- each list's vertices and indices,
+// each command's texture -- so a sanitizer catches draw data pointing at freed memory.
+void XpWindow::render(ImDrawData* dd, int l, int t, int r, int b) {
+    (void)l; (void)t; (void)r; (void)b;
+    if (!dd) return;
+    float sum = 0.f;
+    for (int n = 0; n < dd->CmdListsCount; ++n) {
+        const ImDrawList* cl = dd->CmdLists[n];
+        for (int v = 0; v < cl->VtxBuffer.Size; ++v) sum += cl->VtxBuffer[v].pos.x + cl->VtxBuffer[v].uv.y;
+        for (int c = 0; c < cl->CmdBuffer.Size; ++c) {
+            const ImDrawCmd& cmd = cl->CmdBuffer[c];
+            if (cmd.UserCallback) continue;
+            for (unsigned e = 0; e < cmd.ElemCount; ++e) sum += (float)cl->IdxBuffer[(int)(cmd.IdxOffset + e)];
+            sum += (float)(intptr_t)cmd.GetTexID();
+        }
+    }
+    (void)sum;
+}
+#else
 void XpWindow::render(ImDrawData* dd, int l, int t, int r, int b) {
     if (!dd || dd->CmdListsCount == 0) return;
     (void)r;
@@ -261,9 +345,10 @@ void XpWindow::render(ImDrawData* dd, int l, int t, int r, int b) {
     glPopClientAttrib();
     glPopAttrib();
 }
+#endif
 
 void XpWindow::mouse(int x, int y, int l, int t) {
-    ImGui::SetCurrentContext(ctx_);
+    ContextGuard guard(ctx_);
     ImGui::GetIO().AddMousePosEvent((float)(x - l), (float)(t - y));
 }
 
@@ -271,7 +356,7 @@ int XpWindow::mouseEvent(int x, int y, XPLMMouseStatus st, int button) {
     if (!ctx_) return 0;
     int l, t, r, b; geometry(&l, &t, &r, &b);
     mouse(x, y, l, t);
-    ImGui::SetCurrentContext(ctx_);
+    ContextGuard guard(ctx_);
     ImGuiIO& io = ImGui::GetIO();
     if (st == xplm_MouseDown) {
         if (passThrough_ && !io.WantCaptureMouse) return 0;
@@ -292,7 +377,7 @@ int XpWindow::wheelCb(XPLMWindowID, int x, int y, int wheel, int clicks, void* r
     if (!w->ctx_) return 0;
     int l, t, r, b; w->geometry(&l, &t, &r, &b);
     w->mouse(x, y, l, t);
-    ImGui::SetCurrentContext(w->ctx_);
+    ContextGuard guard(w->ctx_);
     ImGuiIO& io = ImGui::GetIO();
     if (w->passThrough_ && !io.WantCaptureMouse) return 0;
     if (wheel == 0) io.AddMouseWheelEvent(0.f, (float)clicks); else io.AddMouseWheelEvent((float)clicks, 0.f);
@@ -310,7 +395,7 @@ XPLMCursorStatus XpWindow::cursorCb(XPLMWindowID, int x, int y, void* ref) {
 void XpWindow::keyCb(XPLMWindowID, char key, XPLMKeyFlags flags, char vk, void* ref, int losingFocus) {
     XpWindow* w = (XpWindow*)ref;
     if (!w->ctx_) return;
-    ImGui::SetCurrentContext(w->ctx_);
+    ContextGuard guard(w->ctx_);
     ImGuiIO& io = ImGui::GetIO();
     if (losingFocus) { w->hasFocus_ = false; io.AddFocusEvent(false); io.AddFocusEvent(true); return; }
     const bool down = (flags & xplm_DownFlag) != 0;

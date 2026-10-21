@@ -40,6 +40,7 @@ docs/            this file, the server guide, the VPN guide
 | `upnp.cpp/.h`, `natpmp.cpp/.h` | asking the router to open the hosting port, two protocols, on a worker thread. |
 | `update.cpp/.h` | the once-per-session "a newer version exists" check. |
 | `clipboard.cpp/.h` | the Copy buttons. |
+| `ui2/` | the Dear ImGui window and Tower mode's windows (`docs/ui.md`). `imgui_xp.cpp` hosts ImGui in an X-Plane window with one context per window; `ContextGuard` there is the only way a context is ever switched. |
 | `settings.h` | every setting, its config-file key, its widget and its tab, in one table. |
 | `ui.cpp/.h` | the widget set the settings window is drawn with. Text only, on purpose. |
 | `joincode.h` | an address and port as ten letters, for reading out loud. |
@@ -61,6 +62,17 @@ sim. Everything else that has to wait for something runs elsewhere:
 - **audio threads** (miniaudio's, in `voice.cpp`): capture and playback
   callbacks. They must never block, so they only ever `try_lock`.
 - **relay thread** (`server.cpp`): the hosted server, when hosting is on.
+- **hosting worker** (`main.cpp`, `applyHostingAsync`): stops and starts the
+  relay when a settings change asks for it, so the sim never waits on the old
+  server's thread; the flight loop collects the result and reconnects.
+
+The windows' buttons never do work of their own. A click happens inside the
+window's draw callback, in the middle of an ImGui frame, so a button only
+queues what it wants (`defer()` / `requestApply()` in `main.cpp`) and the
+flight loop runs it before the next frame -- outside every window, with an
+exception caught and logged instead of ending the sim. v0.6.0 saved,
+restarted the server, reconnected and re-applied the theme straight from the
+Apply button, switching ImGui contexts on the way, and crashed X-Plane for it.
 - **UPnP worker** (`upnp.cpp`): talks to the router, one job at a time.
 - **update worker** (`update.cpp`): one HTTP request, then gone.
 
@@ -120,6 +132,9 @@ cmake -B build-tests -DXRADIO_BUILD_TESTS=ON -DXRADIO_USE_XPMP2=OFF \
 ./build-tests/settings_test            # and voice_test, hosting_test, placement_test ...
 python3 tools/test_server_parity.py --cpp ./build-tests/xradio_server
 ```
+
+`IM_ASSERT` never aborts in any build (`ui2/xr_imconfig.h`): the plugin
+writes a failed assert to Log.txt, a test build counts it.
 
 The README's *Tests* section lists them all, including the fake router, the
 fake release site and the two fuzzers. On Windows, use Visual Studio's

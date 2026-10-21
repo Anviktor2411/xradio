@@ -70,8 +70,11 @@ void drawTower(const TowerFrame& f, const tower::State& s, const TowerActions& a
 // "lvp", "light:green steady", "retry", "radar", "ac:DLH5KM" ...). Off unless a test turns them on.
 struct ProbeRect { float x0 = 0, y0 = 0, x1 = 0, y1 = 0; bool found = false; };
 void enableProbes(bool on);
+bool probesOn();
 ProbeRect probe(const std::string& name);
 void clearProbes();
+// The same for the main window (app_ui.cpp): the last item drawn, under `name` ("tab:6", "apply:settings").
+void probeLast(const std::string& name);
 
 }  // namespace ui2
 }  // namespace xr

@@ -191,9 +191,11 @@ endif()
 
 set(XR_IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/lib/imgui")
 set(XR_UI2_SOURCES
-    plugin/src/ui2/app_ui.cpp plugin/src/ui2/host.cpp plugin/src/ui2/i18n.cpp plugin/src/ui2/imgui_xp.cpp
+    plugin/src/ui2/app_ui.cpp plugin/src/ui2/host.cpp plugin/src/ui2/i18n.cpp plugin/src/ui2/imgui_assert.cpp plugin/src/ui2/imgui_xp.cpp
     plugin/src/ui2/model.cpp plugin/src/ui2/theme.cpp plugin/src/ui2/tower_model.cpp plugin/src/ui2/tower_ui.cpp)
 set(XR_IMGUI_SOURCES "${XR_IMGUI_DIR}/imgui.cpp" "${XR_IMGUI_DIR}/imgui_draw.cpp" "${XR_IMGUI_DIR}/imgui_tables.cpp" "${XR_IMGUI_DIR}/imgui_widgets.cpp")
+# IM_ASSERT never aborts (plugin/src/ui2/xr_imconfig.h): the plugin logs a failure to Log.txt, a test fails on it.
+set(XR_IMGUI_CONFIG "IMGUI_USER_CONFIG=\"ui2/xr_imconfig.h\"")
 
 if(XR_BUILD_PLUGIN)
 if(XRADIO_UI_IMGUI AND NOT EXISTS "${XR_IMGUI_DIR}/imgui.cpp")
@@ -208,7 +210,7 @@ else()
 endif()
 xradio_configure_target(XRadio)
 if(XRADIO_UI_IMGUI)
-    target_compile_definitions(XRadio PRIVATE XRADIO_UI_IMGUI=1 IMGUI_DISABLE_OBSOLETE_FUNCTIONS=1)
+    target_compile_definitions(XRadio PRIVATE XRADIO_UI_IMGUI=1 IMGUI_DISABLE_OBSOLETE_FUNCTIONS=1 ${XR_IMGUI_CONFIG})
     target_include_directories(XRadio PRIVATE "${XR_IMGUI_DIR}")
     if(WIN32)
         target_link_libraries(XRadio PRIVATE opengl32)

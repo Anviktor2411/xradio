@@ -5,9 +5,11 @@
 // shown, or shown but not saved.
 #pragma once
 
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "joincode.h"
@@ -295,7 +297,14 @@ inline float clampf(float v, float lo, float hi) { return v < lo ? lo : (v > hi 
 
 inline bool saveSettings(const Settings& s, const std::string& path) {
     Settings copy = s;                       // describe() needs a non-const ref
-    FILE* f = fopen(path.c_str(), "w");
+    // On Windows a file somebody else has open at that moment (the search indexer, an antivirus reading what
+    // was just written) refuses to be opened for writing: a sharing violation, over in milliseconds. Try
+    // again a few times before giving up, so a Save does not silently save nothing.
+    FILE* f = nullptr;
+    for (int attempt = 0; attempt < 5 && !f; ++attempt) {
+        if (attempt) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        f = fopen(path.c_str(), "w");
+    }
     if (!f) return false;
     fprintf(f, "# XRadio configuration\n");
     int lastTab = -1;

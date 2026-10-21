@@ -939,8 +939,10 @@ void windowButton(const TowerFrame& f, const TowerActions& a) {
 TowerUi& towerUi() { return g_ui; }
 void setTowerFonts(const Fonts& f) { g_fonts = f; }
 void enableProbes(bool on) { g_probeOn = on; if (!on) g_probes.clear(); }
+bool probesOn() { return g_probeOn; }
 ProbeRect probe(const std::string& name) { auto it = g_probes.find(name); return it == g_probes.end() ? ProbeRect() : it->second; }
 void clearProbes() { g_probes.clear(); }
+void probeLast(const std::string& name) { probeItem(name); }
 
 const char* towerWindowTitle(int which) {
     static const char* k[kTwCount] = {"Tower: ground radar", "Tower: strips", "Tower: Delivery", "Tower: frequency", "Tower: ATIS / operations", "Tower: TowerTrainer"};

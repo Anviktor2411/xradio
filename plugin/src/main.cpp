@@ -30,6 +30,7 @@
 #include "tcasread.h"
 #ifdef XRADIO_UI_IMGUI
 #  include "ui2/host.h"
+#  include "ui2/imgui_assert.h"
 #endif
 
 #include "XPLMDataAccess.h"
@@ -50,6 +51,8 @@
 #include <cctype>
 #include <cstring>
 #include <deque>
+#include <exception>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -659,6 +662,54 @@ XPLMWindowID     g_window       = nullptr;
 XPLMFlightLoopID g_loop         = nullptr;
 XPLMCommandRef   g_cmdPtt       = nullptr;
 XPLMMenuID       g_menu         = nullptr;
+bool             g_enabled      = false;   // between XPluginEnable and XPluginDisable: the flight loop runs
+
+// ---------------------------------------------------------------------------
+// what a click asks for, done from the flight loop
+// ---------------------------------------------------------------------------
+// The ImGui window acts on a click inside its own draw callback, in the middle of an ImGui frame. Saving the
+// settings, restarting the hosted server, reopening the audio devices, reconnecting, entering or leaving the
+// tower: none of that may run there -- v0.6.0 crashed X-Plane on Apply that way. A button only queues the
+// work; runDeferred() does it at the top of the next flight loop, outside every window's frame, and an
+// exception thrown by the work goes to Log.txt instead of taking the sim down with it.
+struct Deferred { const char* what; std::function<void()> fn; };
+std::vector<Deferred> g_deferred;          // main thread only
+
+void defer(const char* what, std::function<void()> fn) {
+    g_deferred.push_back({what, std::move(fn)});
+    // without a socket the loop idles at 2 Hz; the work is due on the next frame
+    if (g_loop && g_enabled) XPLMScheduleFlightLoop(g_loop, -1.0f, 1);
+}
+
+void runDeferred() {
+    // work that queues more (Apply asks for a reconnect) gets it done in the same pass
+    for (int pass = 0; pass < 4 && !g_deferred.empty(); ++pass) {
+        std::vector<Deferred> jobs;
+        jobs.swap(g_deferred);
+        for (Deferred& j : jobs) {
+            try {
+                j.fn();
+            } catch (const std::exception& e) {
+                logMsg("%s failed: %s", j.what, e.what());
+            } catch (...) {
+                logMsg("%s failed: unknown exception", j.what);
+            }
+        }
+    }
+}
+
+// The ImGui window's Apply: the copy of the settings it holds, saved by the flight loop (runApply, with the
+// settings window below). Two presses before the loop runs save the later one, once.
+Settings g_applyWanted;
+bool     g_applyQueued = false;
+void runApply();
+void requestApply(const Settings& s) {
+    g_applyWanted = s;
+    if (g_applyQueued) return;
+    g_applyQueued = true;
+    defer("apply", [] { g_applyQueued = false; runApply(); });
+}
+void pollHosting();          // with hosting, below
 
 // The window's structured log (Phase U): every chat line, with who / what / where when known.
 struct Msg { float t = 0; std::string from, text; uint32_t khz = 0; bool atc = false, priv = false, mine = false, guard = false, system = true; };
@@ -1748,6 +1799,8 @@ float g_lastAircraftCheck = 0.f;
 
 float flightLoop(float elapsedSinceLast, float, int, void*) {
     g_elapsed += elapsedSinceLast;
+    runDeferred();              // what the windows' buttons asked for, outside their frames
+    pollHosting();              // a hosted server the worker has (re)started or stopped
     xr::tower::tick(elapsedSinceLast, g_elapsed);
     {   // S3: a finished SimBrief fetch lands here, on the main thread
         xr::simbrief::Ofp o;
@@ -2602,31 +2655,91 @@ std::string g_copyNote;
 float       g_copyNoteAt = -100.f;
 bool        g_copyOk = false;
 
-void applyHosting() {
-    const uint16_t port = (uint16_t)g_cfg.hostPort_i();
+// A settings change restarts the server on a worker thread: relay::stop() joins the server's thread (up to one
+// 20 ms receive wait) and start() binds a port, and the sim should not sit through either. pollHosting()
+// collects the answer on the flight loop and does what belongs on the main thread: the router request, the
+// log line, and the reconnect that was waiting for the server.
+struct HostingJob { bool enable = false; uint16_t port = 0; std::string password; bool ducting = false, upnp = false; };
+struct HostingResult { bool done = false, enable = false, wasRunning = false, ok = false, upnp = false; uint16_t port = 0; std::string err; };
+std::thread   g_hostWorker;
+std::mutex    g_hostMx;
+HostingResult g_hostResult;                // guarded by g_hostMx: the worker's answer until pollHosting takes it
+bool          g_reconnectAfterHosting = false;   // main thread only
 
-    if (!g_cfg.hostEnabled) {
-        if (xr::relay::running()) {
-            xr::relay::stop();
+HostingJob hostingJob() {
+    HostingJob j;
+    j.enable = g_cfg.hostEnabled; j.port = (uint16_t)g_cfg.hostPort_i(); j.password = g_cfg.password;
+    j.ducting = g_cfg.hostDucting; j.upnp = g_cfg.hostUpnp;
+    return j;
+}
+
+// The server half: either thread.
+HostingResult runHosting(const HostingJob& j) {
+    HostingResult r;
+    r.enable = j.enable; r.port = j.port; r.upnp = j.upnp;
+    r.wasRunning = xr::relay::running();
+    if (!j.enable) { xr::relay::stop(); r.ok = true; return r; }
+    r.ok = xr::relay::start(j.port, j.password, &r.err, j.ducting);   // stops the old one first
+    return r;
+}
+
+// The rest: main thread.
+void finishHosting(const HostingResult& r) {
+    if (!r.enable) {
+        if (r.wasRunning) {
             xr::upnp::releaseAsync();
             logMsg("hosting stopped");
         }
         g_hostNote.clear();
         return;
     }
-
-    xr::relay::stop();
-    std::string err;
-    if (!xr::relay::start(port, g_cfg.password, &err, g_cfg.hostDucting)) {
-        g_hostNote = "cannot host: " + err;
+    if (!r.ok) {
+        g_hostNote = "cannot host: " + r.err;
         logMsg("%s", g_hostNote.c_str());
         return;
     }
     g_hostNote.clear();
-    logMsg("hosting on port %u", (unsigned)port);
-
+    logMsg("hosting on port %u", (unsigned)r.port);
     xr::upnp::clear();
-    xr::upnp::requestAsync(port, "XRadio", g_cfg.hostUpnp);
+    xr::upnp::requestAsync(r.port, "XRadio", r.upnp);
+}
+
+// At startup, before anything needs the server: on the spot.
+void applyHosting() { finishHosting(runHosting(hostingJob())); }
+
+void pollHosting() {
+    HostingResult r;
+    {
+        std::lock_guard<std::mutex> lk(g_hostMx);
+        if (!g_hostResult.done) return;
+        r = g_hostResult;
+        g_hostResult = HostingResult{};
+    }
+    if (g_hostWorker.joinable()) g_hostWorker.join();   // it has answered, so it has finished
+    finishHosting(r);
+    if (g_reconnectAfterHosting) { g_reconnectAfterHosting = false; reconnect(); }
+}
+
+// A settings change: the server restarts on the worker; a reconnect the change needs waits for it, so the
+// client has something to connect to by the time it tries.
+void applyHostingAsync(bool reconnectAfter) {
+    if (g_hostWorker.joinable()) g_hostWorker.join();   // the previous change: a few ms of work
+    pollHosting();                                        // ...and its answer, if not collected yet
+    g_reconnectAfterHosting = g_reconnectAfterHosting || reconnectAfter;
+    const HostingJob job = hostingJob();
+    g_hostWorker = std::thread([job] {
+        HostingResult r;
+        try {
+            r = runHosting(job);
+        } catch (const std::exception& e) {
+            r.enable = job.enable; r.port = job.port; r.ok = false; r.err = e.what();
+        } catch (...) {
+            r.enable = job.enable; r.port = job.port; r.ok = false; r.err = "unknown exception";
+        }
+        r.done = true;
+        std::lock_guard<std::mutex> lk(g_hostMx);
+        g_hostResult = r;
+    });
 }
 
 // The router half on its own, for when "Ask the router to open it" changes
@@ -2692,6 +2805,7 @@ void sendLogout() {
 }
 
 void reconnect() {
+    logMsg("reconnecting to %s:%d", g_cfg.activeHost().c_str(), g_cfg.activePort());
     netStop();
     sendLogout();
     g_connected = false;
@@ -2794,6 +2908,7 @@ void openSettings() {
     xr::ui2::host::showSettings();
     return;
 #endif
+    if (!g_settingsWin) return;
     g_edit = g_cfg;
     g_settingsNote.clear();
     g_captureKey = false;
@@ -2810,15 +2925,22 @@ void openSettings() {
     XPLMTakeKeyboardFocus(g_settingsWin);
 }
 
+// The text window's; the ImGui build never shows it and does not come here (applySettings).
 void closeSettings() {
     g_ui.focus = -1;
     g_captureKey = false;
     g_keyQueue.clear();
+    if (!g_settingsWin) return;
     if (XPLMHasKeyboardFocus(g_settingsWin)) XPLMTakeKeyboardFocus(nullptr);
     XPLMSetWindowIsVisible(g_settingsWin, 0);
 }
 
-void applySettings() {
+// Save what the settings window holds and push it into everything that cares. Runs on the main thread and
+// never inside an ImGui frame: the ImGui window's Apply gets here through requestApply() and the flight loop.
+// The text window calls it from its own draw, which has no ImGui in it, and even there only the quick part
+// happens on the spot -- the hosted server restarts on a worker, the audio devices and the reconnect wait for
+// the flight loop. False, with the reason in g_settingsNote, when the settings do not validate.
+bool applySettings() {
     g_edit.callsign = upper(trim(g_edit.callsign));
     g_edit.acIcao   = upper(trim(g_edit.acIcao));
     g_edit.host     = trim(g_edit.host);
@@ -2827,7 +2949,7 @@ void applySettings() {
     const std::string problem = xr::validate(g_edit);
     if (!problem.empty()) {
         g_settingsNote = problem;
-        return;
+        return false;
     }
 
     const bool netChanged = (g_edit.host != g_cfg.host) ||
@@ -2853,25 +2975,52 @@ void applySettings() {
     const bool devChanged = (g_edit.micDevice != g_cfg.micDevice) ||
                             (g_edit.outDevice != g_cfg.outDevice);
 
+    g_settingsNote.clear();
     g_cfg = g_edit;
-    xr::saveSettings(g_cfg, g_cfgPath);
+    if (!xr::saveSettings(g_cfg, g_cfgPath)) {
+        // applied all the same -- the settings are live -- but the next start would not have them
+        logMsg("could not write %s: the settings are applied but not saved", g_cfgPath.c_str());
+        pushNotice("Settings applied, but xradio.cfg could not be written", 1);
+    }
     applyLiveSettings();
     // Start or stop the built-in server before reconnecting, so the client
-    // has something to connect to by the time it tries.
-    if (relayChanged) applyHosting();
+    // has something to connect to by the time it tries: a change to the
+    // server reconnects once the worker has it running.
+    if (relayChanged) applyHostingAsync(netChanged);
     else if (routerChanged) applyRouter();
 
     if (devChanged) {
-        std::string err;
-        if (!xr::voice::reopenDevices(g_cfg.micDevice, g_cfg.outDevice, &err)) {
-            logMsg("could not switch audio device: %s", err.c_str());
-        } else {
-            logMsg("audio devices: mic '%s', out '%s'",
-                   xr::voice::currentMic().c_str(), xr::voice::currentOutput().c_str());
-        }
+        defer("audio devices", [] {
+            std::string err;
+            if (!xr::voice::reopenDevices(g_cfg.micDevice, g_cfg.outDevice, &err)) {
+                logMsg("could not switch audio device: %s", err.c_str());
+            } else {
+                logMsg("audio devices: mic '%s', out '%s'",
+                       xr::voice::currentMic().c_str(), xr::voice::currentOutput().c_str());
+            }
+        });
     }
+#ifndef XRADIO_UI_IMGUI
     closeSettings();
-    if (netChanged) reconnect();
+#endif
+    if (netChanged && !relayChanged) defer("reconnect", [] { reconnect(); });
+    return true;
+}
+
+// The ImGui window's Apply, from the flight loop (requestApply).
+void runApply() {
+    g_edit = g_applyWanted;
+    if (!applySettings()) {
+        logMsg("settings not saved: %s", g_settingsNote.c_str());
+#ifdef XRADIO_UI_IMGUI
+        xr::ui2::state().editDirty = true;           // Apply stays pressable for the correction
+        xr::ui2::host::toast("Not saved: " + g_settingsNote, 3);
+#endif
+        return;
+    }
+#ifdef XRADIO_UI_IMGUI
+    xr::ui2::host::applyDisplay(g_cfg);
+#endif
 }
 
 // Hand the widgets every key up to the next Enter/Escape/Tab, and remember
@@ -3329,9 +3478,10 @@ void createSettingsWindow() {
 // changed while X-Plane was running.
 void resetWindowPositions() {
 #ifdef XRADIO_UI_IMGUI
+    // the text windows stay hidden in this build: only the ImGui ones are put back
     xr::ui2::host::resetPositions();
     xr::ui2::host::resetTowerPositions();
-#endif
+#else
     int l, t, r, b;
     if (g_window) {
         safeWindowRect(460, 400, 0, &l, &t, &r, &b);
@@ -3344,6 +3494,7 @@ void resetWindowPositions() {
         XPLMSetWindowGeometry(g_settingsWin, l, t, r, b);
         XPLMBringWindowToFront(g_settingsWin);
     }
+#endif
     logMsg("window positions reset");
 }
 
@@ -3414,11 +3565,12 @@ xr::ui2::Actions makeActions() {
     a.sendText = [](const std::string& t) { sendText(t); };
     a.fileFlightPlan = []() { return sendFlightPlan(); };
     a.cancelFlightPlan = []() { cancelFlightPlan(); };
-    a.applySettings = [](const xr::Settings& s) { g_edit = s; applySettings(); xr::ui2::host::applyDisplay(g_cfg); };
-    a.reconnect = []() { loadConfig(); reconnect(); };
-    a.refreshDevices = []() { refreshDeviceLists(); };
+    // These run inside the window's frame, so the heavy ones only queue their work for the flight loop
+    a.applySettings = [](const xr::Settings& s) { requestApply(s); };
+    a.reconnect = []() { defer("reconnect", [] { loadConfig(); reconnect(); }); };
+    a.refreshDevices = []() { defer("refresh devices", [] { refreshDeviceLists(); }); };
     a.copyAddress = []() { mainButton(kBtnCopy); return std::string(g_mainCopyOk ? "copied" : "could not copy"); };
-    a.toggleTower = []() { xr::tower::toggle(); };
+    a.toggleTower = []() { defer("tower mode", [] { xr::tower::toggle(); }); };   // the camera, the aircraft, the link
     a.keyPtt = [](bool down) { setPtt(down); };
     a.openUrl = [](const std::string& url) { xr::ui2::openUrlNative(url); };
     a.importSimbrief = []() { importSimbrief(); };
@@ -3439,7 +3591,7 @@ xr::ui2::TowerActions makeTowerActions() {
     a.setStopBars = [](bool on) { xr::tower::setStopBars(on); };
     a.lightGun = [](int id, const std::string& signal) { xr::tower::lightGun(id, signal); };
     a.retry = []() { xr::tower::retry(); };
-    a.leave = []() { xr::tower::leave(); };
+    a.leave = []() { defer("leave the tower", [] { xr::tower::leave(); }); };   // camera, aircraft and link: not mid-frame
     a.settings = []() { xr::ui2::host::showSettings(); xr::ui2::state().settingsGroup = 5; };
     a.look = [](float dYaw, float dPitch) { xr::tower::look(dYaw, dPitch); };
     a.binoculars = [](float f) { xr::tower::zoom(f); };
@@ -3629,6 +3781,8 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     // the text windows stay as the fallback build; with the ImGui window they are never shown
     if (g_window) XPLMSetWindowIsVisible(g_window, 0);
     if (g_noticeWin) XPLMSetWindowIsVisible(g_noticeWin, 0);
+    // a failed IM_ASSERT is a line in Log.txt, never the end of the sim (ui2/xr_imconfig.h)
+    xr::ui2::setImguiAssertSink([](const char* m) { logMsg("%s", m); });
     xr::ui2::host::init(makeActions(), g_cfg);
     // Tower mode's windows exist only here: a build without ImGui runs Tower mode (camera, link, traffic) headless
     xr::ui2::host::initTower(makeTowerActions(), g_cfg.towerLayout);
@@ -3688,6 +3842,7 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
 }
 
 PLUGIN_API int XPluginEnable(void) {
+    g_enabled = true;
     xr::csl::enable();
     xr::csl::setLabels(g_cfg.showLabels, g_cfg.labelDistNm);
 
@@ -3703,6 +3858,9 @@ PLUGIN_API int XPluginEnable(void) {
 }
 
 PLUGIN_API void XPluginDisable(void) {
+    g_enabled = false;
+    g_deferred.clear();                  // clicks made before disabling: a disabled plugin does nothing
+    g_applyQueued = false;
     xr::tower::leave();
     xr::voice::setTransmitting(false);
     xr::voice::releaseMicrophone();      // a disabled plugin holds nothing
@@ -3732,6 +3890,11 @@ PLUGIN_API void XPluginStop(void) {
     xr::simbrief::shutdown();
     xr::tower::shutdown();
     netStop();
+    g_deferred.clear();
+    g_applyQueued = false;
+    if (g_hostWorker.joinable()) g_hostWorker.join();   // a server change still in hand finishes first
+    g_hostResult = HostingResult{};
+    g_reconnectAfterHosting = false;
     xr::relay::stop();
     xr::upnp::releaseAsync();      // give the router's port back if we can
     xr::upnp::shutdown();
