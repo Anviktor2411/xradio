@@ -291,6 +291,23 @@ reaches both ways through the hosted server, that the Hosting tab reports the
 truth, and that unticking the box really does stop the server and refuse new
 joins.
 
+`tools/harness/ui_apply_test.cpp` is the whole plugin with its Dear ImGui
+windows, headless (the draw lists are read, nothing is rendered), against a
+fake server: it presses *Apply* fifty times -- callsign, port, UI scale, theme,
+language, audio devices, hosting -- on the Settings tab, on Host / Connect and
+through the wizard, with the cockpit overlay and (`XR_TOWER_PORT` pointing at
+`tools/fake_towertrainer.py`) Tower mode's windows open. After every frame the
+current ImGui context is what it was before, no window is left mid-frame, no
+`IM_ASSERT` failed, the settings reached the file, the fonts were rebuilt
+between frames rather than inside the click, and each change reconnected
+exactly once. v0.6.0 crashed X-Plane on the first press; its code fails this
+test with a segmentation fault.
+
+`tools/harness/crashlog_test.cpp` is the crash handler: an address named as
+`<module>+<offset>`, and on Windows a child process that really crashes and
+leaves `XRadio crash: access violation ... at crashlog_test.exe+0x...` with a
+stack, the way Log.txt would show it.
+
 `tools/test_server_parity.py` is a differential test between the two server
 implementations. It starts a fresh Python server and a fresh C++ server for
 each of eight scenarios, drives identical traffic at them over real UDP, and

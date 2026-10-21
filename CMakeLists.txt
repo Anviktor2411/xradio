@@ -387,17 +387,23 @@ if(XRADIO_BUILD_TESTS)
     target_compile_features(ui_logic_test PRIVATE cxx_std_17)
     # the window rendered to PNG files for the documentation (needs lib/imgui, no OpenGL)
     if(EXISTS "${XR_IMGUI_DIR}/imgui.cpp")
-        add_executable(ui_preview tools/ui_preview/main.cpp plugin/src/ui2/app_ui.cpp plugin/src/ui2/i18n.cpp plugin/src/ui2/model.cpp plugin/src/ui2/theme.cpp
+        add_executable(ui_preview tools/ui_preview/main.cpp plugin/src/ui2/app_ui.cpp plugin/src/ui2/i18n.cpp plugin/src/ui2/imgui_assert.cpp plugin/src/ui2/model.cpp plugin/src/ui2/theme.cpp
                                   plugin/src/ui2/tower_model.cpp plugin/src/ui2/tower_ui.cpp plugin/src/tower_parse.cpp ${XR_IMGUI_SOURCES})
         target_include_directories(ui_preview PRIVATE plugin/src "${XR_IMGUI_DIR}")
-        target_compile_definitions(ui_preview PRIVATE IMGUI_DISABLE_OBSOLETE_FUNCTIONS=1)
+        target_compile_definitions(ui_preview PRIVATE IMGUI_DISABLE_OBSOLETE_FUNCTIONS=1 ${XR_IMGUI_CONFIG})
         target_compile_features(ui_preview PRIVATE cxx_std_17)
         # the tower windows clicked through headless: the real ImGui code, fake input, the actions recorded
-        add_executable(tower_ui_test tools/harness/tower_ui_test.cpp plugin/src/ui2/i18n.cpp plugin/src/ui2/theme.cpp
+        add_executable(tower_ui_test tools/harness/tower_ui_test.cpp plugin/src/ui2/i18n.cpp plugin/src/ui2/imgui_assert.cpp plugin/src/ui2/theme.cpp
                                      plugin/src/ui2/tower_model.cpp plugin/src/ui2/tower_ui.cpp plugin/src/tower_parse.cpp ${XR_IMGUI_SOURCES})
         target_include_directories(tower_ui_test PRIVATE plugin/src "${XR_IMGUI_DIR}")
-        target_compile_definitions(tower_ui_test PRIVATE IMGUI_DISABLE_OBSOLETE_FUNCTIONS=1)
+        target_compile_definitions(tower_ui_test PRIVATE IMGUI_DISABLE_OBSOLETE_FUNCTIONS=1 ${XR_IMGUI_CONFIG})
         target_compile_features(tower_ui_test PRIVATE cxx_std_17)
+        # The whole plugin with its ImGui windows, headless (no OpenGL: the draw lists are read, not drawn),
+        # against a fake server: Apply pressed fifty times with the overlay and the tower windows open --
+        # v0.6.0 crashed X-Plane on it. Needs the fake SDK's window calls in xplm_stub.cpp.
+        xradio_test_exe(ui_apply_test tools/harness/ui_apply_test.cpp ${XR_UI2_SOURCES} ${XR_IMGUI_SOURCES})
+        target_include_directories(ui_apply_test PRIVATE "${XR_IMGUI_DIR}")
+        target_compile_definitions(ui_apply_test PRIVATE XRADIO_UI_IMGUI=1 XRADIO_UI_HEADLESS=1 IMGUI_DISABLE_OBSOLETE_FUNCTIONS=1 ${XR_IMGUI_CONFIG})
     endif()
     # Not a test: renders a WAV through the radio chain so it can be listened to.
     xradio_test_exe(radio_demo     tools/harness/radio_demo.cpp)
@@ -422,6 +428,15 @@ if(XRADIO_BUILD_TESTS)
     if(XRADIO_SANITIZE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(acftype_test PRIVATE -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer)
         target_link_options(acftype_test    PRIVATE -fsanitize=address,undefined)
+    endif()
+
+    # The crash handler: module+offset naming, and (Windows) a child process that really crashes. No sanitizer
+    # here: one would catch the child's fault itself, ahead of the handler under test.
+    add_executable(crashlog_test tools/harness/crashlog_test.cpp plugin/src/crashlog.cpp)
+    target_include_directories(crashlog_test PRIVATE plugin/src)
+    target_compile_features(crashlog_test PRIVATE cxx_std_17)
+    if(WIN32)
+        target_compile_definitions(crashlog_test PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
     endif()
 
     # The UPnP client alone, against tools/harness/fake_igd.py.

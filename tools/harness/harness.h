@@ -35,7 +35,14 @@ void menu(int item);                      // click a plugin menu item
 // second window (settings) -- id 2 in creation order
 std::vector<std::string> drawWindow(int id);
 bool windowVisible(int id);
+int  windowCount();
 void click(int id, int x, int y);
+// The Dear ImGui windows: the mouse moved over one, a button down or up, the wheel, and whether it was
+// popped out. The window finds itself through the refcon X-Plane hands back, which these pass on.
+void hover(int id, int x, int y);
+void mouseButton(int id, int x, int y, bool down, bool right = false);
+void wheel(int id, int x, int y, int clicks);
+bool windowPoppedOut(int id);
 void typeText(int id, const std::string& text);
 void pressVk(int id, int vk);
 void windowTop(int id, int* top, int* left);

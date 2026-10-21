@@ -226,6 +226,24 @@ jobs:
       - name: Tower mode's windows
         run: ASAN_OPTIONS=detect_leaks=0 ./build-tests/tower_ui_test
 
+      # The whole plugin with its ImGui windows, headless, against a fake server: Apply pressed
+      # fifty times (callsign, port, UI scale, theme, language, audio devices, hosting) on the
+      # Settings tab, on Host / Connect and through the wizard, with the overlay and the tower
+      # windows open. v0.6.0 crashed X-Plane on the first press; the work now waits for the
+      # flight loop, the contexts are guarded and the fonts rebuilt between frames.
+      - name: Apply in the window, fifty times, with the tower windows open
+        run: |
+          python3 tools/fake_towertrainer.py --port 48792 --log /tmp/tt_apply_rx.txt > /tmp/tt_apply.log 2>&1 &
+          tw=$!
+          bash tools/harness/wait_port.sh 48792 20 "$tw" || { cat /tmp/tt_apply.log; exit 1; }
+          XR_TOWER_PORT=48792 ASAN_OPTIONS=detect_leaks=0 ./build-tests/ui_apply_test 49760
+          kill "$tw" 2>/dev/null || true
+
+      # The crash handler: a fault named as <module>+<offset> (and, on Windows, a child process
+      # that really crashes and leaves the report).
+      - name: The crash handler
+        run: ./build-tests/crashlog_test
+
       - name: SimBrief import against a fake SimBrief
         run: ASAN_OPTIONS=detect_leaks=0 bash tools/check_simbrief.sh build-tests
 

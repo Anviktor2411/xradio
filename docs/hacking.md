@@ -131,11 +131,16 @@ python3 tools/test_server.py           # the Python server, protocol and routing
 cmake -B build-tests -DXRADIO_BUILD_TESTS=ON -DXRADIO_USE_XPMP2=OFF \
       -DXPLANE_SDK=$PWD/tools/fake_sdk && cmake --build build-tests -j
 ./build-tests/settings_test            # and voice_test, hosting_test, placement_test ...
+./build-tests/ui_apply_test            # the ImGui window's Apply, fifty times (XR_TOWER_PORT=8781 adds the tower windows)
+./build-tests/crashlog_test            # the crash handler, with a child process that really crashes
 python3 tools/test_server_parity.py --cpp ./build-tests/xradio_server
 ```
 
-`IM_ASSERT` never aborts in any build (`ui2/xr_imconfig.h`): the plugin
-writes a failed assert to Log.txt, a test build counts it.
+`ui_apply_test` links the plugin with `XRADIO_UI_IMGUI=1` and
+`XRADIO_UI_HEADLESS=1`: the real `imgui_xp.cpp` without its OpenGL calls, so
+the windows draw and take clicks through `xplm_stub.cpp` on a machine with no
+GL context. `IM_ASSERT` never aborts in any build (`ui2/xr_imconfig.h`): the
+plugin writes a failed assert to Log.txt, a test counts it and fails.
 
 The README's *Tests* section lists them all, including the fake router, the
 fake release site and the two fuzzers. On Windows, use Visual Studio's

@@ -93,9 +93,14 @@ XPLMDrawWindow_f              g_drawFunc   = nullptr;   // first window (main)
 struct Win {
     XPLMDrawWindow_f       draw  = nullptr;
     XPLMHandleMouseClick_f click = nullptr;
+    XPLMHandleMouseClick_f rclick = nullptr;
     XPLMHandleKey_f        key   = nullptr;
+    XPLMHandleCursor_f     cursor = nullptr;
+    XPLMHandleMouseWheel_f wheel = nullptr;
+    void* refcon = nullptr;                  // the ImGui windows find themselves through it
     int  l = 0, t = 800, r = 500, b = 0;
     bool visible = true;
+    bool poppedOut = false, inVR = false;
 };
 std::vector<Win> g_wins;                  // index+1 is the XPLMWindowID
 XPLMWindowID     g_focus = nullptr;
@@ -132,24 +137,43 @@ const std::vector<float>& getArray(const std::string& name) {
 
 void tick(float dt) { if (g_loopFunc) g_loopFunc(dt, dt, 0, nullptr); }
 
-std::vector<std::string> draw() {
-    g_drawn.clear();
-    g_drawnAt.clear();
-    if (g_drawFunc) g_drawFunc((XPLMWindowID)1, nullptr);
-    return g_drawn;
-}
-
-// --- second window (settings) helpers ------------------------------------
 static Win* win(int id) {
     return (id >= 1 && id <= (int)g_wins.size()) ? &g_wins[id - 1] : nullptr;
 }
 
+std::vector<std::string> draw() {
+    g_drawn.clear();
+    g_drawnAt.clear();
+    if (g_drawFunc) g_drawFunc((XPLMWindowID)1, win(1) ? win(1)->refcon : nullptr);
+    return g_drawn;
+}
+
+// --- second window (settings) helpers ------------------------------------
 std::vector<std::string> drawWindow(int id) {
     g_drawn.clear();
     g_drawnAt.clear();
-    if (Win* w = win(id); w && w->draw) w->draw((XPLMWindowID)(intptr_t)id, nullptr);
+    if (Win* w = win(id); w && w->draw) w->draw((XPLMWindowID)(intptr_t)id, w->refcon);
     return g_drawn;
 }
+
+int windowCount() { return (int)g_wins.size(); }
+
+// The mouse over a window, as X-Plane reports it between clicks (the cursor callback).
+void hover(int id, int x, int y) {
+    Win* w = win(id);
+    if (w && w->cursor) w->cursor((XPLMWindowID)(intptr_t)id, x, y, w->refcon);
+}
+void mouseButton(int id, int x, int y, bool down, bool right) {
+    Win* w = win(id);
+    if (!w) return;
+    XPLMHandleMouseClick_f f = right ? w->rclick : w->click;
+    if (f) f((XPLMWindowID)(intptr_t)id, x, y, down ? xplm_MouseDown : xplm_MouseUp, w->refcon);
+}
+void wheel(int id, int x, int y, int clicks) {
+    Win* w = win(id);
+    if (w && w->wheel) w->wheel((XPLMWindowID)(intptr_t)id, x, y, 0, clicks, w->refcon);
+}
+bool windowPoppedOut(int id) { Win* w = win(id); return w && w->poppedOut; }
 
 // Where the most recent draw put a line. Lets a test click the row a label is
 // actually on instead of re-deriving the layout and drifting out of sync.
@@ -170,24 +194,24 @@ bool windowVisible(int id) { Win* w = win(id); return w && w->visible; }
 void click(int id, int x, int y) {
     Win* w = win(id);
     if (!w || !w->click) return;
-    w->click((XPLMWindowID)(intptr_t)id, x, y, xplm_MouseDown, nullptr);
-    w->click((XPLMWindowID)(intptr_t)id, x, y, xplm_MouseUp, nullptr);
+    w->click((XPLMWindowID)(intptr_t)id, x, y, xplm_MouseDown, w->refcon);
+    w->click((XPLMWindowID)(intptr_t)id, x, y, xplm_MouseUp, w->refcon);
 }
 
 void typeText(int id, const std::string& text) {
     Win* w = win(id);
     if (!w || !w->key) return;
     for (char c : text) {
-        w->key((XPLMWindowID)(intptr_t)id, c, xplm_DownFlag, 0, nullptr, 0);
-        w->key((XPLMWindowID)(intptr_t)id, c, xplm_UpFlag,   0, nullptr, 0);
+        w->key((XPLMWindowID)(intptr_t)id, c, xplm_DownFlag, 0, w->refcon, 0);
+        w->key((XPLMWindowID)(intptr_t)id, c, xplm_UpFlag,   0, w->refcon, 0);
     }
 }
 
 void pressVk(int id, int vk) {
     Win* w = win(id);
     if (!w || !w->key) return;
-    w->key((XPLMWindowID)(intptr_t)id, 0, xplm_DownFlag, (char)vk, nullptr, 0);
-    w->key((XPLMWindowID)(intptr_t)id, 0, xplm_UpFlag,   (char)vk, nullptr, 0);
+    w->key((XPLMWindowID)(intptr_t)id, 0, xplm_DownFlag, (char)vk, w->refcon, 0);
+    w->key((XPLMWindowID)(intptr_t)id, 0, xplm_UpFlag,   (char)vk, w->refcon, 0);
 }
 
 // Forget every window, so a test can run XPluginStart more than once
@@ -325,7 +349,11 @@ XPLMWindowID XPLMCreateWindowEx(XPLMCreateWindow_t* p) {
     harness::Win w;
     w.draw = p->drawWindowFunc;
     w.click = p->handleMouseClickFunc;
+    w.rclick = p->handleRightClickFunc;
     w.key = p->handleKeyFunc;
+    w.cursor = p->handleCursorFunc;
+    w.wheel = p->handleMouseWheelFunc;
+    w.refcon = p->refcon;
     w.l = p->left; w.t = p->top; w.r = p->right; w.b = p->bottom;
     w.visible = p->visible != 0;
     harness::g_wins.push_back(w);
@@ -334,7 +362,43 @@ XPLMWindowID XPLMCreateWindowEx(XPLMCreateWindow_t* p) {
 }
 void XPLMDestroyWindow(XPLMWindowID id) {
     if ((intptr_t)id == 1) harness::g_drawFunc = nullptr;
+    // a destroyed window is never drawn or clicked again (its refcon may be gone)
+    if ((intptr_t)id >= 1 && (intptr_t)id <= (intptr_t)harness::g_wins.size()) {
+        auto& w = harness::g_wins[(intptr_t)id - 1];
+        w.draw = nullptr; w.click = nullptr; w.rclick = nullptr; w.key = nullptr; w.cursor = nullptr; w.wheel = nullptr; w.refcon = nullptr;
+        w.visible = false;
+    }
 }
+
+// The Dear ImGui window's calls: pop-out and VR are flags on the window, the OS / VR geometry is the plain
+// one, the screen is the one setScreen() gave, and textures are numbered.
+void XPLMSetWindowPositioningMode(XPLMWindowID id, XPLMWindowPositioningMode mode, int) {
+    if ((intptr_t)id >= 1 && (intptr_t)id <= (intptr_t)harness::g_wins.size()) {
+        auto& w = harness::g_wins[(intptr_t)id - 1];
+        w.poppedOut = mode == xplm_WindowPopOut;
+        w.inVR = mode == xplm_WindowVR;
+    }
+}
+int XPLMWindowIsPoppedOut(XPLMWindowID id) {
+    return ((intptr_t)id >= 1 && (intptr_t)id <= (intptr_t)harness::g_wins.size()) ? harness::g_wins[(intptr_t)id - 1].poppedOut : 0;
+}
+int XPLMWindowIsInVR(XPLMWindowID id) {
+    return ((intptr_t)id >= 1 && (intptr_t)id <= (intptr_t)harness::g_wins.size()) ? harness::g_wins[(intptr_t)id - 1].inVR : 0;
+}
+void XPLMGetWindowGeometryOS(XPLMWindowID id, int* l, int* t, int* r, int* b) { XPLMGetWindowGeometry(id, l, t, r, b); }
+void XPLMGetWindowGeometryVR(XPLMWindowID id, int* w, int* h) {
+    int l, t, r, b;
+    XPLMGetWindowGeometry(id, &l, &t, &r, &b);
+    if (w) *w = r - l;
+    if (h) *h = t - b;
+}
+void XPLMGetScreenSize(int* w, int* h) {
+    if (w) *w = harness::g_screenR - harness::g_screenL;
+    if (h) *h = harness::g_screenT - harness::g_screenB;
+}
+void XPLMSetGraphicsState(int, int, int, int, int, int, int) {}
+void XPLMBindTexture2d(int, int) {}
+void XPLMGenerateTextureNumbers(int* out, int n) { static int next = 100; for (int i = 0; i < n; ++i) out[i] = next++; }
 void XPLMGetWindowGeometry(XPLMWindowID id, int* l, int* t, int* r, int* b) {
     auto* w = ((intptr_t)id >= 1 && (intptr_t)id <= (intptr_t)harness::g_wins.size())
               ? &harness::g_wins[(intptr_t)id - 1] : nullptr;
