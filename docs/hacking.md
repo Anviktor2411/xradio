@@ -40,6 +40,7 @@ docs/            this file, the server guide, the VPN guide
 | `upnp.cpp/.h`, `natpmp.cpp/.h` | asking the router to open the hosting port, two protocols, on a worker thread. |
 | `update.cpp/.h` | the once-per-session "a newer version exists" check. |
 | `clipboard.cpp/.h` | the Copy buttons. |
+| `crashlog.cpp/.h` | on Windows, the last word before X-Plane dies of us: the exception, the faulting instruction and a short stack as `<module>+<offset>` in Log.txt, then X-Plane's own handler as before. Resolved against the symbol files the build keeps beside the plugin. |
 | `ui2/` | the Dear ImGui window and Tower mode's windows (`docs/ui.md`). `imgui_xp.cpp` hosts ImGui in an X-Plane window with one context per window; `ContextGuard` there is the only way a context is ever switched. |
 | `settings.h` | every setting, its config-file key, its widget and its tab, in one table. |
 | `ui.cpp/.h` | the widget set the settings window is drawn with. Text only, on purpose. |
@@ -171,3 +172,13 @@ MinGW build that needs `libstdc++-6.dll` loads on the machine that built it
 and nowhere else, so the release stops there. The binaries pilots install come from
 the CI run's `XRadio-all-platforms` artifact. Everyone in a flight must run
 the same build, so the version is checked at login.
+
+The build keeps the plugin's symbols beside it, never inside it:
+`XRadio.pdb` (MSVC), `XRadio.xpl.debug` (MinGW, GCC, Clang; the plugin is
+stripped and linked to it with `--add-gnu-debuglink`) or `XRadio.xpl.dSYM`
+(macOS). CI uploads them as `XRadio-symbols-<platform>`. A line such as
+`XRadio crash: access violation (0xc0000005) at XRadio.xpl+0x1a2b3c` in
+Log.txt is then a line of source: `addr2line -e XRadio.xpl.debug
+0x<image base + 0x1a2b3c>` (the image base is in `objdump -p`), or the
+offset from the module base in a debugger with the pdb loaded. Keep the
+symbols of every release you ship.

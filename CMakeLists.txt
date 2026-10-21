@@ -98,6 +98,7 @@ endif()
 # --- common settings for anything that compiles the plugin sources ----------
 set(XR_PLUGIN_SOURCES
     plugin/src/clipboard.cpp
+    plugin/src/crashlog.cpp
     plugin/src/main.cpp
     plugin/src/natpmp.cpp
     plugin/src/net.cpp
@@ -236,6 +237,31 @@ endif()
 # wrong and X-Plane skips the folder silently, with nothing in Log.txt.
 set_target_properties(XRadio PROPERTIES
     PREFIX "" SUFFIX ".xpl" OUTPUT_NAME "XRadio")
+
+# Symbols for a crash report (plugin/src/crashlog.h names a fault as <module>+<offset>), kept beside the
+# plugin and never inside it. MSVC: /Zi and /DEBUG write XRadio.pdb next to the plugin. GCC / Clang / MinGW:
+# -g, then objcopy moves the debug information into XRadio.xpl.debug and links the plugin to it, so the
+# plugin itself stays as small as before. macOS: dsymutil collects it into XRadio.xpl.dSYM. The release
+# (CI) packs them into a symbols artifact of their own; addr2line -e XRadio.xpl.debug / the pdb in a
+# debugger turn an offset from Log.txt into a line.
+if(MSVC)
+    target_compile_options(XRadio PRIVATE /Zi)
+    target_link_options(XRadio PRIVATE /DEBUG /OPT:REF /OPT:ICF)
+elseif(APPLE)
+    find_program(XR_DSYMUTIL dsymutil)
+    target_compile_options(XRadio PRIVATE -g)
+    if(XR_DSYMUTIL)
+        add_custom_command(TARGET XRadio POST_BUILD
+            COMMAND "${XR_DSYMUTIL}" "$<TARGET_FILE:XRadio>" -o "$<TARGET_FILE:XRadio>.dSYM"
+            COMMENT "Keeping XRadio's symbols in XRadio.xpl.dSYM")
+    endif()
+elseif(CMAKE_OBJCOPY)
+    target_compile_options(XRadio PRIVATE -g)
+    add_custom_command(TARGET XRadio POST_BUILD
+        COMMAND "${CMAKE_OBJCOPY}" --only-keep-debug "$<TARGET_FILE:XRadio>" "$<TARGET_FILE:XRadio>.debug"
+        COMMAND "${CMAKE_OBJCOPY}" --strip-debug "--add-gnu-debuglink=$<TARGET_FILE:XRadio>.debug" "$<TARGET_FILE:XRadio>"
+        COMMENT "Keeping XRadio's symbols in XRadio.xpl.debug")
+endif()
 
 if(WIN32)
     find_library(XPLM_LIBRARY NAMES XPLM_64.lib XPLM

@@ -284,6 +284,17 @@ jobs:
           mkdir -p dist
           cp -r build/XRadio dist/XRadio
           cp README.md LICENSE dist/XRadio/
+          # The symbols (XRadio.pdb / XRadio.xpl.debug / XRadio.xpl.dSYM, see CMakeLists.txt) go into
+          # an artifact of their own: a crash line in Log.txt ("XRadio crash: ... at XRadio.xpl+0x...")
+          # is resolved against them, and pilots do not need them.
+          mkdir -p dist-symbols/${{ matrix.platdir }}
+          for s in dist/XRadio/${{ matrix.platdir }}/*.pdb dist/XRadio/${{ matrix.platdir }}/*.debug; do
+            if [ -e "$s" ]; then mv "$s" dist-symbols/${{ matrix.platdir }}/; fi
+          done
+          if [ -d dist/XRadio/${{ matrix.platdir }}/XRadio.xpl.dSYM ]; then
+            mv dist/XRadio/${{ matrix.platdir }}/XRadio.xpl.dSYM dist-symbols/${{ matrix.platdir }}/
+          fi
+          ls -la dist-symbols/${{ matrix.platdir }} || true
           # The standalone relay server, for anyone who wants one running
           # without X-Plane open. Hosting from inside the sim needs none of
           # this -- it is here for a machine that should stay up.
@@ -338,6 +349,12 @@ jobs:
           name: XRadio-${{ matrix.name }}
           path: dist
           if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XRadio-symbols-${{ matrix.name }}
+          path: dist-symbols
+          if-no-files-found: warn
 
   # ---------------------------------------------------------------------------
   # Merge the three platform builds into one folder that works everywhere.

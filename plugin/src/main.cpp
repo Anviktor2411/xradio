@@ -28,6 +28,7 @@
 #include "simbrief.h"
 #include "acftype.h"
 #include "tcasread.h"
+#include "crashlog.h"
 #ifdef XRADIO_UI_IMGUI
 #  include "ui2/host.h"
 #  include "ui2/imgui_assert.h"
@@ -3761,6 +3762,9 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     XPLMEnableFeature("XPLM_USE_NATIVE_PATHS", 1);
     XPLMEnableFeature("XPLM_USE_NATIVE_WIDGET_WINDOWS", 1);
 
+    // if the plugin ever takes the sim down again, Log.txt says where (crashlog.h); X-Plane's own handler
+    // runs after ours exactly as before
+    xr::crashlog::install([](const char* line) { XPLMDebugString(line); });
     loadConfig();
     findRefs();
     {
@@ -3908,6 +3912,7 @@ PLUGIN_API void XPluginStop(void) {
     if (g_cmdPtt) { XPLMUnregisterCommandHandler(g_cmdPtt, pttHandler, 1, nullptr); }
     XPLMUnregisterKeySniffer(pttKeySniffer, 0, nullptr);
     if (g_menu)   { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
+    xr::crashlog::uninstall();
 }
 
 PLUGIN_API void XPluginReceiveMessage(XPLMPluginID, int msg, void* param) {
