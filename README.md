@@ -63,6 +63,27 @@ It walks through putting everyone on Tailscale (five minutes each, free for a
 group of six), the ZeroTier alternative, forwarding by hand, and renting a
 small VPS, with a table at the top for picking between them.
 
+### Over Tailscale
+
+The quickest way around a router that won't open the port is Tailscale.
+Nothing changes on anyone's router, and it works from mobile internet and
+behind carrier NAT too.
+
+1. Everyone installs [Tailscale](https://tailscale.com/download). The host
+   invites the others under **Users → Invite users** at
+   [login.tailscale.com](https://login.tailscale.com). Invite them as users,
+   not with the *Share* button: a shared machine can't receive the packets
+   the server sends to it.
+2. The host opens **Host / Connect**, ticks **Host a flight**, **unticks
+   *Ask the router to open the port***, and presses **Apply**.
+3. The host sends their Tailscale address and the port, e.g.
+   `100.94.3.17:49100`.
+4. Everyone else puts that address in **Connect to** and presses **Apply**.
+
+If `ping 100.x.x.x` gets a reply but XRadio won't connect, the host's
+firewall is blocking UDP 49100. **[docs/tailscale.md](docs/tailscale.md)**
+has the full walkthrough, both windows' settings, troubleshooting and an FAQ.
+
 ## Architecture
 
 ```
