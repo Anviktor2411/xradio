@@ -12,6 +12,7 @@
 #include "net.h"
 #include "protocol.h"
 #include "radio.h"
+#include "version.h"   // what the LAN search is told
 
 #include <atomic>
 #include <algorithm>
@@ -21,6 +22,7 @@
 #include <cstring>
 #include <map>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -68,6 +70,17 @@ struct Session {
     bool     aglKnown = false;       // the report carried it; a v5-sized one does not
     uint16_t svcRangeNm = 0;         // a station's service volume as it asked, 0 = by facility
     uint16_t svcCeilingFt = 0;
+    // 0.7
+    bool     muted = false;          // the host muted them: nothing they say on the radio is relayed
+    bool     crewOpen = false;       // their cockpit takes a crew (docs/crew.md)
+    std::string crewCode;            // ...who must give this code, if it is not empty
+    uint32_t crewOf = 0;             // aboard this pilot's aircraft as crew (their session), 0 = their own
+    uint8_t  crewRole = 0;           // CREW_ROLE_COPILOT / OBSERVER, while aboard
+    std::vector<uint8_t> panel;      // a pilot's last CREW_PANEL, as relayed, for crew who join later
+    uint32_t txHolder = 0;           // a crewed aircraft has one transmitter: who keyed it last...
+    double   txHolderAt = 0;         // ...and when
+    uint16_t voiceSeqOut = 0;        // ...and the numbers its one stream goes out with
+    uint32_t crewTxFreq = 0;         // the frequency its transmitter was last keyed on, by whoever
 
     double altFt() const { return (double)altM * 3.28084; }
     // The height above the ground the radio counts for this aircraft.
@@ -203,6 +216,10 @@ public:
     // then bring tropospheric ducting. Off unless whoever runs the server asks.
     Core(Sink sink, void* ctx, std::string password, bool ducting = false)
         : sink_(sink), ctx_(ctx), password_(std::move(password)), ductingEnabled_(ducting) {}
+    Core(Sink sink, void* ctx, const Options& o)
+        : sink_(sink), ctx_(ctx), password_(o.password), ductingEnabled_(o.ducting),
+          adminToken_(o.adminToken), maxPilots_(std::max(0, o.maxPilots)), visible_(o.visible),
+          name_(o.name.empty() ? std::string(kDefaultName) : o.name), hosted_(o.hosted), port_(o.port) {}
 
     void onPacket(const Peer& from, const uint8_t* data, int len, double now);
     void tick(double now);
@@ -219,6 +236,21 @@ public:
         std::sort(out.begin(), out.end());
         return out;
     }
+    // 0.7: the Hosting tab's list, sorted like callsigns()
+    std::vector<PilotInfo> pilots() const {
+        std::vector<PilotInfo> out;
+        for (const auto& kv : sessions_) {
+            if (kv.second.injector) continue;
+            PilotInfo p;
+            p.sid = kv.second.sid; p.callsign = kv.second.callsign; p.host = kv.first.host();
+            p.muted = kv.second.muted; p.atc = kv.second.atc; p.crewOf = kv.second.crewOf;
+            out.push_back(p);
+        }
+        std::sort(out.begin(), out.end(), [](const PilotInfo& a, const PilotInfo& b) { return a.callsign < b.callsign; });
+        return out;
+    }
+    void setLimits(int maxPilots, bool visible) { maxPilots_ = std::max(0, maxPilots); visible_ = visible; }
+    int  maxPilots() const { return maxPilots_; }
     uint64_t sent() const { return sent_; }
 
 private:
@@ -238,6 +270,18 @@ private:
     void onAtis(Session& s, const uint8_t* p, int len);
     void onAircraft(Session& s, const uint8_t* p, int len);
     void onTcas(Session& s, const uint8_t* p, int len);
+    // 0.7
+    void onCrew(Session& s, const uint8_t* p, int len);
+    void onAdmin(const Peer& from, const uint8_t* p, int len, uint8_t version, double now);
+    void onDiscover(const Peer& from, const uint8_t* p, int len, uint8_t version);
+    void kick(Session& t, uint16_t minutes, double now);
+    Session& aircraftOf(Session& s);
+    std::vector<Session*> crewMembers(Session& pilot);
+    void sendCrewState(Session& pilot);
+    void crewRefuse(const Session& s, uint8_t reason, const std::string& callsign);
+    void crewLeave(Session& s);
+    void crewClose(Session& pilot);
+    void broadcastCrews();
     void offerAtis(Session& s);
     void broadcastAtcList(double now);
     Session* speaker(Session& s, uint32_t fromSid);
@@ -283,6 +327,14 @@ private:
     uint16_t rosterEpoch_ = 0;
     uint64_t sent_ = 0;
     double   t0_ = 0;
+    // 0.7: whoever runs the server
+    std::string adminToken_;            // empty: PT_ADMIN does nothing
+    int      maxPilots_ = 0;            // 0: no limit
+    bool     visible_ = true;           // answer the LAN search
+    std::string name_ = kDefaultName;   // ...and what it is told the flight is called
+    bool     hosted_ = false;           // run inside X-Plane
+    uint16_t port_ = 0;                 // the port it listens on, for the LAN search's answer
+    std::map<std::string, double> bans_;   // kicked address -> until when
 };
 
 void Core::send(const Peer& to, uint8_t type, uint32_t sid,
@@ -332,6 +384,10 @@ void Core::onPacket(const Peer& from, const uint8_t* data, int len, double now) 
     if ((int)h.payloadLen != avail) return;
 
     if (h.type == PT_LOGIN) { onLogin(from, payload, avail, now, h.version); return; }
+    // 0.7: the two that need no session -- the LAN search, and whoever holds the
+    // admin token (an admin tool should not join the flight to run it).
+    if (h.type == PT_DISCOVER) { onDiscover(from, payload, avail, h.version); return; }
+    if (h.type == PT_ADMIN) { onAdmin(from, payload, avail, h.version, now); return; }
 
     auto it = sessions_.find(from);
     if (it == sessions_.end()) return;      // everything else needs a login first
@@ -346,13 +402,16 @@ void Core::onPacket(const Peer& from, const uint8_t* data, int len, double now) 
         case PT_POSITION: onPosition(s, payload, avail); break;
         case PT_TEXT:     onText(s, payload, avail); break;
         case PT_VOICE:    onVoice(s, payload, avail, now); break;
-        case PT_PING:     send(from, PT_PONG, s.sid); break;
+        // 0.7: whatever the ping carries comes back, so the client can match the
+        // answer and time the round trip; an empty ping, an empty pong.
+        case PT_PING:     send(from, PT_PONG, s.sid, payload, std::min(avail, kMaxPingEcho)); break;
         case PT_WEATHER:  onWeather(s, payload, avail); break;
         case PT_AI_TRAFFIC: onAiTraffic(s, payload, avail, now); break;
         case PT_FLIGHTPLAN: onFlightPlan(s, payload, avail); break;
         case PT_ATIS:     onAtis(s, payload, avail); break;
         case PT_AIRCRAFT: onAircraft(s, payload, avail); break;
         case PT_TCAS:     onTcas(s, payload, avail); break;
+        case PT_CREW:     onCrew(s, payload, avail); break;
         case PT_LOGOUT:   drop(from); break;
         default: break;
     }
@@ -627,6 +686,21 @@ void Core::onLogin(const Peer& from, const uint8_t* p, int len, double now, uint
         send(from, PT_LOGIN_REJECT, 0, &rj, (int)sizeof(rj), version);
         return;
     }
+    // 0.7: an address the host kicked stays out for as long as they said, and is
+    // told so, with the minutes left.
+    {
+        auto ban = bans_.find(from.host());
+        if (ban != bans_.end()) {
+            if (now < ban->second) {
+                LoginRejectPayload rj{};
+                rj.reason = RJ_KICKED;
+                rj.reserved = (uint16_t)std::min(65535.0, std::ceil((ban->second - now) / 60.0));
+                send(from, PT_LOGIN_REJECT, 0, &rj, (int)sizeof(rj), version);
+                return;
+            }
+            bans_.erase(ban);
+        }
+    }
     if (!password_.empty()) {
         // fixed-width, may lack a terminator
         std::string given(lp.password, strnlen(lp.password, sizeof(lp.password)));
@@ -638,6 +712,18 @@ void Core::onLogin(const Peer& from, const uint8_t* p, int len, double now, uint
         }
     }
     if (lp.protoVer < 6) lp.flags &= LF_WEATHER_SOURCE;   // the station and injector bits are v6's
+    // 0.7: as many as the host allows -- a program driving traffic is not a
+    // pilot, and somebody logging in again is not one more.
+    if (maxPilots_ > 0 && !(lp.flags & LF_INJECTOR)) {
+        int here = 0;
+        for (const auto& kv : sessions_) if (!kv.second.injector && !(kv.first == from)) ++here;
+        if (here >= maxPilots_) {
+            LoginRejectPayload rj{};
+            rj.reason = RJ_FULL;
+            send(from, PT_LOGIN_REJECT, 0, &rj, (int)sizeof(rj), version);
+            return;
+        }
+    }
 
     std::string callsign = clean(lp.callsign, sizeof(lp.callsign), 15);
     std::string acIcao   = clean(lp.acIcao,   sizeof(lp.acIcao),   7);
@@ -748,6 +834,7 @@ void Core::onText(Session& client, const uint8_t* p, int len) {
     // no radios of its own to check against, so the frequency named in the
     // packet is the one it transmits on.
     Session& s = *speaker(client, th.fromSession);
+    const uint8_t* body = p + sizeof(TextHeader);
 
     // A message addressed to a callsign is not a transmission: it goes to
     // that one pilot wherever they are, on no frequency at all, and nobody
@@ -755,6 +842,7 @@ void Core::onText(Session& client, const uint8_t* p, int len) {
     // being left to wonder whether the message landed.
     const std::string to = clean(th.to, sizeof(th.to), 15);
     if (!to.empty()) {
+        if (s.muted) return;                    // 0.7: muted by the host, direct messages included
         Session* target = nullptr;
         for (auto& kv : sessions_) {
             if (kv.second.callsign == to) { target = &kv.second; break; }
@@ -770,7 +858,7 @@ void Core::onText(Session& client, const uint8_t* p, int len) {
         if (target) {
             dh.textLen = (uint16_t)textLen;
             memcpy(dm, &dh, sizeof(dh));
-            memcpy(dm + sizeof(dh), p + sizeof(TextHeader), (size_t)textLen);
+            memcpy(dm + sizeof(dh), body, (size_t)textLen);
             send(target->peer, PT_TEXT, target->sid, dm, (int)sizeof(dh) + textLen);
         } else {
             const std::string why = "nobody called " + to + " is in this flight";
@@ -782,32 +870,58 @@ void Core::onText(Session& client, const uint8_t* p, int len) {
         return;
     }
 
+    // One text, from someone, on a frequency: the record every listener gets.
+    auto textOut = [&](uint32_t freq, const Session& from, uint8_t* out) {
+        TextHeader oh{};
+        oh.freqKhz     = freq;
+        oh.fromSession = from.sid;
+        padInto(oh.from, sizeof(oh.from), from.callsign);
+        oh.textLen     = (uint16_t)textLen;
+        memcpy(out, &oh, sizeof(oh));
+        memcpy(out + sizeof(oh), body, (size_t)textLen);
+        return (int)sizeof(oh) + textLen;
+    };
+
+    // 0.7: the cockpit intercom -- the crew, nobody else, at any distance.
+    if (isIntercom(th.freqKhz)) {
+        std::vector<Session*> crew = crewMembers(aircraftOf(s));
+        if (crew.size() > 1) {
+            uint8_t out[kMaxPacket];
+            const int outLen = textOut(kIntercomKhz, s, out);
+            for (Session* m : crew) if (m != &s) send(m->peer, PT_TEXT, m->sid, out, outLen);
+        }
+        return;
+    }
+    if (s.muted) return;
+    // 0.7: crew aboard somebody's aircraft transmit on its radios, as it -- a
+    // copilot does; an observer has no transmitter.
+    Session& a = aircraftOf(s);
+    if (&a != &s && s.crewRole != CREW_ROLE_COPILOT) return;
+
     // Text does not need the PTT held, so it goes out on whichever radio the
     // client names -- but only if that radio is really tuned there, so nobody
     // can transmit on a frequency they are not on.
     uint32_t freq = 0;
     if (s.ai) {
         freq = th.freqKhz;
-    } else if (th.freqKhz && (th.freqKhz == s.com1 || th.freqKhz == s.com2)) {
+    } else if (th.freqKhz && (th.freqKhz == a.com1 || th.freqKhz == a.com2)) {
         freq = th.freqKhz;
     } else if (th.freqKhz == 0) {
-        freq = s.txFreq();
-        if (freq == 0) freq = s.com1;
+        freq = a.txFreq();
+        if (freq == 0) freq = a.com1;
     }
     if (freq == 0) return;
 
     uint8_t out[kMaxPacket];
-    TextHeader oh{};
-    oh.freqKhz     = freq;
-    oh.fromSession = s.sid;
-    padInto(oh.from, sizeof(oh.from), s.callsign);
-    oh.textLen     = (uint16_t)textLen;
-    memcpy(out, &oh, sizeof(oh));
-    memcpy(out + sizeof(oh), p + sizeof(TextHeader), (size_t)textLen);
-    const int outLen = (int)sizeof(oh) + textLen;
-
-    for (Session* peer : listeners(s, freq)) {
+    const int outLen = textOut(freq, a, out);
+    for (Session* peer : listeners(a, freq)) {
         send(peer->peer, PT_TEXT, peer->sid, out, outLen);
+    }
+    if (a.crewOpen) {
+        // ...and the crew read it in the cockpit, from whoever typed it
+        uint8_t crewOut[kMaxPacket];
+        const int crewLen = textOut(freq, s, crewOut);
+        for (Session* m : crewMembers(a)) if (m != &s) send(m->peer, PT_TEXT, m->sid, crewOut, crewLen);
     }
 }
 
@@ -822,6 +936,34 @@ void Core::onVoice(Session& client, const uint8_t* p, int len, double now) {
     opusLen = std::min(opusLen, avail);
     if (opusLen <= 0) return;
     Session& s = *speaker(client, vh.fromSession);
+    const uint8_t* opus = p + sizeof(VoiceHeader);
+
+    auto voiceOut = [&](uint32_t freq, uint32_t fromSid, uint16_t seq, uint8_t* out) {
+        VoiceHeader oh{};
+        oh.freqKhz     = freq;
+        oh.fromSession = fromSid;
+        oh.seq         = seq;
+        oh.opusLen     = (uint16_t)opusLen;
+        memcpy(out, &oh, sizeof(oh));
+        memcpy(out + sizeof(oh), opus, (size_t)opusLen);
+        return (int)sizeof(oh) + opusLen;
+    };
+
+    // 0.7: the cockpit intercom -- the crew, nobody else, at any distance, and
+    // never muted: a cockpit's own wire is nobody else's business.
+    if (isIntercom(vh.freqKhz)) {
+        std::vector<Session*> crew = crewMembers(aircraftOf(s));
+        if (crew.size() > 1) {
+            uint8_t out[kMaxPacket];
+            const int outLen = voiceOut(kIntercomKhz, s.sid, vh.seq, out);
+            for (Session* m : crew) if (m != &s) send(m->peer, PT_VOICE, m->sid, out, outLen);
+        }
+        return;
+    }
+    if (s.muted) return;
+    // 0.7: crew aboard somebody's aircraft transmit on its radios, as it.
+    Session& a = aircraftOf(s);
+    if (&a != &s && s.crewRole != CREW_ROLE_COPILOT) return;   // an observer has no transmitter
 
     // Same rule as text. Relying on txRadio from the last position report
     // would drop the first ~200 ms of every transmission.
@@ -830,27 +972,36 @@ void Core::onVoice(Session& client, const uint8_t* p, int len, double now) {
         freq = vh.freqKhz;
         // so the [TX] flag on the aircraft follows its voice like a pilot's
         s.com1 = freq; s.txRadio = TX_COM1;
-    } else if (vh.freqKhz && (vh.freqKhz == s.com1 || vh.freqKhz == s.com2)) {
+    } else if (vh.freqKhz && (vh.freqKhz == a.com1 || vh.freqKhz == a.com2)) {
         freq = vh.freqKhz;
     } else if (vh.freqKhz == 0) {
-        freq = s.txFreq();
+        freq = a.txFreq();
     }
     if (freq == 0) return;
 
-    s.lastVoice = now;
+    uint16_t outSeq = vh.seq;
+    if (a.crewOpen) {
+        // One aircraft, one transmitter: whoever keyed it first holds it until
+        // they let go, and everyone outside hears one stream from the aircraft,
+        // numbered here so it never runs backwards when the voice behind it changes.
+        if (a.txHolder && a.txHolder != s.sid && now - a.txHolderAt < kTxHoldS) return;
+        a.txHolder = s.sid; a.txHolderAt = now;
+        a.voiceSeqOut = (uint16_t)(a.voiceSeqOut + 1);
+        outSeq = a.voiceSeqOut;
+        a.crewTxFreq = freq;
+    }
+    a.lastVoice = now;
 
     uint8_t out[kMaxPacket];
-    VoiceHeader oh{};
-    oh.freqKhz     = freq;
-    oh.fromSession = s.sid;
-    oh.seq         = vh.seq;
-    oh.opusLen     = (uint16_t)opusLen;
-    memcpy(out, &oh, sizeof(oh));
-    memcpy(out + sizeof(oh), p + sizeof(VoiceHeader), (size_t)opusLen);
-    const int outLen = (int)sizeof(oh) + opusLen;
-
-    for (Session* peer : listeners(s, freq)) {
+    const int outLen = voiceOut(freq, a.sid, outSeq, out);
+    for (Session* peer : listeners(a, freq)) {
         send(peer->peer, PT_VOICE, peer->sid, out, outLen);
+    }
+    if (a.crewOpen) {
+        // ...and the rest of the crew hear it in the cockpit, from whoever is talking
+        uint8_t crewOut[kMaxPacket];
+        const int crewLen = voiceOut(freq, s.sid, vh.seq, crewOut);
+        for (Session* m : crewMembers(a)) if (m != &s) send(m->peer, PT_VOICE, m->sid, crewOut, crewLen);
     }
 }
 
@@ -860,17 +1011,282 @@ std::vector<Session*> Core::listeners(const Session& sender, uint32_t freqKhz) {
     // the one frequency you can call somebody on without already knowing where
     // they are listening, which is the whole reason it exists.
     const bool guard = isGuard(freqKhz);
+    // 0.7: crew aboard an aircraft hear what its radios hear, from where it is;
+    // the sender's own crew are left out -- they hear it in the cockpit.
     for (auto& kv : sessions_) {
         Session& peer = kv.second;
         if (peer.sid == sender.sid) continue;
+        if (sender.crewOpen && peer.crewOf == sender.sid) continue;
         if (sender.ai && peer.sid == sender.owner) continue;   // the program driving it said it; it knows
-        if (!guard && !peer.listeningOn(freqKhz)) continue;
-        if (sender.hasPosition && peer.hasPosition && !inRadioRange(sender, peer, freqKhz, ducting_)) {
+        const Session& rx = aircraftOf(peer);
+        if (!guard && !rx.listeningOn(freqKhz)) continue;
+        if (sender.hasPosition && rx.hasPosition && !inRadioRange(sender, rx, freqKhz, ducting_)) {
             continue;
         }
         out.push_back(&peer);
     }
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// 0.7: the shared cockpit (docs/crew.md)
+// ---------------------------------------------------------------------------
+// The aircraft a session is in: its own, or the pilot's it is crew aboard.
+Session& Core::aircraftOf(Session& s) {
+    if (s.crewOf) {
+        if (Session* pilot = bySid(s.crewOf)) return *pilot;
+    }
+    return s;
+}
+
+// Everyone in this pilot's cockpit, the pilot first, then by session.
+std::vector<Session*> Core::crewMembers(Session& pilot) {
+    std::vector<Session*> out{&pilot};
+    if (!pilot.crewOpen) return out;
+    std::vector<Session*> rest;
+    for (auto& kv : sessions_) if (kv.second.crewOf == pilot.sid) rest.push_back(&kv.second);
+    std::sort(rest.begin(), rest.end(), [](const Session* a, const Session* b) { return a->sid < b->sid; });
+    out.insert(out.end(), rest.begin(), rest.end());
+    return out;
+}
+
+namespace {
+CrewPayload crewRecord(uint8_t op, const std::string& callsign = "", uint8_t role = CREW_ROLE_NONE,
+                       uint8_t reason = 0, uint8_t count = 0, uint32_t aircraftSid = 0, uint32_t fromSid = 0) {
+    CrewPayload c{};
+    c.op = op; c.role = role; c.reason = reason; c.count = count; c.aircraftSid = aircraftSid; c.fromSid = fromSid;
+    padInto(c.callsign, sizeof(c.callsign), callsign);
+    return c;
+}
+}  // namespace
+
+// Who is aboard, to everyone aboard.
+void Core::sendCrewState(Session& pilot) {
+    if (!pilot.crewOpen) return;
+    const std::vector<Session*> crew = crewMembers(pilot);
+    uint8_t payload[kMaxPacket];
+    size_t off = sizeof(CrewPayload);
+    for (const Session* m : crew) {
+        CrewMember e{};
+        e.sid = m->sid;
+        padInto(e.callsign, sizeof(e.callsign), m->callsign);
+        e.role = m == &pilot ? (uint8_t)CREW_ROLE_PILOT : m->crewRole;
+        memcpy(payload + off, &e, sizeof(e));
+        off += sizeof(e);
+    }
+    for (const Session* to : crew) {
+        const CrewPayload c = crewRecord(CREW_STATE, pilot.callsign,
+                                         to == &pilot ? (uint8_t)CREW_ROLE_PILOT : to->crewRole, 0,
+                                         (uint8_t)crew.size(), pilot.sid);
+        memcpy(payload, &c, sizeof(c));
+        send(to->peer, PT_CREW, to->sid, payload, (int)off);
+    }
+}
+
+void Core::crewRefuse(const Session& s, uint8_t reason, const std::string& callsign) {
+    const CrewPayload c = crewRecord(CREW_REFUSED, callsign, CREW_ROLE_NONE, reason);
+    send(s.peer, PT_CREW, s.sid, &c, (int)sizeof(c));
+}
+
+// s gets off the aircraft it is crew aboard; the ones left are told.
+void Core::crewLeave(Session& s) {
+    Session* pilot = bySid(s.crewOf);
+    s.crewOf = 0; s.crewRole = 0;
+    if (pilot) sendCrewState(*pilot);
+}
+
+// The pilot takes no crew any more: everyone aboard is put off, and told.
+void Core::crewClose(Session& pilot) {
+    std::vector<Session*> crew = crewMembers(pilot);
+    for (size_t i = 1; i < crew.size(); ++i) {
+        crew[i]->crewOf = 0; crew[i]->crewRole = 0;
+        crewRefuse(*crew[i], CREW_CLOSED, pilot.callsign);
+    }
+    pilot.crewOpen = false; pilot.crewCode.clear(); pilot.panel.clear();
+    pilot.txHolder = 0;
+}
+
+// Every cockpit's crew list again, with the roster: one lost on the way heals by itself.
+void Core::broadcastCrews() {
+    std::vector<Session*> pilots;
+    for (auto& kv : sessions_) if (kv.second.crewOpen) pilots.push_back(&kv.second);
+    std::sort(pilots.begin(), pilots.end(), [](const Session* a, const Session* b) { return a->sid < b->sid; });
+    for (Session* p : pilots) sendCrewState(*p);
+}
+
+void Core::onCrew(Session& s, const uint8_t* p, int len) {
+    if (len < (int)sizeof(CrewPayload) || s.atc || s.injector || s.proto < 6) return;
+    CrewPayload c{};
+    memcpy(&c, p, sizeof(c));
+    const bool havePanel = len >= (int)(sizeof(CrewPayload) + sizeof(CrewPanel));
+    const uint8_t* rec = p + sizeof(CrewPayload);
+    switch (c.op) {
+        case CREW_OPEN: {
+            if (s.crewOf) crewLeave(s);         // off somebody else's aircraft, into your own
+            s.crewOpen = true;
+            s.crewCode = clean(c.code, sizeof(c.code), 15);
+            sendCrewState(s);
+            break;
+        }
+        case CREW_CLOSE: {
+            if (!s.crewOpen) break;
+            crewClose(s);
+            const CrewPayload none = crewRecord(CREW_STATE);
+            send(s.peer, PT_CREW, s.sid, &none, (int)sizeof(none));
+            break;
+        }
+        case CREW_JOIN: {
+            const uint8_t role = (c.role == CREW_ROLE_COPILOT || c.role == CREW_ROLE_OBSERVER) ? c.role
+                                                                                                : (uint8_t)CREW_ROLE_OBSERVER;
+            const std::string want = clean(c.callsign, sizeof(c.callsign), 15);
+            Session* target = nullptr;
+            for (auto& kv : sessions_) {
+                Session& x = kv.second;
+                if (x.callsign == want && &x != &s && !x.atc && !x.injector) { target = &x; break; }
+            }
+            if (s.crewOpen)       { crewRefuse(s, CREW_BUSY, want); break; }
+            if (!target)          { crewRefuse(s, CREW_NO_SUCH, want); break; }
+            if (!target->crewOpen) { crewRefuse(s, CREW_NOT_OPEN, want); break; }
+            if (!target->crewCode.empty() && clean(c.code, sizeof(c.code), 15) != target->crewCode) {
+                crewRefuse(s, CREW_BAD_CODE, want); break;
+            }
+            if (s.crewOf != target->sid && (int)crewMembers(*target).size() >= kMaxCrew) {
+                crewRefuse(s, CREW_FULL, want); break;
+            }
+            if (s.crewOf && s.crewOf != target->sid) crewLeave(s);
+            s.crewOf = target->sid; s.crewRole = role;
+            sendCrewState(*target);
+            if (!target->panel.empty())
+                send(s.peer, PT_CREW, s.sid, target->panel.data(), (int)target->panel.size());
+            break;
+        }
+        case CREW_LEAVE: {
+            if (!s.crewOf) break;
+            crewLeave(s);
+            const CrewPayload none = crewRecord(CREW_STATE);
+            send(s.peer, PT_CREW, s.sid, &none, (int)sizeof(none));
+            break;
+        }
+        case CREW_PANEL: {
+            if (!s.crewOpen || !havePanel) break;
+            const CrewPayload head = crewRecord(CREW_PANEL, s.callsign, CREW_ROLE_PILOT, 0, 0, s.sid);
+            s.panel.assign((const uint8_t*)&head, (const uint8_t*)&head + sizeof(head));
+            s.panel.insert(s.panel.end(), rec, rec + sizeof(CrewPanel));
+            std::vector<Session*> crew = crewMembers(s);
+            for (size_t i = 1; i < crew.size(); ++i)
+                send(crew[i]->peer, PT_CREW, crew[i]->sid, s.panel.data(), (int)s.panel.size());
+            break;
+        }
+        case CREW_TUNE: {
+            Session* pilot = s.crewOf ? bySid(s.crewOf) : nullptr;
+            if (!pilot || s.crewRole != CREW_ROLE_COPILOT || !havePanel) break;
+            uint8_t out[sizeof(CrewPayload) + sizeof(CrewPanel)];
+            const CrewPayload head = crewRecord(CREW_TUNE, s.callsign, s.crewRole, 0, 0, pilot->sid, s.sid);
+            memcpy(out, &head, sizeof(head));
+            memcpy(out + sizeof(head), rec, sizeof(CrewPanel));
+            send(pilot->peer, PT_CREW, pilot->sid, out, (int)sizeof(out));
+            break;
+        }
+        default: break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 0.7: whoever runs the server
+// ---------------------------------------------------------------------------
+// Kick, mute, unmute, the pilot limit -- with the admin token, or nothing at
+// all: a wrong token gets no answer to learn from.
+void Core::onAdmin(const Peer& from, const uint8_t* p, int len, uint8_t version, double now) {
+    if (len < (int)sizeof(AdminPayload)) return;
+    AdminPayload ap{};
+    memcpy(&ap, p, sizeof(ap));
+    const std::string token(ap.token, strnlen(ap.token, sizeof(ap.token)));
+    if (adminToken_.empty() || token != adminToken_) return;
+    auto me = sessions_.find(from);
+    Session* sender = me == sessions_.end() ? nullptr : &me->second;
+    bool ok = false;
+    if (ap.op == ADMIN_LIMIT) {
+        maxPilots_ = (int)std::min<uint32_t>(ap.value, 999);
+        ok = true;
+    } else if (ap.op == ADMIN_KICK || ap.op == ADMIN_MUTE || ap.op == ADMIN_UNMUTE) {
+        Session* t = nullptr;
+        if (ap.targetSid) {
+            t = bySid(ap.targetSid);
+        } else {
+            const std::string want = clean(ap.target, sizeof(ap.target), 15);
+            if (!want.empty())
+                for (auto& kv : sessions_) if (kv.second.callsign == want) { t = &kv.second; break; }
+        }
+        if (t && t != sender) {
+            if (ap.op == ADMIN_KICK) {
+                // the answer goes out before the session is gone, so `sender` stays valid for it
+                ok = true;
+                AdminPayload reply = ap;
+                reply.result = 1;
+                memset(reply.token, 0, sizeof(reply.token));
+                const uint32_t replySid = sender ? sender->sid : 0;
+                kick(*t, ap.minutes, now);
+                me = sessions_.find(from);
+                send(from, PT_ADMIN, me == sessions_.end() ? 0 : replySid, &reply, (int)sizeof(reply),
+                     me == sessions_.end() ? version : (uint8_t)0);
+                return;
+            }
+            t->muted = ap.op == ADMIN_MUTE;
+            const std::string why = t->muted ? "the host has muted you: nothing you say on the radio reaches anyone"
+                                             : "the host has unmuted you";
+            uint8_t dm[kMaxPacket];
+            TextHeader dh{};
+            dh.freqKhz = 0; dh.fromSession = 0; dh.textLen = (uint16_t)why.size();
+            padInto(dh.from, sizeof(dh.from), "XRADIO");
+            padInto(dh.to, sizeof(dh.to), t->callsign);
+            memcpy(dm, &dh, sizeof(dh));
+            memcpy(dm + sizeof(dh), why.data(), why.size());
+            send(t->peer, PT_TEXT, t->sid, dm, (int)sizeof(dh) + (int)why.size());
+            ok = true;
+        }
+    }
+    AdminPayload reply = ap;
+    reply.result = ok ? 1 : 0;
+    memset(reply.token, 0, sizeof(reply.token));
+    send(from, PT_ADMIN, sender ? sender->sid : 0, &reply, (int)sizeof(reply), sender ? (uint8_t)0 : version);
+}
+
+// Told why, dropped -- and with minutes, the address kept out that long.
+void Core::kick(Session& t, uint16_t minutes, double now) {
+    LoginRejectPayload rj{};
+    rj.reason = RJ_KICKED;
+    rj.reserved = minutes;
+    send(t.peer, PT_LOGIN_REJECT, 0, &rj, (int)sizeof(rj));
+    if (minutes) {
+        bans_[t.peer.host()] = now + minutes * 60.0;
+        while ((int)bans_.size() > kMaxBans) {
+            auto oldest = bans_.begin();
+            for (auto it = bans_.begin(); it != bans_.end(); ++it) if (it->second < oldest->second) oldest = it;
+            bans_.erase(oldest);
+        }
+    }
+    const Peer peer = t.peer;
+    drop(peer);
+}
+
+// The LAN search: what this flight is, in a record the size of the question --
+// so nobody can use the server to send more than they did.
+void Core::onDiscover(const Peer& from, const uint8_t* p, int len, uint8_t version) {
+    if (!visible_ || len < (int)sizeof(DiscoverPayload)) return;
+    DiscoverPayload q{};
+    memcpy(&q, p, sizeof(q));
+    int pilots = 0;
+    for (const auto& kv : sessions_) if (!kv.second.injector) ++pilots;
+    DiscoverPayload a{};
+    a.protoVer = kProtoVersion;
+    a.port = port_;
+    a.pilots = (uint16_t)std::min(pilots, 0xFFFF);
+    a.maxPilots = (uint16_t)std::min(maxPilots_, 0xFFFF);
+    a.flags = (uint8_t)((password_.empty() ? 0 : DF_PASSWORD) | (hosted_ ? DF_HOSTED : 0));
+    padInto(a.name, sizeof(a.name), name_);
+    padInto(a.version, sizeof(a.version), brand::version());
+    a.nonce = q.nonce;
+    send(from, PT_DISCOVER, 0, &a, (int)sizeof(a), version);
 }
 
 // One sim decides the sky; the rest are told about it. Relayed untouched and
@@ -921,20 +1337,32 @@ void Core::drop(const Peer& peer) {
     // with no shared sky, nothing says the air is layered
     if (it->second.sid == weatherSid_) { weatherSid_ = 0; setDucting(false); }
     forget(it->second);
+    const bool wasOpen = it->second.crewOpen;
+    const uint32_t sid = it->second.sid, crewOf = it->second.crewOf;
+    const std::string callsign = it->second.callsign;   // the refusal names the aircraft
     sessions_.erase(it);
     rosterDirty_ = true;
+    // 0.7: a pilot who goes takes the cockpit with them; crew who go leave a seat
+    if (wasOpen) {
+        std::vector<Session*> crew;
+        for (auto& kv : sessions_) if (kv.second.crewOf == sid) crew.push_back(&kv.second);
+        std::sort(crew.begin(), crew.end(), [](const Session* a, const Session* b) { return a->sid < b->sid; });
+        for (Session* m : crew) {
+            m->crewOf = 0; m->crewRole = 0;
+            crewRefuse(*m, CREW_CLOSED, callsign);
+        }
+    }
+    if (crewOf) {
+        if (Session* pilot = bySid(crewOf)) sendCrewState(*pilot);
+    }
 }
 
 void Core::reap(double now) {
-    for (auto it = sessions_.begin(); it != sessions_.end();) {
-        if (now - it->second.lastSeen > kSessionTimeoutS) {
-            if (it->second.sid == weatherSid_) { weatherSid_ = 0; setDucting(false); }
-            forget(it->second);
-            it = sessions_.erase(it);
-            rosterDirty_ = true;
-        }
-        else ++it;
-    }
+    // drop() does what goes with a session (the sky, its aircraft and ATIS, its cockpit)
+    std::vector<Peer> gone;
+    for (const auto& kv : sessions_)
+        if (now - kv.second.lastSeen > kSessionTimeoutS) gone.push_back(kv.first);
+    for (const Peer& peer : gone) drop(peer);
     for (auto it = ai_.begin(); it != ai_.end();) {
         if (now - it->second.lastSeen > kAiTimeoutS) it = ai_.erase(it);
         else ++it;
@@ -948,7 +1376,10 @@ void Core::tick(double now) {
     lastTraffic_ = now;
     reap(now);
     broadcastTraffic(now);
-    if (rosterDirty_ || now - lastRoster_ >= kRosterIntervalS) broadcastRoster(now);
+    if (rosterDirty_ || now - lastRoster_ >= kRosterIntervalS) {
+        broadcastRoster(now);
+        broadcastCrews();
+    }
     if (atcDirty_ || now - lastAtc_ >= kAtcListIntervalS) broadcastAtcList(now);
 }
 
@@ -1006,13 +1437,15 @@ void Core::broadcastTraffic(double now) {
     // What can be seen: pilots, and the aircraft injectors drive. An ATC
     // station is not an aircraft, and an injector does not need its own
     // aircraft back.
+    // 0.7: crew aboard somebody's aircraft are not an aircraft of their own, and
+    // they do not see the one they are sitting in.
     std::vector<Session*> visible;
-    for (Session* s : live) if (!s->atc) visible.push_back(s);
+    for (Session* s : live) if (!s->atc && !s->crewOf) visible.push_back(s);
     for (auto& kv : ai_) visible.push_back(&kv.second);
     for (Session* me : live) {
         std::vector<Session*> others;
         for (Session* other : visible) {
-            if (other->sid == me->sid || (other->ai && other->owner == me->sid)) continue;
+            if (other->sid == me->sid || (other->ai && other->owner == me->sid) || other->sid == me->crewOf) continue;
             if (distanceNm(*me, *other) > kTrafficRangeNm) continue;
             others.push_back(other);
         }
@@ -1038,6 +1471,7 @@ void Core::sendTraffic(Session& me, const std::vector<Session*>& others, double 
   const bool v6 = me.proto >= 6;
   const size_t esize = v6 ? sizeof(TrafficEntry) : (size_t)kTrafficEntrySizeV5;
   const size_t per = (size_t)(v6 ? kMaxEntriesPerPacket : kMaxTrafficEntriesV5);
+  const Session& ears = aircraftOf(me);   // crew listen on the radios of the aircraft they are in
   for (size_t first = 0; first == 0 || first < others.size(); first += per) {
     const size_t n = std::min(per, others.size() - first);
     uint8_t payload[kMaxPacket];
@@ -1050,8 +1484,9 @@ void Core::sendTraffic(Session& me, const std::vector<Session*>& others, double 
         Session* o = others[i];
         uint8_t txActive = 0;
         if (now - o->lastVoice < kTxHoldS) {
-            const uint32_t f = o->txFreq();
-            txActive = (f && me.listeningOn(f)) ? 1 : 0;
+            // a crewed aircraft is keyed by whoever holds its transmitter
+            const uint32_t f = o->crewOpen ? o->crewTxFreq : o->txFreq();
+            txActive = (f && ears.listeningOn(f)) ? 1 : 0;
         }
         TrafficEntry e{};
         e.sessionId = o->sid;
@@ -1086,8 +1521,22 @@ std::thread       g_thread;
 std::atomic<bool> g_run{false};
 std::mutex        g_statusMx;
 Status            g_status;
-std::string       g_password;
+Options           g_options;             // what start() was given; the thread reads it once
 std::atomic<bool> g_ducting{false};
+std::atomic<int>  g_maxPilots{0};        // 0.7: changed while running, like the ducting switch
+std::atomic<bool> g_visible{true};
+std::atomic<bool> g_limitsChanged{false};
+std::mutex        g_tokenMx;
+std::string       g_token;               // the running server's admin token
+
+// A token nobody can guess: 24 characters from the system's random source.
+std::string makeToken() {
+    static const char kAlphabet[] = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+    std::random_device rd;
+    std::string t;
+    for (int i = 0; i < 24; ++i) t += kAlphabet[rd() % (sizeof(kAlphabet) - 1)];
+    return t;
+}
 
 double nowSeconds() {
     static const auto t0 = std::chrono::steady_clock::now();
@@ -1099,7 +1548,11 @@ void sinkFn(void*, const Peer& to, const void* data, int len) {
 }
 
 void serverThread() {
-    Core core(sinkFn, nullptr, g_password, g_ducting.load());
+    Options o = g_options;
+    o.ducting = g_ducting.load();
+    o.maxPilots = g_maxPilots.load();
+    o.visible = g_visible.load();
+    Core core(sinkFn, nullptr, o);
     uint8_t buf[kMaxPacket];
     uint64_t in = 0;
     double lastStatus = 0;
@@ -1115,6 +1568,7 @@ void serverThread() {
             core.onPacket(from, buf, n, now);
         }
         core.setDuctingEnabled(g_ducting.load());
+        if (g_limitsChanged.exchange(false)) core.setLimits(g_maxPilots.load(), g_visible.load());
         core.tick(now);
 
         if (now - lastStatus > 0.5) {
@@ -1122,6 +1576,8 @@ void serverThread() {
             std::lock_guard<std::mutex> lk(g_statusMx);
             g_status.clients    = core.clientCount();
             g_status.callsigns  = core.callsigns();
+            g_status.pilots     = core.pilots();
+            g_status.maxPilots  = core.maxPilots();
             g_status.packetsIn  = in;
             g_status.packetsOut = core.sent();
         }
@@ -1131,9 +1587,25 @@ void serverThread() {
 }  // namespace
 
 bool start(uint16_t port, const std::string& password, std::string* err, bool ducting) {
+    Options o;
+    o.port = port; o.password = password; o.ducting = ducting;
+    return start(o, err);
+}
+
+bool start(const Options& options, std::string* err) {
     stop();
-    g_password = password;
-    g_ducting.store(ducting);
+    g_options = options;
+    const uint16_t port = options.port;
+    g_options.name = options.name.empty() ? std::string(kDefaultName) : options.name;
+    g_ducting.store(options.ducting);
+    g_maxPilots.store(std::max(0, options.maxPilots));
+    g_visible.store(options.visible);
+    g_limitsChanged.store(false);
+    {
+        std::lock_guard<std::mutex> lk(g_tokenMx);
+        g_token = options.adminToken;
+        g_options.adminToken = g_token;
+    }
     std::string e;
     if (!g_sock.open(port, "", &e)) {
         if (err) *err = e;
@@ -1166,6 +1638,19 @@ void stop() {
 bool running() { return g_run.load(); }
 
 void setDucting(bool on) { g_ducting.store(on); }
+
+void setLimits(int maxPilots, bool visible) {
+    g_maxPilots.store(std::max(0, maxPilots));
+    g_visible.store(visible);
+    g_limitsChanged.store(true);
+}
+
+std::string adminToken() {
+    std::lock_guard<std::mutex> lk(g_tokenMx);
+    return g_run.load() ? g_token : std::string();
+}
+
+std::string newAdminToken() { return makeToken(); }
 
 Status status() {
     std::lock_guard<std::mutex> lk(g_statusMx);

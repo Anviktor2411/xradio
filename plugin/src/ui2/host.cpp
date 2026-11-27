@@ -29,6 +29,8 @@ namespace host {
 
 namespace {
 std::unique_ptr<XpWindow> g_main, g_overlay;
+std::unique_ptr<XpWindow> g_traffic;      // 0.7: the traffic scope
+int     g_trafficThemeGen = 0;
 Model   g_model;
 Actions g_actions;
 std::string g_theme = "dark";
@@ -99,6 +101,19 @@ void drawOverlayWin(XpWindow& w) {
     w.setPassThrough(!overlayWantsMouse());
 }
 
+void drawTrafficWin(XpWindow& w) {
+    setFonts(uiFonts());
+    ImGui::PushFont(fonts().body);
+    drawTraffic(g_model, g_actions, w.width(), w.height());
+    ImGui::PopFont();
+}
+
+void defaultTraffic(int* l, int* t, int* r, int* b) {
+    int sl, st, sr, sb;
+    XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);
+    *r = sr - 30; *l = *r - 320; *t = st - 120; *b = *t - 360;
+}
+
 // Where the tower windows open the first time: radar top left, strips top right, Delivery under the radar, the
 // frequency bottom left, operations under the strips, the banner at the top in the middle.
 void defaultTowerRect(int which, int* l, int* t, int* r, int* b) {
@@ -156,6 +171,8 @@ void init(const Actions& actions, const Settings& settings) {
 }
 
 void shutdown() {
+    g_traffic.reset();
+    g_trafficThemeGen = 0;
     for (auto& w : g_tw) w.reset();
     g_twState = nullptr;
     g_twPopOut.clear();
@@ -177,6 +194,7 @@ void update(const Model& model) {
         g_wasVr = vr;
         if (g_main) g_main->toVR(vr);
         if (g_overlay) g_overlay->toVR(vr);
+        if (g_traffic) g_traffic->toVR(vr);
         for (auto& w : g_tw) if (w) w->toVR(vr);
     }
 }
@@ -208,6 +226,35 @@ void resetPositions() {
     g_main->popOut(false);
     g_main->setGeometry(l, t, r, b);
     if (g_overlay) g_overlay->setGeometry(l, t + 60, l + 520, t - 4);
+    if (g_traffic) {
+        defaultTraffic(&l, &t, &r, &b);
+        g_traffic->popOut(false);
+        g_traffic->setGeometry(l, t, r, b);
+    }
+}
+
+// ---------------------------------------------------------------- 0.7: the traffic scope's window
+void initTraffic(const std::string& geometry, bool visible) {
+    int l, t, r, b;
+    defaultTraffic(&l, &t, &r, &b);
+    int a[4] = {0, 0, 0, 0};
+    if (sscanf(geometry.c_str(), "%d,%d,%d,%d", &a[0], &a[1], &a[2], &a[3]) == 4 && a[2] - a[0] >= 220 && a[1] - a[3] >= 200) {
+        l = a[0]; t = a[1]; r = a[2]; b = a[3];
+    }
+    g_traffic.reset(new XpWindow(tr("XRadio traffic"), l, t, r, b, true, drawTrafficWin));
+    g_traffic->setResizingLimits(220, 200, 1600, 1600);
+    g_traffic->setBeforeFrame([](XpWindow&) { themeFor(g_trafficThemeGen); });
+    g_traffic->setVisible(visible);
+}
+
+void showTraffic(bool on) { if (g_traffic) { g_traffic->setVisible(on); if (on) g_traffic->bringToFront(); } }
+bool trafficVisible() { return g_traffic && g_traffic->visible(); }
+
+std::string trafficGeometry() {
+    if (!g_traffic || g_traffic->poppedOut() || g_traffic->inVR()) return "";
+    int l, t, r, b; g_traffic->geometry(&l, &t, &r, &b);
+    char s[64]; snprintf(s, sizeof s, "%d,%d,%d,%d", l, t, r, b);
+    return s;
 }
 
 std::string mainGeometry() {

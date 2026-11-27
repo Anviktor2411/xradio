@@ -78,6 +78,19 @@ enum PacketType : uint8_t {
     // controller -- or the AI pilots TowerTrainer flies -- can coordinate with
     // a real pilot's resolution advisory. See TcasPayload.
     PT_TCAS      = 18,
+    // --- 0.7, added without a protocol bump: every one is a new type an older peer drops ---
+    // Shared cockpit (docs/crew.md). One pilot opens their cockpit to a crew; a
+    // copilot or an observer joins it from their own X-Plane. The crew talks on
+    // a private intercom, hears what the aircraft's radios hear, and a copilot
+    // transmits on them as the aircraft. See CrewPayload.
+    PT_CREW      = 19,
+    // Whoever runs the server: kick, mute, the pilot limit. Carries the server's
+    // admin token and is refused without it; no login needed. See AdminPayload.
+    PT_ADMIN     = 20,
+    // Anyone -> server, no login: "is there a flight here?" -- broadcast on the
+    // local network by the Host / Connect tab's search. The server answers with
+    // the same record filled in, never bigger than the question. See DiscoverPayload.
+    PT_DISCOVER  = 21,
 };
 
 // The international emergency frequency, and in XRadio the one place everybody
@@ -88,6 +101,14 @@ enum PacketType : uint8_t {
 // applies exactly as it does on any other frequency.
 static const uint32_t kGuardKhz = 121500;
 inline bool isGuard(uint32_t freqKhz) { return freqKhz == kGuardKhz; }
+
+// 0.7: the cockpit intercom, carried as PT_VOICE and PT_TEXT on a "frequency"
+// no radio can tune. The server relays it to the sender's crew and nobody else,
+// wherever they are -- an intercom is a wire, not a radio, so there is no range,
+// no squelch and no capture. A server from before 0.7 drops it: the frequency is
+// on neither of the sender's radios.
+static const uint32_t kIntercomKhz = 1;
+inline bool isIntercom(uint32_t freqKhz) { return freqKhz == kIntercomKhz; }
 
 // LoginPayload.flags
 static const uint16_t LF_WEATHER_SOURCE = 1 << 0;  // "my weather and time are the flight's"
@@ -137,6 +158,9 @@ enum AtcKind : uint8_t {
 enum RejectReason : uint16_t {
     RJ_PASSWORD = 1,   // wrong or missing flight password
     RJ_VERSION  = 2,   // client and server are different XRadio versions
+    // 0.7. An older client shows either as "login refused", which is still true.
+    RJ_KICKED   = 3,   // the host removed this pilot (and may keep the address out for a while)
+    RJ_FULL     = 4,   // the flight has as many pilots as its host allows
 };
 
 // Transmit selector
@@ -469,7 +493,124 @@ struct TcasPayload {         // 20 bytes
     uint32_t intruderSid;    // the session the RA is against, when it is one of ours; 0 = unknown
 };
 
+// --- 0.7 ---
+
+// PT_PING / PT_PONG. A ping may carry this; the server echoes the first
+// kMaxPingEcho bytes of whatever a ping carries in its pong, so the client can
+// match the answer to the question and measure the round trip and the loss. An
+// empty ping -- every client before 0.7 -- gets an empty pong, as it always did.
+struct PingPayload {         // 8 bytes
+    uint32_t seq;            // the client's own counter
+    uint32_t timeMs;         // the client's clock when it was sent
+};
+
+// PT_CREW, both ways: one record, `op` says which.
+struct CrewPayload {         // 48 bytes; CREW_STATE is followed by `count` CrewMember,
+                             // CREW_PANEL and CREW_TUNE by one CrewPanel
+    uint8_t  op;             // CrewOp
+    uint8_t  role;           // CREW_JOIN: the role asked for; CREW_STATE: the receiver's own
+    uint8_t  reason;         // CREW_REFUSED: CrewReason
+    uint8_t  count;          // CREW_STATE: how many CrewMember records follow (0: not in a cockpit)
+    uint32_t aircraftSid;    // CREW_STATE / PANEL / TUNE: the aircraft -- its pilot's session
+    char     callsign[16];   // CREW_JOIN: the pilot whose cockpit; CREW_STATE: the aircraft's callsign
+    char     code[16];       // CREW_OPEN / CREW_JOIN: the crew code, empty for none
+    uint32_t fromSid;        // CREW_TUNE: who asked, filled in by the server
+    uint32_t reserved;
+};
+
+struct CrewMember {          // 24 bytes
+    uint32_t sid;
+    char     callsign[16];
+    uint8_t  role;           // CrewRole
+    uint8_t  flags;          // reserved, 0
+    uint16_t reserved;
+};
+
+// The aircraft's radio panel. CREW_PANEL: the pilot's, as it is, to the crew.
+// CREW_TUNE: a copilot asking for a change -- 0 in a frequency, 0 in txSel,
+// 0xFF in rxMask and a negative volume each mean "leave that alone".
+struct CrewPanel {           // 28 bytes
+    uint32_t com1Khz, com2Khz;           // active
+    uint32_t com1StbyKhz, com2StbyKhz;   // standby
+    uint8_t  txSel;          // TxRadio: the COM the push-to-talk keys
+    uint8_t  rxMask;         // RX_* bits: the COMs that are heard
+    uint8_t  flags;          // CP_* bits
+    uint8_t  reserved;
+    float    com1Vol, com2Vol;           // the volume knobs, 0..1
+};
+
+// PT_ADMIN: the server's admin token or nothing happens. The server answers
+// with the same record, `result` 1 if it was done, and the token blanked.
+struct AdminPayload {        // 60 bytes
+    uint8_t  op;             // AdminOp
+    uint8_t  result;         // in the answer: 1 done, 0 not
+    uint16_t minutes;        // ADMIN_KICK: how long the address stays out, 0 = it may come straight back
+    uint32_t targetSid;      // who; 0 = the pilot named in `target`
+    uint32_t value;          // ADMIN_LIMIT: the most pilots, 0 = no limit
+    char     target[16];     // a callsign, when targetSid is 0
+    char     token[32];
+};
+
+// PT_DISCOVER. The question is this record with `nonce` set and the rest zero;
+// the answer is the same size, so asking a server never makes it send more
+// than it was sent. A question shorter than this is not answered.
+struct DiscoverPayload {     // 64 bytes
+    uint16_t protoVer;       // the server's protocol version
+    uint16_t port;           // the port it listens on: what to connect to
+    uint16_t pilots;         // sessions logged in
+    uint16_t maxPilots;      // 0 = no limit
+    uint8_t  flags;          // DF_* bits
+    uint8_t  reserved[3];
+    char     name[28];       // the flight: the hosting pilot's callsign, or the server's --name
+    char     version[16];    // the XRadio version, "0.7.0"
+    uint32_t nonce;          // the question's, echoed: an answer to somebody else's is not ours
+    uint32_t reserved2;
+};
+
 #pragma pack(pop)
+
+// PT_CREW ops.
+enum CrewOp : uint8_t {
+    CREW_OPEN    = 1,   // pilot -> server: crew may join my cockpit
+    CREW_CLOSE   = 2,   // pilot -> server: no crew any more; everyone aboard is told
+    CREW_JOIN    = 3,   // crew -> server: put me in `callsign`'s cockpit as `role`
+    CREW_LEAVE   = 4,   // crew -> server: I am leaving it
+    CREW_STATE   = 5,   // server -> everyone aboard: who is in the cockpit
+    CREW_REFUSED = 6,   // server -> would-be crew: why not
+    CREW_PANEL   = 7,   // the aircraft -> server -> its crew: the radio panel as it is
+    CREW_TUNE    = 8,   // copilot -> server -> the aircraft: please set this on the panel
+};
+enum CrewRole : uint8_t {
+    CREW_ROLE_NONE     = 0,
+    CREW_ROLE_PILOT    = 1,   // the aircraft: flies it, owns the radios
+    CREW_ROLE_COPILOT  = 2,   // hears the radios, transmits on them as the aircraft, may retune them
+    CREW_ROLE_OBSERVER = 3,   // hears the radios and the intercom, talks on the intercom only
+};
+enum CrewReason : uint8_t {
+    CREW_NO_SUCH  = 1,   // nobody with that callsign is in the flight
+    CREW_NOT_OPEN = 2,   // they have not opened their cockpit
+    CREW_BAD_CODE = 3,   // the crew code does not match
+    CREW_FULL     = 4,   // kMaxCrew aboard already
+    CREW_CLOSED   = 5,   // the pilot closed the cockpit or left the flight
+    CREW_BUSY     = 6,   // you have a cockpit of your own open
+};
+static const int kMaxCrew = 4;               // the pilot and three more
+// CrewPanel.flags
+static const uint8_t CP_COM1_POWER = 1 << 0; // the radio has power: the crew's PTT works on it
+static const uint8_t CP_COM2_POWER = 1 << 1;
+
+// PT_ADMIN ops.
+enum AdminOp : uint8_t {
+    ADMIN_KICK   = 1,   // drop the pilot, told why; `minutes` keeps their address out
+    ADMIN_MUTE   = 2,   // nothing they say on the radio is relayed, nor their direct messages, until
+                        // unmuted (their own cockpit's intercom is theirs and stays on)
+    ADMIN_UNMUTE = 3,
+    ADMIN_LIMIT  = 4,   // the most pilots the flight takes, 0 = no limit
+};
+static const int kMaxPingEcho = 16;          // a pong echoes at most this much of its ping
+// DiscoverPayload.flags
+static const uint8_t DF_PASSWORD = 1 << 0;   // a flight password is needed
+static const uint8_t DF_HOSTED   = 1 << 1;   // a pilot hosts it from inside X-Plane
 
 // What a v5 client sends and receives: the same records without the v6 radio
 // fields at their end. A v6 server reads a 72-byte position as v5 and writes

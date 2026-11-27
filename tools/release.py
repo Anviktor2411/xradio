@@ -7,7 +7,7 @@ Run it and answer one question:
     current version : v0.5.2
     new version [v0.5.3]: v0.6.0
 
-It then sets the version in one place (plugin/src/brand.h -- the window and
+It then sets the version in one place (plugin/src/version.h -- the window and
 the tests both read it from there), runs whatever checks this machine can
 run, and writes dist/xradio-v0.6.0-source.zip ready to upload, plus a
 release-notes skeleton with the version and compare link filled in.
@@ -30,7 +30,9 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-BRAND = ROOT / "plugin" / "src" / "brand.h"
+BRAND = ROOT / "plugin" / "src" / "version.h"   # the version, one place (brand.h draws it)
+BRAND_H = ROOT / "plugin" / "src" / "brand.h"     # ...whose comment shows an example of it
+PROTOCOL_PY = ROOT / "server" / "protocol.py"   # XRADIO_VERSION, the LAN search answer
 VERSION_RE = re.compile(r'version\(\)\s*\{\s*return\s*"([^"]+)"')
 
 # Everything that is either generated, fetched, or not ours.
@@ -70,12 +72,21 @@ def set_version(new, dry):
     if new == old:
         return old
     updated = text.replace(f'return "{old}";', f'return "{new}";', 1)
-    # the example in the comment above draw(), so it does not go stale
-    updated = updated.replace(f"v{old}` at (x, y)", f"v{new}` at (x, y)", 1)
     if updated == text:
-        sys.exit("the version in brand.h did not change -- has the file moved on?")
+        sys.exit("the version in version.h did not change -- has the file moved on?")
+    # the example in brand.h's comment above draw(), so it does not go stale (cosmetic: no stop if it moved)
+    brand_text = BRAND_H.read_text()
+    brand_new = brand_text.replace(f"v{old}` at (x, y)", f"v{new}` at (x, y)", 1)
+    # ...and the Python server's copy, which it tells the LAN search (check_sizes.py holds the two equal)
+    proto_text = PROTOCOL_PY.read_text()
+    proto_new = re.sub(r'^XRADIO_VERSION = "[^"]*"', f'XRADIO_VERSION = "{new}"', proto_text, count=1, flags=re.M)
+    if proto_new == proto_text:
+        sys.exit(f"the version in {PROTOCOL_PY} did not change -- has the file moved on?")
     if not dry:
         BRAND.write_text(updated)
+        if brand_new != brand_text:
+            BRAND_H.write_text(brand_new)
+        PROTOCOL_PY.write_text(proto_new)
     return old
 
 

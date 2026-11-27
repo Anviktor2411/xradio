@@ -60,7 +60,12 @@ struct Peer {
         return memcmp(addr, o.addr, (size_t)len) < 0;
     }
     std::string text() const;                  // "1.2.3.4:49100", for logs
+    std::string host() const;                  // "1.2.3.4": the address without the port
 };
+
+// An IPv4 address and port as a Peer, without asking DNS: "255.255.255.255" for the
+// local network's broadcast. False if `ip` is not a dotted quad.
+bool makePeer(const std::string& ip, uint16_t port, Peer* out);
 
 // A bound UDP socket: receives from anyone, replies to a specific peer.
 // This is what the built-in server listens on, so a pilot can host a
@@ -82,6 +87,8 @@ public:
     bool sendTo(const Peer& to, const void* data, int len);
 
     uint16_t boundPort() const { return port_; }
+    // Lets sendTo() reach a broadcast address (SO_BROADCAST): the LAN search.
+    bool enableBroadcast();
 
 private:
 #ifdef _WIN32

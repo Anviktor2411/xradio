@@ -279,6 +279,71 @@ Pilots put it in **Settings → Connection → Flight password**. A wrong or mis
 
 It is a door lock, not cryptography — the protocol is not encrypted, and anyone who can watch the traffic between a pilot and the server can read the password out of it. It keeps strangers out. Do not reuse a password you use for anything else.
 
+### 5b. Kick, mute and a pilot limit (0.7)
+
+Start the server with an **admin token** -- a secret only you know -- and you
+can remove or silence a pilot, and cap how many may join, from the machine or
+from anywhere that can reach the port:
+
+```bash
+python3 server.py --port 49100 --password cumulus --admin-token 'pick-something-long' --max-pilots 12
+```
+
+```bash
+cd server
+python3 admin.py --token 'pick-something-long' mute ESNA12      # nothing they say on the radio reaches anyone
+python3 admin.py --token 'pick-something-long' unmute ESNA12
+python3 admin.py --token 'pick-something-long' kick ESNA12      # out; they may log in again
+python3 admin.py --token 'pick-something-long' kick ESNA12 --minutes 30   # ...and their address stays out 30 min
+python3 admin.py --token 'pick-something-long' limit 8          # 0: no limit
+python3 admin.py --host 203.0.113.7 --token 'pick-something-long' kick ESNA12
+```
+
+`admin.py` does not log in, so it never appears in anybody's flight. A wrong
+token gets no answer at all -- nothing for somebody guessing to learn from --
+and a server started without `--admin-token` takes no orders from anyone.
+The token travels in the clear like the flight password: it keeps strangers
+out, it is not cryptography.
+
+What each one does:
+
+- **mute** -- the pilot's radio voice and text, and their direct messages, are
+  not relayed until unmuted. They are told. Their own cockpit's intercom
+  (`docs/crew.md`) is theirs and stays on.
+- **kick** -- the pilot is told why and dropped. With `--minutes`, their
+  *address* is kept out that long and every login is told how many minutes
+  are left. Two pilots behind one home router share an address, so both are
+  kept out.
+- **limit** -- the most pilots the flight takes; the next one is told the
+  flight is full and retries by itself every few seconds. ATC stations count,
+  TowerTrainer's traffic injector does not, and somebody logging in again is
+  not one more.
+
+The same as switches or environment variables, for the service file:
+`--admin-token` / `XRADIO_ADMIN_TOKEN`, `--max-pilots` / `XRADIO_MAX_PILOTS`.
+The C++ build of the server (`xradio_server`) takes the same switches.
+
+A pilot hosting from inside the sim has all of this on the **Host / Connect**
+tab -- *Mute*, *Kick*, *Kick 30 min* beside each pilot, and *Most pilots* --
+with no token to set: the plugin makes one for every hosting session.
+
+### 5c. Found on the local network (0.7)
+
+XRadio's **Find flights on this network** button (Host / Connect tab) asks
+the local network who is hosting; the server answers with what the flight is
+called, how many are in it, its limit, its version and whether it needs a
+password. The question and the answer are the same size, so nobody can use the
+server to send more than they sent it.
+
+```bash
+python3 server.py --port 49100 --name "Baltic Wings"      # what the search shows (default "XRadio server")
+python3 server.py --port 49100 --hidden                   # do not answer the search at all
+```
+
+Only machines on the same network see a broadcast, so on a VPS this mostly
+matters for a server reached through a VPN. `--hidden` / `XRADIO_HIDDEN=1`
+turns it off; `--name` / `XRADIO_NAME` names it.
+
 ---
 
 ### 6. Make it permanent

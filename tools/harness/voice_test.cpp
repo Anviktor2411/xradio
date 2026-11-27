@@ -2,6 +2,7 @@
 // mixed output, with no audio hardware. Drives the capture and playback paths
 // directly through the test hooks, the way the audio devices would.
 #include "voice.h"
+#include "protocol.h"   // kIntercomKhz
 
 #include <algorithm>
 #include <chrono>
@@ -470,6 +471,160 @@ int main() {
         renderMs(300);
         const double cleanQuiet = rms(renderMs(100));
         check("radio sound off: no squelch noise either", cleanQuiet < 1.0, std::to_string(cleanQuiet));
+        fresh();
+    }
+
+    printf("\n0.7: the intercom\n");
+    {
+        fresh();
+        std::vector<OutFrame> frames;
+        setIntercomTransmit(true);
+        testCapture(tone(200).data(), (int)tone(200).size());
+        pollOutgoing(frames);
+        setIntercomTransmit(false);
+        bool allIc = !frames.empty();
+        for (const auto& f : frames) allIc = allIc && f.intercom;
+        check("the intercom's PTT encodes frames marked for the intercom", allIc && frames.size() == 10,
+              std::to_string(frames.size()) + " frames");
+        setIntercomTransmit(true);
+        setTransmitting(true);
+        testCapture(tone(100).data(), (int)tone(100).size());
+        pollOutgoing(frames);
+        setTransmitting(false);
+        setIntercomTransmit(false);
+        bool noneIc = !frames.empty();
+        for (const auto& f : frames) noneIc = noneIc && !f.intercom;
+        check("with the radio's PTT down too, the radio wins", noneIc, std::to_string(frames.size()) + " frames");
+        check("no frames once both are released", [] {
+            std::vector<OutFrame> f; testCapture(tone(100).data(), (int)tone(100).size()); pollOutgoing(f); return f.empty(); }());
+
+        // In: a wire, not a radio -- the squelch, the noise and the capture are not its business.
+        fresh(); setSquelch(0.6f); setHiss(1.f);
+        auto ic = encode(tone(300));
+        for (size_t i = 0; i < ic.size(); ++i)
+            onIncomingFrame(71, (uint16_t)i, ic[i].opus.data(), (int)ic[i].opus.size(), xr::kIntercomKhz);
+        setSignalQuality(71, 0.1f);                 // far below the squelch, if it were a radio
+        const std::vector<int16_t> heard = renderMs(400);
+        check("intercom is heard whatever the squelch says", rms(slice(heard, 60, 280)) > 2000.0,
+              std::to_string(rms(slice(heard, 60, 280))));
+        check("and none of the radio's noise after it ends", rms(slice(heard, 340, 400)) < 1.0,
+              std::to_string(rms(slice(heard, 340, 400))));
+        fresh();
+        for (size_t i = 0; i < ic.size(); ++i)
+            onIncomingFrame(72, (uint16_t)i, ic[i].opus.data(), (int)ic[i].opus.size(), xr::kIntercomKhz);
+        check("it is listed as the intercom, not as somebody on the radio",
+              activeSpeakers().empty() && activeIntercomSpeakers().size() == 1 && activeIntercomSpeakers()[0] == 72);
+        const std::vector<SpeakerInfo> who = speakers();
+        check("and the window is told it is the intercom", who.size() == 1 && who[0].intercom && who[0].sid == 72);
+        setTransmitting(true);
+        const double whileTx = rms(slice(renderMs(200), 60, 200));
+        setTransmitting(false);
+        check("the intercom is heard while you transmit on the radio", whileTx > 1000.0, std::to_string(whileTx));
+        fresh(); setIntercomVolume(0.f);
+        for (size_t i = 0; i < ic.size(); ++i)
+            onIncomingFrame(73, (uint16_t)i, ic[i].opus.data(), (int)ic[i].opus.size(), xr::kIntercomKhz);
+        const double off = rms(slice(renderMs(300), 60, 280));
+        check("its own volume knob turns it down to nothing", off < 1.0, std::to_string(off));
+        setIntercomVolume(0.8f);
+
+        fresh(); setHiss(0.f);
+        feed(74, encode(tone(300)));
+        setSignal(74, 0.7f, -80.f);
+        renderMs(60);
+        const std::vector<SpeakerInfo> radioWho = speakers();
+        check("someone on the radio comes with their signal and level",
+              radioWho.size() == 1 && !radioWho[0].intercom && fabs(radioWho[0].quality - 0.7f) < 1e-4 &&
+              fabs(radioWho[0].levelDbm + 80.f) < 1e-3);
+        renderMs(400);
+    }
+
+    printf("\n0.7: the microphone test\n");
+    {
+        fresh();
+        check("idle to begin with", micTest() == MicTest::Idle);
+        check("it starts", startMicTest() && micTest() == MicTest::Recording);
+        const std::vector<int16_t> say = tone(500);
+        testCapture(say.data(), (int)say.size());
+        check("it records what the microphone hears", micTestSeconds() > 0.45f && micTestSeconds() < 0.55f,
+              std::to_string(micTestSeconds()));
+        std::vector<OutFrame> frames;
+        pollOutgoing(frames);
+        check("and sends nothing anywhere", frames.empty(), std::to_string(frames.size()) + " frames");
+        stopMicTest();
+        check("let go, it plays back", micTest() == MicTest::Playing);
+        const std::vector<int16_t> back = renderMs(700);
+        const std::vector<int16_t> body = slice(back, 60, 440);
+        check("through the codec and the radio, the tone comes back", rms(body) > 1000.0 &&
+              tonePower(body, 1000.0) > 20.0 * tonePower(body, 2500.0), std::to_string(rms(body)));
+        check("and then it is done", micTest() == MicTest::Idle);
+        startMicTest();
+        setTransmitting(true);
+        check("keying the radio ends it", micTest() == MicTest::Idle);
+        check("and it cannot start while transmitting", !startMicTest());
+        setTransmitting(false);
+        startMicTest();
+        const std::vector<int16_t> lots = tone(6500);
+        testCapture(lots.data(), (int)lots.size());
+        check("six seconds full, it plays back by itself", micTest() == MicTest::Playing);
+        stopMicTest();
+        check("and stops when asked", micTest() == MicTest::Idle);
+        renderMs(100);
+    }
+
+    printf("\n0.7: the radio's switches\n");
+    {
+        fresh(); setPttClick(true);
+        setTransmitting(true);
+        const int keyClick = peak(renderMs(20));
+        setTransmitting(false);
+        const int unkeyClick = peak(renderMs(20));
+        check("a click in your own headset as you key", keyClick > 500, std::to_string(keyClick));
+        check("and another as you let go", unkeyClick > 500, std::to_string(unkeyClick));
+        setPttClick(false);
+        setTransmitting(true);
+        const int quiet = peak(renderMs(20));
+        setTransmitting(false);
+        renderMs(20);
+        check("switched off, keying is silent", quiet == 0, std::to_string(quiet));
+
+        // The squelch's burst and clicks, switched off: the signal ends and that is all.
+        fresh(); setHiss(1.f); setSquelchTail(false);
+        feed(81, encode(tone(240)));
+        const std::vector<int16_t> noTail = renderMs(600);
+        setSquelchTail(true);
+        fresh(); setHiss(1.f);
+        feed(82, encode(tone(240)));
+        const std::vector<int16_t> withTail = renderMs(600);
+        // the carrier lasts the tone, the jitter buffer and the concealment after it: gone by 420 ms
+        check("without the squelch tail the carrier drops into silence",
+              rms(slice(noTail, 440, 500)) < 1.0, std::to_string(rms(slice(noTail, 440, 500))));
+        check("with it, a burst of noise as it always had", rms(slice(withTail, 440, 500)) > 100.0,
+              std::to_string(rms(slice(withTail, 440, 500))));
+
+        // Static crashes: a weak signal crackles, a strong one does not, and the switch decides.
+        // They draw on random numbers of their own, so the same seed gives the same hiss either
+        // way and the difference between the two renders is the crackle and nothing else.
+        auto run = [](bool crackle, float quality) {
+            fresh(); setHiss(0.35f); setSquelch(0.01f); setCrackle(crackle); testSeed(12345);
+            feed(83, encode(std::vector<int16_t>((size_t)(kSampleRate * 2), 0)));
+            setSignal(83, quality, -100.f);
+            const std::vector<int16_t> out = renderMs(1900);
+            setCrackle(false);
+            return slice(out, 100, 1800);
+        };
+        auto cracks = [](const std::vector<int16_t>& a, const std::vector<int16_t>& b) {
+            int n = 0;
+            for (size_t i = 0; i < a.size() && i < b.size(); ++i) if (abs((int)a[i] - (int)b[i]) > 2000) ++n;
+            return n;
+        };
+        const std::vector<int16_t> weakOff = run(false, 0.05f), weakOn = run(true, 0.05f);
+        const std::vector<int16_t> strongOff = run(false, 0.95f), strongOn = run(true, 0.95f);
+        check("near the horizon the static crackles", cracks(weakOff, weakOn) > 20,
+              std::to_string(cracks(weakOff, weakOn)) + " samples");
+        check("and switching it on leaves the hiss under it exactly as it was",
+              cracks(weakOff, run(false, 0.05f)) == 0);
+        check("a strong signal does not crackle", strongOff == strongOn,
+              std::to_string(cracks(strongOff, strongOn)) + " samples");
         fresh();
     }
 

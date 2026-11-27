@@ -36,7 +36,9 @@ import server as S            # noqa: E402
 STRUCTS = ("HEADER", "LOGIN", "LOGIN_ACK", "LOGIN_REJECT", "POSITION",
            "TRAFFIC_HDR", "TRAFFIC_ENTRY", "TEXT_HDR", "VOICE_HDR", "WEATHER",
            "ROSTER_HDR", "ROSTER_ENTRY", "FLIGHTPLAN", "ATIS_HDR", "ATC_LIST_HDR", "ATC_ENTRY",
-           "AIRCRAFT", "TCAS")
+           "AIRCRAFT", "TCAS",
+           # 0.7
+           "PING", "CREW", "CREW_MEMBER", "CREW_PANEL_REC", "ADMIN", "DISCOVER")
 
 # Not structs, but the same class of mistake: a packet budget, an entry cap or
 # a well-known frequency that drifts apart shows up as traffic that thins out
@@ -65,6 +67,26 @@ CONSTANTS = (
     ("MAX_TRAFFIC_ENTRIES_V5", lambda: P.MAX_TRAFFIC_ENTRIES_V5),
     ("AL_DUCTING", lambda: P.AL_DUCTING),
     ("AE_POSITION", lambda: P.AE_POSITION),
+    # 0.7
+    ("PT_CREW", lambda: P.PT_CREW),
+    ("PT_ADMIN", lambda: P.PT_ADMIN),
+    ("PT_DISCOVER", lambda: P.PT_DISCOVER),
+    ("INTERCOM_KHZ", lambda: P.INTERCOM_KHZ),
+    ("RJ_KICKED", lambda: P.RJ_KICKED),
+    ("RJ_FULL", lambda: P.RJ_FULL),
+    ("CREW_OPS", lambda: " ".join(str(v) for v in (P.CREW_OPEN, P.CREW_CLOSE, P.CREW_JOIN, P.CREW_LEAVE,
+                                                   P.CREW_STATE, P.CREW_REFUSED, P.CREW_PANEL, P.CREW_TUNE))),
+    ("CREW_ROLES", lambda: " ".join(str(v) for v in (P.CREW_ROLE_NONE, P.CREW_ROLE_PILOT, P.CREW_ROLE_COPILOT,
+                                                     P.CREW_ROLE_OBSERVER))),
+    ("CREW_REASONS", lambda: " ".join(str(v) for v in (P.CREW_NO_SUCH, P.CREW_NOT_OPEN, P.CREW_BAD_CODE,
+                                                       P.CREW_FULL, P.CREW_CLOSED, P.CREW_BUSY))),
+    ("MAX_CREW", lambda: P.MAX_CREW),
+    ("CP_POWER", lambda: f"{P.CP_COM1_POWER} {P.CP_COM2_POWER}"),
+    ("ADMIN_OPS", lambda: f"{P.ADMIN_KICK} {P.ADMIN_MUTE} {P.ADMIN_UNMUTE} {P.ADMIN_LIMIT}"),
+    ("MAX_PING_ECHO", lambda: P.MAX_PING_ECHO),
+    ("DF_FLAGS", lambda: f"{P.DF_PASSWORD} {P.DF_HOSTED}"),
+    # what the LAN search is told: plugin/src/version.h and server/protocol.py say the same release
+    ("XRADIO_VERSION", lambda: P.XRADIO_VERSION),
 )
 
 

@@ -136,6 +136,26 @@ When two stations transmit together, the receiver compares their levels:
 * **within 6 dB**: nobody captures it. Both garble, chopped by the beat between
   them, under the full heterodyne squeal.
 
+## 5b. What else the receiver does, and the switches for it (0.7)
+
+* **The squelch's burst and click** as a carrier comes and goes: on by
+  default; *Squelch burst and click* off and a transmission just starts and
+  stops.
+* **Static crashes** on a weak signal: none above 65 % of the quality scale
+  (strong), then more the nearer the horizon -- up to about thirty a second
+  at its very edge -- each a short impulse the audio filter turns into a
+  crack, scaled by *Radio noise*. Through an open squelch (the knob all the
+  way down) a few a second. They draw on random numbers of their own, so
+  switching them on or off leaves the hiss under them exactly as it was --
+  which is also how `voice_test` proves it.
+* **The PTT click** in your own headset as you key and unkey: a few
+  milliseconds of a decaying tick, higher as the relay closes, lower as it
+  opens.
+* **The intercom** (`docs/crew.md`) is not a radio at all: it skips the
+  squelch, the noise, the flutter, the break-up and the capture, and is heard
+  over the radio -- also while you transmit -- at its own volume, through a
+  headset's 200 Hz - 5 kHz band when *Radio sound* is on.
+
 ## 6. Tropospheric ducting (optional, off by default)
 
 On a warm, still evening a temperature inversion over the sea can trap VHF and

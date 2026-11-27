@@ -63,6 +63,32 @@ The light theme: ![radio light](ui/radio-light.png)
   SimBrief (username or Pilot ID).
 * **Tower** — enter or leave TowerTrainer's tower cab (`docs/tower-mode.md`).
 
+### New in 0.7
+
+* **Radio** — a row of eight **quick-tune** slots under the COMs (click: COM1, right-click: COM2,
+  Ctrl+click: keep COM1 in the slot); the **shared cockpit** panel when there is one (who is aboard and in
+  which role, a talking light each, the **Intercom (hold)** button and the intercom volume); and under
+  "is transmitting", **everyone coming in**: callsign, frequency, signal bars and the readability in words
+  ("loud and clear" … "barely readable"), distance, squawk and transponder mode — or "on the intercom".
+* **Host / Connect** — *Findable on this network* and *Most pilots* beside the hosting switches (on lines of
+  their own when the window is too narrow for them); while hosting with others in the flight, everyone in it
+  with where they connect from, crew / ATC / muted badges and **Mute**, **Kick**, **Kick 30 min** — a table
+  six pilots tall that scrolls past that, so *Connect* and its *Apply* stay put; **Find flights on this network** with a *Join* button per flight found (a flight
+  on another protocol version is listed, greyed, with its version); and the connection's **round trip**,
+  jitter, packets lost and voice lost, amber when it is bad enough to notice.
+* **Settings** — Audio adds the PTT click, the squelch burst, static crackle and the intercom volume, and
+  the **Mic test** now records and plays back locally (it used to key the transmitter); Controls adds the
+  intercom key and the quick-tune slots; Display adds the traffic scope window; Traffic adds X-Plane's map,
+  TCAS and the scope's range; and a new **Crew** group sets up the shared cockpit (`docs/crew.md`).
+* **The overlay** shows **IC** with a light when there is a crew, and the round trip when it is bad.
+* **The traffic scope** — a window of its own (Plugins → XRadio → *Traffic scope window*, the command
+  `xradio/traffic_window`, or Settings → Display): range rings, our aircraft in the middle, each pilot as
+  a TCAS-style diamond with the height above or below us in hundreds of feet and an arrow when climbing or
+  descending, filled amber within 6 nm and 1200 ft, green while talking, red squawking an emergency, grey
+  when their transponder is off; heading up or north up, 2 to 80 nm, the radios and the round trip along
+  the top, and a click on a target for its type, distance, height, speed and squawk. It is created after
+  the tower's windows, so the harness's window numbers stay put.
+
 ## Tower mode's windows
 
 The ground radar, strips, Delivery, frequency, ATIS / operations and the connection banner are drawn the

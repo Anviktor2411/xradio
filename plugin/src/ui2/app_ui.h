@@ -27,7 +27,7 @@ struct UiState {
     Settings    edit;                       // the settings being edited
     bool        editLoaded = false, editDirty = false;
     int         settingsGroup = 0;          // 0 audio, 1 controls, 2 display, 3 traffic, 4 language, 5 tower
-    bool        capturingPtt = false, capturingTower = false;
+    bool        capturingPtt = false, capturingTower = false, capturingIc = false;
     bool        wizardOpen = false;
     Wizard      wizard;
     std::string note;                       // a short confirmation ("copied", "filed")
@@ -41,6 +41,11 @@ struct UiState {
     int         fpSerial = -1;              // the OFP import the form was loaded from
     Fonts       fonts;
     bool        wantSettingsTab = false;
+    // 0.7
+    bool        icHeld = false;             // the intercom button is down
+    float       scopeRangeNm = -1.f;        // the traffic scope's range; -1 until taken from the settings
+    bool        scopeNorthUp = false;
+    uint32_t    scopeSelected = 0;          // the target whose details the scope shows
 };
 
 UiState& state();
@@ -48,6 +53,7 @@ void   setFonts(const Fonts& f);
 void   toast(const std::string& text, int colour, double now);
 void   drawMain(Model& m, const Actions& a);                  // inside an ImGui window the host began
 void   drawOverlay(Model& m, const Actions& a, float width);  // the compact strip + toasts
+void   drawTraffic(Model& m, const Actions& a, float width, float height);   // 0.7: the traffic scope window
 bool   overlayWantsMouse();                                   // false: clicks fall through to the sim
 void   noteKey(int vk, bool down);                            // a raw key for the PTT / tower bindings capture
 const char* tabName(int tab);

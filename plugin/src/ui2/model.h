@@ -41,7 +41,61 @@ struct Pilot {
     unsigned    squawk = 0;
     bool        talking = false, ai = false, drawn = true, emergency = false;
     float       signal = 0.f;
+    // 0.7: for the traffic scope
+    double      bearingDeg = 0.0;     // true, from us
+    float       relAltFt = 0.f;       // above us, + up
+    float       vsFpm = 0.f;
+    float       trackDeg = 0.f;
+    bool        onTcas = true;        // its transponder answers (off / standby: not a TCAS target)
 };
+
+// 0.7: the shared cockpit as the window shows it.
+struct CrewSeatView { std::string callsign, role; bool talking = false, me = false; };
+struct CrewView {
+    std::string mode = "off";         // off / pilot / join, as set
+    bool        aboard = false;
+    std::string role;                 // ours: pilot / copilot / observer
+    std::string aircraft;             // the aircraft's callsign
+    std::vector<CrewSeatView> seats;
+    std::string problem;              // why not, when not
+    bool        icDown = false;       // we are talking on the intercom
+    std::string icWho;                // who is, otherwise
+    float       icVolume = 0.8f;
+};
+
+// 0.7: who is coming in right now, with what the radio and the transponder say about them.
+struct SpeakerView {
+    std::string callsign, freqText, xpdr;
+    float       signal = 0.f;         // 0..1
+    double      distNm = -1.0;
+    unsigned    squawk = 0;
+    bool        intercom = false, atc = false;
+};
+
+struct PresetView { std::string label; uint32_t khz = 0; };
+
+// 0.7: how the connection is doing.
+struct Telemetry {
+    bool   have = false;              // a round trip has been measured
+    double rttMs = 0, jitterMs = 0, lossPct = 0, voiceLossPct = 0;
+};
+
+// 0.7: hosting -- who is in the flight, and what the host can do about them.
+struct HostPilot {
+    uint32_t    sid = 0;
+    std::string callsign, address;
+    bool        muted = false, atc = false, crew = false, me = false;
+};
+
+// 0.7: a flight the network search found.
+struct LanFlightView {
+    std::string address, name, version;
+    unsigned    port = 0;
+    int         pilots = 0, maxPilots = 0;
+    bool        password = false, hosted = false, sameVersion = true;
+};
+
+struct MicTestView { int state = 0; float seconds = 0.f; };   // 0 idle, 1 recording, 2 playing
 
 struct Message {
     double      t = 0;                // plugin seconds
@@ -128,6 +182,18 @@ struct Model {
     UpdateInfo   update;
     bool         towerActive = false;
     std::string  towerStatus;
+    // 0.7
+    CrewView     crew;
+    std::vector<SpeakerView> speakers;
+    std::vector<PresetView>  presets;
+    Telemetry    tele;
+    std::vector<HostPilot>   hostPilots;
+    int          hostMax = 0;
+    std::vector<LanFlightView> lan;
+    bool         lanBusy = false, lanSearched = false;
+    MicTestView  micTest;
+    double       ownHeading = 0.0;    // true, for the traffic scope
+    float        ownAltFt = 0.f;
     Settings     settings;            // the plugin's current settings (a copy)
     int          unreadMessages = 0;
     double       readUntil = 0;       // messages up to this time have been seen
@@ -152,6 +218,17 @@ struct Actions {
     std::function<void()> importSimbrief;                       // S3
     std::function<std::string()> writeFms;                      // S3: returns a note
     std::function<void()> checkUpdate;
+    // 0.7
+    std::function<void(bool down)> icPtt;                       // the intercom's push-to-talk
+    std::function<void(float v)> setIntercomVolume;
+    std::function<void(int slot, int which)> tunePreset;        // a quick-tune slot onto COM1 / COM2
+    std::function<void(int slot)> storePreset;                  // COM1 as it is into a slot
+    std::function<void(uint32_t sid, int minutes)> kick;        // hosting: minutes 0 = they may come back
+    std::function<void(uint32_t sid, bool on)> mute;
+    std::function<void()> lanSearch;
+    std::function<void(const std::string& address, unsigned port)> join;   // a flight the search found
+    std::function<void(bool down)> micTest;                     // hold to record, let go to hear it back
+    std::function<void()> toggleTraffic;
 };
 
 // ---------------------------------------------------------------- logic (tested without ImGui)
@@ -164,6 +241,15 @@ std::string stuckMicText(double downFor, double warnAfterS);   // "" or a warnin
 int         countUnread(const std::vector<Message>& msgs, double readUntil);
 std::vector<const Pilot*> filterPilots(const std::vector<Pilot>& all, bool hideAi, const std::string& filter);
 std::vector<const Station*> sortedStations(const std::vector<Station>& all);   // tuned first, then by distance
+// 0.7: the traffic scope. Where a target goes on a scope of `radiusPx`, `rangeNm` to its edge, turned so
+// that `upDeg` (true) is up -- 0 for north up, the own heading for heading up. `inside` false: past the edge.
+struct ScopePoint { float x = 0.f, y = 0.f; bool inside = true; };
+ScopePoint  scopePoint(double bearingDeg, double distNm, double upDeg, double rangeNm, float radiusPx);
+std::string relAltText(float relFt);                     // +500 ft -> "+05", -1240 -> "-12", within 50 ft -> "00"
+// TCAS-like: 2 a proximate target (within 6 nm and 1200 ft), 1 other traffic in range, 0 past it.
+int         trafficLevel(double distNm, float relAltFt, double rangeNm);
+std::string telemetryText(const Telemetry& t);           // "42 ms  jitter 3 ms  lost 0 %" or ""
+std::string signalWords(float quality);                  // "loud and clear" .. "barely readable" (radio's readability)
 
 // Toasts live a few seconds; the overlay draws them even with the main window closed.
 class Toasts {

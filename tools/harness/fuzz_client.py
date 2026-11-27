@@ -30,6 +30,7 @@ import protocol as P          # noqa: E402
 
 TYPES = [P.PT_LOGIN, P.PT_LOGIN_ACK, P.PT_POSITION, P.PT_TRAFFIC, P.PT_TEXT,
          P.PT_VOICE, P.PT_PING, P.PT_PONG, P.PT_LOGOUT, P.PT_WEATHER,
+         P.PT_CREW, P.PT_ADMIN, P.PT_DISCOVER,          # 0.7: two of them need no login
          0, 10, 99, 255]
 
 WILD_FLOATS = [float("nan"), float("inf"), float("-inf"), 0.0, -0.0,
@@ -159,7 +160,7 @@ def main():
 
     sent = 0
     for i in range(args.count):
-        pick = rng.randint(0, 9)
+        pick = rng.randint(0, 11)
         if pick == 0:
             pkt = rand_header(rng) + os.urandom(rng.randint(0, 200))
         elif pick == 1:
@@ -206,6 +207,24 @@ def main():
                 57.85, 27.02, 914.0, 90.0, 0.0, 0.0, 50.0, 0.0, 0.0,
                 122800, 0, 0, 0, 1, 1, 0, 90.0, 0.0, 1200, P.XPDR_ALT, 0, 914.0, 0, 0))
             pkt = mutate(rng, base)
+        elif pick == 10:                                 # 0.7: the shared cockpit, any op, any length
+            body = P.CREW.pack(rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255), rng.randint(0, 255),
+                               rng.randint(0, 2**32 - 1), os.urandom(16), os.urandom(16),
+                               rng.randint(0, 2**32 - 1), 0) + os.urandom(rng.randint(0, 120))
+            pkt = P.pack(P.PT_CREW, attacker.sid, body[:rng.randint(0, len(body))])
+        elif pick == 11:                                 # 0.7: no-login packets and the intercom
+            which = rng.randint(0, 3)
+            if which == 0:
+                pkt = P.pack(P.PT_DISCOVER, 0, os.urandom(rng.randint(0, 100)))
+            elif which == 1:
+                pkt = P.pack(P.PT_ADMIN, 0, P.admin(rng.randint(0, 9), "", rng.randint(0, 2**32 - 1),
+                                                    "".join(chr(rng.randint(32, 126)) for _ in range(8)),
+                                                    rng.randint(0, 65535), rng.randint(0, 2**32 - 1)))
+            elif which == 2:
+                pkt = P.pack(P.PT_VOICE, attacker.sid, P.VOICE_HDR.pack(P.INTERCOM_KHZ, attacker.sid,
+                             rng.randint(0, 65535), rng.randint(0, 65535)) + os.urandom(rng.randint(0, 64)))
+            else:
+                pkt = P.pack(P.PT_PING, attacker.sid, os.urandom(rng.randint(0, 300)))
         elif pick == 8:                                  # someone else's session
             pkt = P.pack(P.PT_TEXT, rng.randint(0, 2**32 - 1),
                          P.TEXT_HDR.pack(122800, 0, P.pad("SPOOF", 16), 4, P.pad("", 16)) + b"heyo")

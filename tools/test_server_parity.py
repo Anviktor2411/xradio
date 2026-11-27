@@ -1119,6 +1119,288 @@ def scenario_ducting_off(port):
     return ducting_run(port)
 
 
+# ---------------------------------------------------------------------------
+# 0.7: the shared cockpit, the intercom, the round trip, whoever runs the server
+# ---------------------------------------------------------------------------
+def crews(packets, op=None):
+    """PT_CREW payloads, unpacked, the ones of this op if given -- with the
+    session ids left out, so the two servers' answers compare as behaviour."""
+    out = []
+    for payload in packets:
+        d = P.unpack_crew(payload)
+        if d is None or (op is not None and d["op"] != op):
+            continue
+        out.append(d)
+    return out
+
+
+def crew_summary(d):
+    if d is None:
+        return None
+    return (d["op"], d["role"], d["reason"], d["count"], d["callsign"],
+            [(n, r) for _s, n, r in d["members"]], d["panel"])
+
+
+def voices_from(packets, who):
+    """(freq, which client it came from, seq) for each voice frame; `who` maps sid -> name."""
+    out = []
+    for payload in packets:
+        if len(payload) < P.VOICE_HDR.size:
+            continue
+        freq, sid, seq, _n = P.VOICE_HDR.unpack_from(payload, 0)
+        out.append((freq, who.get(sid, "?"), seq))
+    return out
+
+
+def texts_from(packets, who):
+    out = []
+    for payload in packets:
+        if len(payload) < P.TEXT_HDR.size:
+            continue
+        freq, sid, frm, n, _to = P.TEXT_HDR.unpack_from(payload, 0)
+        out.append((freq, who.get(sid, "?"), P.cstr(frm), payload[P.TEXT_HDR.size:P.TEXT_HDR.size + n].decode()))
+    return out
+
+
+def first_crew(c, op, seconds=0.6):
+    got = crews(c.drain(seconds).get(P.PT_CREW, []), op)
+    return crew_summary(got[0]) if got else None
+
+
+def scenario_crew(port):
+    CF, OTHER = 124300, 119700
+    pic = Client(port, "YLPIC1", 56.92, 24.10, com1=CF)
+    cop = Client(port, "YLCOP1", 57.40, 24.90, com1=OTHER)
+    obs = Client(port, "YLOBS1", 56.93, 24.11, com1=OTHER)
+    out = Client(port, "YLOUT1", 56.95, 24.15, com1=CF)
+    for c in (pic, cop, obs, out):
+        c.login()
+        c.position()
+    who = {pic.sid: "pic", cop.sid: "cop", obs.sid: "obs", out.sid: "out"}
+    time.sleep(0.3)
+    for c in (pic, cop, obs, out):
+        c.drain(0.2)
+    r = {}
+    cop.send(P.PT_CREW, P.crew(P.CREW_JOIN, "YLPIC1", role=P.CREW_ROLE_COPILOT))
+    r["not_open"] = first_crew(cop, P.CREW_REFUSED)
+    cop.send(P.PT_CREW, P.crew(P.CREW_JOIN, "NOSUCH", role=P.CREW_ROLE_COPILOT))
+    r["no_such"] = first_crew(cop, P.CREW_REFUSED)
+    pic.send(P.PT_CREW, P.crew(P.CREW_OPEN, code="ABC"))
+    r["opened"] = first_crew(pic, P.CREW_STATE)
+    cop.send(P.PT_CREW, P.crew(P.CREW_JOIN, "YLPIC1", code="XYZ", role=P.CREW_ROLE_COPILOT))
+    r["bad_code"] = first_crew(cop, P.CREW_REFUSED)
+    cop.send(P.PT_CREW, P.crew(P.CREW_JOIN, "YLPIC1", code="ABC", role=P.CREW_ROLE_COPILOT))
+    r["cop_aboard"] = first_crew(cop, P.CREW_STATE)
+    r["pic_told"] = first_crew(pic, P.CREW_STATE)
+    obs.send(P.PT_CREW, P.crew(P.CREW_JOIN, "YLPIC1", code="ABC", role=P.CREW_ROLE_OBSERVER))
+    r["obs_aboard"] = first_crew(obs, P.CREW_STATE)
+    for _ in range(2):
+        for c in (pic, cop, obs, out):
+            c.position()
+        time.sleep(0.12)
+    for c in (pic, cop, obs, out):
+        c.drain(0.2)
+
+    # the intercom
+    cop.voice(seq=5, freq=P.INTERCOM_KHZ)
+    cop.text("checklist complete", freq=P.INTERCOM_KHZ)
+    time.sleep(0.2)
+    g_pic, g_obs, g_out = pic.drain(0.3), obs.drain(0.3), out.drain(0.3)
+    r["ic_pic"] = (voices_from(g_pic[P.PT_VOICE], who), texts_from(g_pic[P.PT_TEXT], who))
+    r["ic_obs"] = voices_from(g_obs[P.PT_VOICE], who)
+    r["ic_out"] = (voices_from(g_out[P.PT_VOICE], who), texts_from(g_out[P.PT_TEXT], who))
+
+    # the aircraft's radios
+    for i in range(3):
+        cop.voice(seq=100 + i, freq=CF)
+        time.sleep(0.02)
+    time.sleep(0.2)
+    r["cop_tx_out"] = voices_from(out.drain(0.3)[P.PT_VOICE], who)
+    r["cop_tx_pic"] = voices_from(pic.drain(0.3)[P.PT_VOICE], who)
+    obs.voice(seq=200, freq=CF)
+    time.sleep(0.2)
+    r["obs_tx_out"] = voices_from(out.drain(0.3)[P.PT_VOICE], who)
+    time.sleep(0.5)
+    pic.voice(seq=300, freq=CF)
+    cop.voice(seq=301, freq=CF)
+    time.sleep(0.2)
+    r["one_transmitter"] = voices_from(out.drain(0.3)[P.PT_VOICE], who)
+    for c in (pic, cop, obs):
+        c.drain(0.2)
+    time.sleep(0.5)
+    out.text("YLPIC1, traffic two o'clock", freq=CF)
+    out.voice(seq=400, freq=CF)
+    time.sleep(0.2)
+    g = cop.drain(0.3)
+    r["crew_hears_radio"] = (texts_from(g[P.PT_TEXT], who), voices_from(g[P.PT_VOICE], who))
+    cop.text("traffic in sight", freq=CF)
+    time.sleep(0.2)
+    r["cop_text_out"] = texts_from(out.drain(0.3)[P.PT_TEXT], who)
+    for c in (pic, obs):
+        c.drain(0.2)
+
+    # traffic
+    for _ in range(3):
+        for c in (pic, cop, obs, out):
+            c.position()
+        time.sleep(0.12)
+    r["out_sees"] = [t[0] for t in traffic_set(wait_traffic(out, want="YLPIC1"), ("YL",))]
+    r["obs_sees"] = [t[0] for t in traffic_set(wait_traffic(obs, want="YLOUT1"), ("YL",))]
+
+    # the panel
+    for c in (pic, cop, obs):
+        c.drain(0.2)
+    panel = P.crew_panel(CF, 121500, 118100, 121800, P.TX_COM1, P.RX_COM1 | P.RX_COM2,
+                         P.CP_COM1_POWER | P.CP_COM2_POWER, 0.75, 0.5)
+    pic.send(P.PT_CREW, P.crew(P.CREW_PANEL) + panel)
+    r["panel_cop"] = first_crew(cop, P.CREW_PANEL)
+    obs.send(P.PT_CREW, P.crew(P.CREW_TUNE) + P.crew_panel(com1=127905))
+    r["tune_from_obs"] = first_crew(pic, P.CREW_TUNE, 0.3)
+    cop.send(P.PT_CREW, P.crew(P.CREW_TUNE) + P.crew_panel(com1=127905))
+    got = crews(pic.drain(0.5).get(P.PT_CREW, []), P.CREW_TUNE)
+    r["tune_from_cop"] = (crew_summary(got[0]), who.get(got[0]["from_sid"])) if got else None
+    late = Client(port, "YLLAT1", 56.94, 24.12, com1=OTHER)
+    late.login()
+    late.send(P.PT_CREW, P.crew(P.CREW_JOIN, "YLPIC1", code="ABC", role=P.CREW_ROLE_OBSERVER))
+    r["late_panel"] = first_crew(late, P.CREW_PANEL)
+    full = Client(port, "YLFUL1", 56.94, 24.13, com1=OTHER)
+    full.login()
+    full.send(P.PT_CREW, P.crew(P.CREW_JOIN, "YLPIC1", code="ABC", role=P.CREW_ROLE_OBSERVER))
+    r["full"] = first_crew(full, P.CREW_REFUSED)
+    pic.send(P.PT_CREW, P.crew(P.CREW_JOIN, "YLOUT1"))
+    r["busy"] = first_crew(pic, P.CREW_REFUSED)
+
+    # leaving
+    pic.drain(0.2)
+    late.send(P.PT_CREW, P.crew(P.CREW_LEAVE))
+    r["after_leave"] = first_crew(pic, P.CREW_STATE)
+    late.send(P.PT_LOGOUT)
+    obs.drain(0.2)
+    pic.send(P.PT_CREW, P.crew(P.CREW_CLOSE))
+    r["closed"] = first_crew(obs, P.CREW_REFUSED)
+    pic.send(P.PT_CREW, P.crew(P.CREW_OPEN))
+    pic.drain(0.3)
+    cop.send(P.PT_CREW, P.crew(P.CREW_JOIN, "YLPIC1", role=P.CREW_ROLE_COPILOT))
+    cop.drain(0.3)
+    pic.send(P.PT_LOGOUT)
+    r["pilot_left"] = first_crew(cop, P.CREW_REFUSED)
+    for c in (pic, cop, obs, out, late, full):
+        c.close()
+    return r
+
+
+def scenario_ping(port):
+    a = Client(port, "PING01", 54.6, 25.3)
+    a.login()
+    r = {}
+    for name, body in (("counter", P.PING.pack(7, 123456)), ("empty", b""), ("long", b"x" * 40)):
+        a.send(P.PT_PING, body)
+        r[name] = a.recv(P.PT_PONG)
+    a.close()
+    return r
+
+
+def admin_call(c, payload):
+    c.send(P.PT_ADMIN, payload)
+    got = c.recv(P.PT_ADMIN, 0.4)
+    return P.ADMIN.unpack_from(got, 0)[1] if got is not None else None
+
+
+def scenario_admin(port):
+    F = 125600
+    a = Client(port, "LYADM1", 54.63, 25.28, com1=F)
+    b = Client(port, "LYADM2", 54.64, 25.29, com1=F)
+    c = Client(port, "LYADM3", 54.65, 25.30, com1=F)
+    for x in (a, b, c):
+        x.login()
+        x.position()
+    time.sleep(0.3)
+    for x in (a, b, c):
+        x.drain(0.2)
+    r = {"wrong_token": admin_call(a, P.admin(P.ADMIN_MUTE, "guess", target_sid=b.sid)),
+         "mute": admin_call(a, P.admin(P.ADMIN_MUTE, "s3cret", target_sid=b.sid))}
+    r["muted_told"] = texts(b.drain(0.3)[P.PT_TEXT])
+    b.text("can anyone hear me", freq=F)
+    b.voice(seq=1, freq=F)
+    b.text("hi", to="LYADM1")
+    time.sleep(0.2)
+    g = a.drain(0.3)
+    r["muted_heard"] = (texts(g[P.PT_TEXT]), voices(g[P.PT_VOICE]))
+    r["unmute"] = admin_call(a, P.admin(P.ADMIN_UNMUTE, "s3cret", target="LYADM2"))
+    b.drain(0.2)
+    b.text("how about now", freq=F)
+    time.sleep(0.2)
+    r["unmuted_heard"] = texts(a.drain(0.3)[P.PT_TEXT])
+    r["self_kick"] = admin_call(a, P.admin(P.ADMIN_KICK, "s3cret", target_sid=a.sid))
+    r["nobody"] = admin_call(a, P.admin(P.ADMIN_KICK, "s3cret", target="NOSUCH"))
+    a.send(P.PT_ADMIN, P.admin(P.ADMIN_KICK, "s3cret", target_sid=c.sid))
+    rej = c.recv(P.PT_LOGIN_REJECT)
+    r["kicked"] = P.LOGIN_REJECT.unpack_from(rej, 0) if rej else None
+    r["kick_answer"] = (lambda g: P.ADMIN.unpack_from(g, 0)[1] if g else None)(a.recv(P.PT_ADMIN, 0.4))
+    r["back_in"] = c.login() != 0
+    # the limit, from a tool that never logged in (and so is not in the flight)
+    tool = Client(port, "TOOL", 0.0, 0.0)
+    tool.send(P.PT_ADMIN, P.admin(P.ADMIN_LIMIT, "s3cret", value=2), sid=0)
+    got = tool.recv(P.PT_ADMIN, 0.4)
+    r["limit_from_tool"] = P.ADMIN.unpack_from(got, 0)[1] if got else None
+    d = Client(port, "LYADM4", 54.66, 25.31, com1=F)
+    r["over_limit"] = (d.login(), d.rejected)
+    tool.send(P.PT_ADMIN, P.admin(P.ADMIN_LIMIT, "s3cret", value=0), sid=0)
+    tool.recv(P.PT_ADMIN, 0.4)
+    # last, because every client here is 127.0.0.1: kept out means all of them
+    a.send(P.PT_ADMIN, P.admin(P.ADMIN_KICK, "s3cret", target="LYADM3", minutes=10))
+    rej = c.recv(P.PT_LOGIN_REJECT)
+    r["kicked_10"] = P.LOGIN_REJECT.unpack_from(rej, 0) if rej else None
+    a.recv(P.PT_ADMIN, 0.4)
+    r["kept_out"] = (c.login(), c.rejected)
+    for x in (a, b, c, d, tool):
+        x.close()
+    return r
+
+
+def scenario_pilot_limit(port):
+    cs = [Client(port, f"LYLIM{i}", 54.6 + i * 0.01, 25.3) for i in range(3)]
+    r = {"logins": [(c.login() != 0, c.rejected) for c in cs]}
+    r["again"] = cs[0].login() != 0          # somebody already in may log in again
+    cs[1].send(P.PT_LOGOUT)
+    time.sleep(0.2)
+    r["after_one_left"] = (cs[2].login() != 0, cs[2].rejected)
+    for c in cs:
+        c.close()
+    return r
+
+
+def discover(port, payload):
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(0.5)
+    s.sendto(P.pack(P.PT_DISCOVER, 0, payload), ("127.0.0.1", port))
+    try:
+        data, _ = s.recvfrom(2048)
+    except socket.timeout:
+        return None
+    finally:
+        s.close()
+    parsed = P.unpack_header(data)
+    if not parsed or parsed[0] != P.PT_DISCOVER:
+        return None
+    d = P.unpack_discover(parsed[4])
+    d["port_is_ours"] = d.pop("port") == port
+    return d
+
+
+def scenario_lan_search(port):
+    a = Client(port, "LYLAN1", 54.6, 25.3)
+    a.login()
+    r = {"answer": discover(port, P.discover_probe(0xBEEF)),
+         "short_question": discover(port, P.discover_probe(1)[:20])}
+    a.close()
+    return r
+
+
+def scenario_lan_hidden(port):
+    return {"answer": discover(port, P.discover_probe(7))}
+
+
 SCENARIOS = [
     ("login and traffic", scenario_login_and_traffic),
     ("atc v6", scenario_atc_v6),
@@ -1141,11 +1423,22 @@ SCENARIOS = [
     ("direct messages", scenario_direct_message),
     ("roster", scenario_roster),
     ("a big roster", scenario_big_roster),
+    # 0.7
+    ("crew", scenario_crew),
+    ("ping", scenario_ping),
+    ("admin", scenario_admin),
+    ("pilot limit", scenario_pilot_limit),
+    ("lan search", scenario_lan_search),
+    ("lan hidden", scenario_lan_hidden),
 ]
 # scenarios whose server runs with a flight password
 PASSWORDED = {"flight password": "sky"}
 # ...and with other switches, the same on both servers
-EXTRA_ARGS = {"ducting": ["--ducting"]}
+EXTRA_ARGS = {"ducting": ["--ducting"],
+              "admin": ["--admin-token", "s3cret"],
+              "pilot limit": ["--max-pilots", "2"],
+              "lan search": ["--name", "Baltic Wings", "--max-pilots", "8"],
+              "lan hidden": ["--hidden"]}
 
 
 # ---------------------------------------------------------------------------
@@ -1447,6 +1740,87 @@ def main():
     r = cpp["ducting off"]
     check("ducting: off unless asked -- the same weather changes nothing",
           not (r["flags_warm"] or 0) & P.AL_DUCTING and r["warm"] == [], f"{r['flags_warm']} {r['warm']}")
+
+    # 0.7
+    r = cpp["crew"]
+    check("crew: a cockpit that is not open is refused, and says so", r["not_open"] and r["not_open"][2] == P.CREW_NOT_OPEN, str(r["not_open"]))
+    check("crew: so is a pilot who is not in the flight", r["no_such"] and r["no_such"][2] == P.CREW_NO_SUCH, str(r["no_such"]))
+    check("crew: the pilot opens the cockpit, alone in it",
+          r["opened"] and r["opened"][1] == P.CREW_ROLE_PILOT and r["opened"][3] == 1, str(r["opened"]))
+    check("crew: a wrong code is refused", r["bad_code"] and r["bad_code"][2] == P.CREW_BAD_CODE, str(r["bad_code"]))
+    check("crew: the right one gets the copilot aboard, and everyone is told",
+          r["cop_aboard"] and r["cop_aboard"][5] == [("YLPIC1", P.CREW_ROLE_PILOT), ("YLCOP1", P.CREW_ROLE_COPILOT)]
+          and r["pic_told"] and r["pic_told"][3] == 2, f"{r['cop_aboard']} {r['pic_told']}")
+    check("crew: an observer joins too", r["obs_aboard"] and r["obs_aboard"][1] == P.CREW_ROLE_OBSERVER and r["obs_aboard"][3] == 3,
+          str(r["obs_aboard"]))
+    check("intercom: voice and text reach the crew, from who said it",
+          r["ic_pic"] == ([(P.INTERCOM_KHZ, "cop", 5)], [(P.INTERCOM_KHZ, "cop", "YLCOP1", "checklist complete")])
+          and r["ic_obs"] == [(P.INTERCOM_KHZ, "cop", 5)], f"{r['ic_pic']} {r['ic_obs']}")
+    check("intercom: and nobody outside the cockpit, however close", r["ic_out"] == ([], []), str(r["ic_out"]))
+    check("crew: the copilot transmits as the aircraft, one stream numbered by the server",
+          [(f, w) for f, w, _s in r["cop_tx_out"]] == [(124300, "pic")] * 3 and
+          [q for _f, _w, q in r["cop_tx_out"]] == [1, 2, 3], str(r["cop_tx_out"]))
+    check("crew: the pilot hears it in the cockpit, from the copilot",
+          r["cop_tx_pic"] == [(124300, "cop", 100), (124300, "cop", 101), (124300, "cop", 102)], str(r["cop_tx_pic"]))
+    check("crew: an observer has no transmitter", r["obs_tx_out"] == [], str(r["obs_tx_out"]))
+    check("crew: one aircraft, one transmitter", [w for _f, w, _s in r["one_transmitter"]] == ["pic"], str(r["one_transmitter"]))
+    check("crew: they hear what the aircraft's radios hear, wherever their own sims are",
+          r["crew_hears_radio"] == ([(124300, "out", "YLOUT1", "YLPIC1, traffic two o'clock")], [(124300, "out", 400)]),
+          str(r["crew_hears_radio"]))
+    check("crew: the copilot's text goes out as the aircraft",
+          r["cop_text_out"] == [(124300, "pic", "YLPIC1", "traffic in sight")], str(r["cop_text_out"]))
+    check("crew: traffic shows the aircraft, not the crew in it",
+          "YLPIC1" in r["out_sees"] and "YLCOP1" not in r["out_sees"] and "YLOBS1" not in r["out_sees"], str(r["out_sees"]))
+    check("crew: and the crew do not see the aircraft they are in",
+          "YLPIC1" not in r["obs_sees"] and "YLOUT1" in r["obs_sees"], str(r["obs_sees"]))
+    check("crew: the panel reaches the crew untouched",
+          r["panel_cop"] and r["panel_cop"][6] is not None and r["panel_cop"][6][:4] == (124300, 121500, 118100, 121800),
+          str(r["panel_cop"]))
+    check("crew: an observer cannot retune the radios; the copilot can, and the pilot knows who asked",
+          r["tune_from_obs"] is None and r["tune_from_cop"] and r["tune_from_cop"][1] == "cop" and r["tune_from_cop"][0][6][0] == 127905,
+          f"{r['tune_from_obs']} {r['tune_from_cop']}")
+    check("crew: those who join later get the panel at once", r["late_panel"] and r["late_panel"][6] == r["panel_cop"][6])
+    check("crew: four aboard is full", r["full"] and r["full"][2] == P.CREW_FULL, str(r["full"]))
+    check("crew: a pilot with an open cockpit cannot sit in another", r["busy"] and r["busy"][2] == P.CREW_BUSY, str(r["busy"]))
+    check("crew: leaving leaves a seat", r["after_leave"] and "YLLAT1" not in [n for n, _r in r["after_leave"][5]], str(r["after_leave"]))
+    check("crew: closing the cockpit puts the crew off, and tells them", r["closed"] and r["closed"][2] == P.CREW_CLOSED, str(r["closed"]))
+    check("crew: a pilot who leaves takes the cockpit with them", r["pilot_left"] and r["pilot_left"][2] == P.CREW_CLOSED,
+          str(r["pilot_left"]))
+
+    r = cpp["ping"]
+    check("ping: a counter and a clock come back", r["counter"] == P.PING.pack(7, 123456), repr(r["counter"]))
+    check("ping: an empty ping, an empty pong (every client before 0.7)", r["empty"] == b"", repr(r["empty"]))
+    check("ping: at most 16 bytes echoed", r["long"] == b"x" * P.MAX_PING_ECHO, repr(r["long"]))
+
+    r = cpp["admin"]
+    check("admin: a wrong token gets no answer", r["wrong_token"] is None, str(r["wrong_token"]))
+    check("admin: mute is done and the pilot is told",
+          r["mute"] == 1 and any(f == "XRADIO" and "muted" in t for _q, f, t in r["muted_told"]), str(r["muted_told"]))
+    check("admin: and nothing they say reaches anyone, direct messages included", r["muted_heard"] == ([], []), str(r["muted_heard"]))
+    check("admin: unmuted by callsign, heard again",
+          r["unmute"] == 1 and [t for _q, _f, t in r["unmuted_heard"]] == ["how about now"], str(r["unmuted_heard"]))
+    check("admin: nobody can kick themselves, nor a pilot who is not there", r["self_kick"] == 0 and r["nobody"] == 0)
+    check("admin: a kicked pilot is told why", r["kicked"] == (P.RJ_KICKED, 0) and r["kick_answer"] == 1, str(r["kicked"]))
+    check("admin: with no minutes they may come straight back", r["back_in"])
+    check("admin: a tool needs no login to set the limit, and the limit holds",
+          r["limit_from_tool"] == 1 and r["over_limit"] == (0, P.RJ_FULL), str(r["over_limit"]))
+    check("admin: kicked for ten minutes, they are told, and kept out",
+          r["kicked_10"] == (P.RJ_KICKED, 10) and r["kept_out"][0] == 0 and r["kept_out"][1] == P.RJ_KICKED,
+          f"{r['kicked_10']} {r['kept_out']}")
+
+    r = cpp["pilot limit"]
+    check("limit: two get in, the third is told the flight is full",
+          r["logins"] == [(True, None), (True, None), (False, P.RJ_FULL)], str(r["logins"]))
+    check("limit: somebody in logging in again is not one more", r["again"])
+    check("limit: and when somebody leaves there is room", r["after_one_left"] == (True, None), str(r["after_one_left"]))
+
+    r = cpp["lan search"]
+    a = r["answer"] or {}
+    check("lan: the search is answered with the flight, the port, the version",
+          a.get("nonce") == 0xBEEF and a.get("port_is_ours") and a.get("name") == "Baltic Wings"
+          and a.get("version") == P.XRADIO_VERSION and a.get("max_pilots") == 8 and a.get("pilots", 0) >= 1, str(a))
+    check("lan: a short question is never answered", r["short_question"] is None)
+    check("lan: a hidden server does not answer", cpp["lan hidden"]["answer"] is None)
 
     print()
     if failures:

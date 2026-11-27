@@ -43,6 +43,9 @@ static bool shows(const std::vector<std::string>& lines, const std::string& need
     return harness::drawnContains(lines, needle);
 }
 
+// Any Settings will do for its descriptor table: the labels and tabs do not depend on the values.
+static xr::Settings& saved_for_layout() { static xr::Settings s; return s; }
+
 static void dump(const std::vector<std::string>& lines) {
     for (const auto& l : lines) printf("        %s\n", l.c_str());
 }
@@ -536,6 +539,100 @@ int main() {
             draw();
             check("cancel keeps the saved binding", harness::simKey(0x20, true) == 0);
             harness::simKey(0x20, false);
+        }
+
+        // 0.7: a second key row. The key pressed goes to the row that was clicked, and one key does one thing.
+        printf("\nthe intercom key\n");
+        {
+            auto openAudio = [&] {
+                harness::menu(1);
+                draw();
+                int tx = 0, ty = 0;
+                harness::drawnAt("Audio", &tx, &ty);
+                harness::click(kWin, tx + 10, ty);
+                draw();
+            };
+            auto save = [&] {
+                int bx = 0, by = 0;
+                harness::drawnAt("Save & apply", &bx, &by);
+                harness::click(kWin, bx + 20, by);
+                draw();
+            };
+            openAudio();
+            check("clicked the intercom row", clickRow("Intercom key", kValueX + 10));
+            int waiting = 0;
+            for (const auto& l : draw()) if (l.find("press a key") != std::string::npos) ++waiting;
+            check("only that row waits for a key", waiting == 1, std::to_string(waiting) + " rows");
+            harness::pressVk(kWin, 0x49);                   // I
+            check("the key shows on the intercom row", shows(draw(), "[ I ]"));
+            save();
+            xr::Settings saved;
+            xr::loadSettings(saved, kCfgPath);
+            check("it went to the intercom, the PTT kept its own", saved.intercomKey == 0x49 && saved.pttKey == 0x20,
+                  std::to_string(saved.intercomKey) + " / " + std::to_string(saved.pttKey));
+
+            openAudio();
+            clickRow("Intercom key", kValueX + 10);
+            harness::pressVk(kWin, 0x20);                   // Space: the PTT's
+            save();
+            xr::loadSettings(saved, kCfgPath);
+            check("given the PTT's key, the intercom takes it off the PTT", saved.intercomKey == 0x20 && saved.pttKey == 0,
+                  std::to_string(saved.intercomKey) + " / " + std::to_string(saved.pttKey));
+
+            openAudio();                                    // back as it was: Space keys the radio, no intercom key
+            clickRow("Push-to-talk key", kValueX + 10);
+            harness::pressVk(kWin, 0x20);
+            save();
+            xr::loadSettings(saved, kCfgPath);
+            check("and back: the PTT takes it off the intercom", saved.pttKey == 0x20 && saved.intercomKey == 0,
+                  std::to_string(saved.pttKey) + " / " + std::to_string(saved.intercomKey));
+        }
+
+        // Every tab opens with all its rows on screen, the buttons below them -- not cut off under the buttons,
+        // where a hidden row used to take the click meant for Save. The Hosting tab grows for its status text.
+        printf("\nevery tab fits the window it opens in\n");
+        {
+            std::string lastLabel[xr::kNumTabs];
+            for (const auto& f : xr::describe(saved_for_layout())) lastLabel[f.tab] = f.label;
+            auto lastRowAboveButtons = [&](int tab) {
+                int lx = 0, ly = 0, bx = 0, by = 0;
+                return harness::drawnAt(lastLabel[tab], &lx, &ly) && harness::drawnAt("Save & apply", &bx, &by) && ly > by;
+            };
+            // Left on the Audio tab, the longest, and opened again: all of it on the very first frame, before the
+            // window has had a chance to grow.
+            {
+                harness::menu(1);
+                draw();
+                int tx = 0, ty = 0, bx = 0, by = 0;
+                harness::drawnAt("Audio", &tx, &ty);
+                harness::click(kWin, tx + 10, ty);
+                draw();
+                harness::drawnAt("Cancel", &bx, &by);
+                harness::click(kWin, bx + 10, by);
+                draw();
+                harness::menu(1);
+                auto first = draw();
+                check("opened on the longest tab, all of it is there on the first frame", lastRowAboveButtons(1));
+                if (!lastRowAboveButtons(1)) dump(first);
+            }
+            for (int tab = 0; tab < xr::kNumTabs; ++tab) {
+                if (tab == 3 || lastLabel[tab].empty()) continue;
+                int tx = 0, ty = 0;
+                harness::drawnAt(xr::tabName(tab), &tx, &ty);
+                harness::click(kWin, tx + 10, ty);
+                auto lines = draw();                        // the first frame of the tab
+                int lx = 0, ly = 0, bx = 0, by = 0;
+                const bool row = harness::drawnAt(lastLabel[tab], &lx, &ly);
+                const bool btn = harness::drawnAt("Save & apply", &bx, &by);
+                check(std::string(xr::tabName(tab)) + ": its last row is drawn, above the buttons", row && btn && ly > by,
+                      lastLabel[tab] + (row ? " at " + std::to_string(ly) : " not drawn") + ", buttons at " + std::to_string(by));
+                if (!(row && btn && ly > by)) dump(lines);
+            }
+            int bx = 0, by = 0;
+            harness::drawnAt("Cancel", &bx, &by);
+            harness::click(kWin, bx + 10, by);
+            draw();
+            check("and Cancel still closes it", !harness::windowVisible(kWin));
         }
 
         printf("\nkeystrokes keep their order\n");

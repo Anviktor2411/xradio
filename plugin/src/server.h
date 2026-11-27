@@ -44,6 +44,32 @@ constexpr int    kMaxVoiceBytes    = 512;
 constexpr double kAiTimeoutS       = 5.0;
 constexpr int    kMaxAiPerInjector = kMaxEntriesTotal;
 constexpr double kAtcListIntervalS = kRosterIntervalS;
+// 0.7. Kicked addresses remembered at once (the oldest goes first), and what the
+// LAN search is told the flight is called when nobody said.
+constexpr int    kMaxBans          = 64;
+constexpr const char* kDefaultName = "XRadio server";
+
+// How the server runs. The plugin's Hosting tab fills it in; xradio_server takes
+// the same as switches (--max-pilots, --hidden, --name, --admin-token, --ducting).
+struct Options {
+    uint16_t    port = 49100;
+    std::string password;            // empty: anyone may join
+    bool        ducting = false;     // the realism switch (docs/radio.md)
+    // 0.7
+    int         maxPilots = 0;       // 0: no limit
+    bool        visible = true;      // answer the LAN search
+    std::string name;                // what the LAN search is told; empty: kDefaultName
+    bool        hosted = false;      // run inside X-Plane (the LAN search says so)
+    std::string adminToken;          // PT_ADMIN with this kicks and mutes; empty: nobody can
+};
+
+// One logged-in session as the Hosting tab lists it.
+struct PilotInfo {
+    uint32_t    sid = 0;
+    std::string callsign, host;      // host: the address it came from, without the port
+    bool        muted = false, atc = false;
+    uint32_t    crewOf = 0;          // aboard this session's aircraft as crew, 0 = its own
+};
 
 struct Status {
     bool        running = false;
@@ -53,6 +79,8 @@ struct Status {
     uint64_t    packetsOut = 0;
     std::string error;               // why it is not running
     std::vector<std::string> callsigns;   // who is connected, for the window
+    std::vector<PilotInfo> pilots;        // 0.7: the same, with what the host can do something about
+    int         maxPilots = 0;
 };
 
 // Starts the listener and its own thread. Returns false (and fills `err`) if
@@ -60,11 +88,20 @@ struct Status {
 // `password` empty means anyone may join. `ducting` is the realism switch: the
 // flight's shared weather may then bring tropospheric ducting (docs/radio.md).
 bool start(uint16_t port, const std::string& password, std::string* err, bool ducting = false);
+bool start(const Options& options, std::string* err);
 void stop();
 bool running();
 // The realism switch, changed while the server runs -- no restart, so nobody
 // connected is thrown off for it.
 void setDucting(bool on);
+// 0.7: the pilot limit and the LAN search, changed while it runs, also without a restart.
+void setLimits(int maxPilots, bool visible);
+// The admin token of the server running now ("" when none): the plugin sends PT_ADMIN
+// with it over its own connection, so kick and mute go through the code a dedicated
+// server runs, and the parity test holds both to the same answers.
+std::string adminToken();
+// A fresh random token for Options::adminToken (the plugin makes one per hosting session).
+std::string newAdminToken();
 
 Status status();
 

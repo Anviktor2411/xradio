@@ -202,6 +202,34 @@ int main() {
         check(inLog(c, lg) && (c.text = "line up", !inLog(c, lg)), "tower: a live call disappears once the trainer's log has it");
     }
 
+    {   // 0.7: the traffic scope, the connection, readability
+        ScopePoint a = scopePoint(0.0, 10.0, 0.0, 20.0, 100.f);
+        check(std::fabs(a.x) < 0.01f && std::fabs(a.y + 50.f) < 0.01f && a.inside, "scope: 10 nm north on a 20 nm scope, north up: half way up");
+        a = scopePoint(90.0, 20.0, 0.0, 20.0, 100.f);
+        check(std::fabs(a.x - 100.f) < 0.01f && std::fabs(a.y) < 0.01f && a.inside, "scope: 20 nm east, north up: on the right-hand edge");
+        a = scopePoint(90.0, 10.0, 90.0, 20.0, 100.f);
+        check(std::fabs(a.x) < 0.01f && std::fabs(a.y + 50.f) < 0.01f, "scope: heading up, flying east: traffic east is straight ahead");
+        a = scopePoint(270.0, 10.0, 90.0, 20.0, 100.f);
+        check(std::fabs(a.y - 50.f) < 0.01f, "scope: and traffic west is behind");
+        a = scopePoint(0.0, 40.0, 0.0, 20.0, 100.f);
+        check(!a.inside && std::fabs(a.y + 100.f) < 0.01f, "scope: past the edge it is held on the edge, and said to be outside");
+        check(!scopePoint(0.0, 1.0, 0.0, 0.0, 100.f).inside && !scopePoint(NAN, 1.0, 0.0, 20.0, 100.f).inside, "scope: no range or no bearing, nothing drawn");
+        check(relAltText(500.f) == "+05" && relAltText(-1240.f) == "-12" && relAltText(30.f) == "00" && relAltText(25000.f) == "+99",
+              "scope: height above or below in hundreds of feet, as TCAS writes it");
+        check(trafficLevel(3.0, 800.f, 20.0) == 2 && trafficLevel(3.0, 2000.f, 20.0) == 1 && trafficLevel(15.0, 0.f, 20.0) == 1 &&
+              trafficLevel(30.0, 0.f, 20.0) == 0, "scope: proximate within 6 nm and 1200 ft, other traffic in range, nothing past it");
+        Telemetry t;
+        check(telemetryText(t).empty(), "telemetry: nothing measured, nothing said");
+        t.have = true; t.rttMs = 42.4; t.jitterMs = 3.2; t.lossPct = 0; t.voiceLossPct = 1.6;
+        check(telemetryText(t) == "42 ms  jitter 3 ms  lost 0 %  voice lost 2 %", "telemetry: the round trip, its jitter and the losses");
+        check(signalWords(0.95f) == "loud and clear" && signalWords(0.5f) == "readable" && signalWords(0.05f) == "barely readable",
+              "readability: the radio's words for the signal");
+        xr::ui2::setLanguage("et");
+        check(std::string(xr::ui2::tr("Shared cockpit")) == "Jagatud kokpit" && std::string(xr::ui2::tr("Intercom (hold)")) == "Interkom (hoia all)",
+              "0.7 in Estonian: the shared cockpit and the intercom");
+        xr::ui2::setLanguage("en");
+    }
+
     printf(fails ? "%d FAILED\n" : "ui_logic_test OK\n", fails);
     return fails ? 1 : 0;
 }

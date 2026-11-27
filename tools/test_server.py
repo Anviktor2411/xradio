@@ -663,6 +663,8 @@ def run():
         c.close()
 
     radio_scenarios(srv, pump)
+    crew_scenarios(srv, pump)
+    host_scenarios(srv, pump)
 
     for c in (a, b, far, off, mid, stale, bad):
         c.close()
@@ -829,6 +831,336 @@ def radio_scenarios(srv, pump):
 
     for c in (ap1, ap2, ap3, twr, fin, rim, hold, hi, hi2, old, far5, up5, v4, sea1, sea2, wx):
         c.close()
+
+
+def voice(c, freq, seq, opus=b"\x01\x02\x03"):
+    c.send(P.PT_VOICE, P.VOICE_HDR.pack(freq, c.sid, seq, len(opus)) + opus)
+
+
+def voices_for(c, timeout=0.4):
+    """Every voice frame that arrives in the window, as (freq, from session, seq)."""
+    out = []
+    end = time.time() + timeout
+    while time.time() < end:
+        payload = c.recv(P.PT_VOICE, max(0.01, end - time.time()))
+        if payload is None:
+            break
+        f, frm, seq, _n = P.VOICE_HDR.unpack_from(payload, 0)
+        out.append((f, frm, seq))
+    return out
+
+
+def text_freqs_for(c, timeout=0.4):
+    """Every text that arrives, as (freq, from session, from, body)."""
+    out = []
+    end = time.time() + timeout
+    while time.time() < end:
+        payload = c.recv(P.PT_TEXT, max(0.01, end - time.time()))
+        if payload is None:
+            break
+        f, sid, frm, n, _to = P.TEXT_HDR.unpack_from(payload, 0)
+        out.append((f, sid, P.cstr(frm), payload[P.TEXT_HDR.size:P.TEXT_HDR.size + n].decode()))
+    return out
+
+
+def crew_for(c, timeout=0.6, op=None):
+    """The next PT_CREW (of this op, if given), unpacked."""
+    end = time.time() + timeout
+    while time.time() < end:
+        payload = c.recv(P.PT_CREW, max(0.01, end - time.time()))
+        if payload is None:
+            return None
+        d = P.unpack_crew(payload)
+        if d is not None and (op is None or d["op"] == op):
+            return d
+    return None
+
+
+def drain(c, seconds=0.3):
+    end = time.time() + seconds
+    while time.time() < end and c.recv_any(max(0.01, end - time.time())) is not None:
+        pass
+
+
+def crew_scenarios(srv, pump):
+    """0.7, the shared cockpit (docs/crew.md): a pilot opens the cockpit, a copilot
+    and an observer join from their own X-Planes. Over Riga, away from the rest."""
+    CREW_F, OTHER = 124300, 119700
+    print("\n0.7: the shared cockpit")
+    pic = Client("YLPIC1", 56.92, 24.10, com1=CREW_F)
+    cop = Client("YLCOP1", 57.40, 24.90, com1=OTHER)      # its own sim is elsewhere, tuned elsewhere
+    obs = Client("YLOBS1", 56.93, 24.11, com1=OTHER)
+    out = Client("YLOUT1", 56.95, 24.15, com1=CREW_F)     # another aircraft nearby, on the frequency
+    for c in (pic, cop, obs, out):
+        c.login(); c.position()
+    pump(0.3)
+    for c in (pic, cop, obs, out):
+        drain(c, 0.2)
+
+    cop.send(P.PT_CREW, P.crew(P.CREW_JOIN, "YLPIC1", role=P.CREW_ROLE_COPILOT))
+    d = crew_for(cop, op=P.CREW_REFUSED)
+    check("joining a cockpit that is not open is refused, and says why", d is not None and d["reason"] == P.CREW_NOT_OPEN, str(d))
+    cop.send(P.PT_CREW, P.crew(P.CREW_JOIN, "NOSUCH", role=P.CREW_ROLE_COPILOT))
+    d = crew_for(cop, op=P.CREW_REFUSED)
+    check("and one that is not in the flight", d is not None and d["reason"] == P.CREW_NO_SUCH, str(d))
+
+    pic.send(P.PT_CREW, P.crew(P.CREW_OPEN, code="ABC"))
+    d = crew_for(pic, op=P.CREW_STATE)
+    check("the pilot opens the cockpit: alone in it, as the pilot",
+          d is not None and d["count"] == 1 and d["role"] == P.CREW_ROLE_PILOT and d["aircraft_sid"] == pic.sid, str(d))
+    cop.send(P.PT_CREW, P.crew(P.CREW_JOIN, "YLPIC1", code="XYZ", role=P.CREW_ROLE_COPILOT))
+    d = crew_for(cop, op=P.CREW_REFUSED)
+    check("the wrong crew code is refused", d is not None and d["reason"] == P.CREW_BAD_CODE, str(d))
+    cop.send(P.PT_CREW, P.crew(P.CREW_JOIN, "YLPIC1", code="ABC", role=P.CREW_ROLE_COPILOT))
+    d = crew_for(cop, op=P.CREW_STATE)
+    check("the right one gets the copilot aboard", d is not None and d["role"] == P.CREW_ROLE_COPILOT and
+          [(n, r) for _s, n, r in d["members"]] == [("YLPIC1", P.CREW_ROLE_PILOT), ("YLCOP1", P.CREW_ROLE_COPILOT)], str(d))
+    d = crew_for(pic, op=P.CREW_STATE)
+    check("and the pilot is told", d is not None and d["count"] == 2, str(d))
+    obs.send(P.PT_CREW, P.crew(P.CREW_JOIN, "YLPIC1", code="ABC", role=P.CREW_ROLE_OBSERVER))
+    d = crew_for(obs, op=P.CREW_STATE)
+    check("an observer joins too", d is not None and d["count"] == 3 and d["role"] == P.CREW_ROLE_OBSERVER, str(d))
+    pump(0.2)
+    for c in (pic, cop, obs, out):
+        c.position()
+    pump(0.3)
+    for c in (pic, cop, obs, out):
+        drain(c, 0.2)
+
+    print("\n0.7: the intercom")
+    voice(cop, P.INTERCOM_KHZ, 5)
+    pump(0.2)
+    got_pic, got_obs, got_out = voices_for(pic), voices_for(obs), voices_for(out)
+    check("the intercom reaches the pilot, from the copilot", got_pic == [(P.INTERCOM_KHZ, cop.sid, 5)], str(got_pic))
+    check("and the observer", got_obs == [(P.INTERCOM_KHZ, cop.sid, 5)], str(got_obs))
+    check("and nobody outside the cockpit, however close", got_out == [], str(got_out))
+    cop.text("checklist complete", P.INTERCOM_KHZ)
+    pump(0.2)
+    t = text_freqs_for(pic)
+    check("intercom text the same way", t == [(P.INTERCOM_KHZ, cop.sid, "YLCOP1", "checklist complete")], str(t))
+    check("and not outside", text_freqs_for(out, 0.2) == [])
+    voice(out, P.INTERCOM_KHZ, 9)
+    pump(0.2)
+    check("somebody with no crew has no intercom to talk on", voices_for(pic, 0.2) == [])
+
+    print("\n0.7: the crew on the aircraft's radios")
+    for i in range(3):
+        voice(cop, CREW_F, 100 + i)
+        pump(0.02)
+    pump(0.2)
+    heard = voices_for(out)
+    check("the copilot transmits on the aircraft's radio, as the aircraft -- from where it is",
+          len(heard) == 3 and all(f == CREW_F and frm == pic.sid for f, frm, _s in heard), str(heard))
+    seqs = [s for _f, _frm, s in heard]
+    check("numbered by the server, one stream from the aircraft", seqs == sorted(seqs) and len(set(seqs)) == 3, str(seqs))
+    side = voices_for(pic)
+    check("the pilot hears it in the cockpit, from the copilot", len(side) == 3 and all(frm == cop.sid for _f, frm, _s in side), str(side))
+    voice(obs, CREW_F, 200)
+    pump(0.2)
+    check("an observer has no transmitter", voices_for(out, 0.2) == [] and voices_for(pic, 0.2) == [])
+    pump(S.TX_HOLD_S + 0.1)
+    voice(pic, CREW_F, 300)
+    voice(cop, CREW_F, 301)
+    pump(0.2)
+    heard = voices_for(out)
+    check("one aircraft, one transmitter: while the pilot holds it the copilot is not on the air",
+          len(heard) == 1 and heard[0][1] == pic.sid, str(heard))
+    drain(pic); drain(cop); drain(obs)
+    pump(S.TX_HOLD_S + 0.1)
+    out.text("YLPIC1, traffic two o'clock", CREW_F)
+    pump(0.2)
+    t = text_freqs_for(cop)
+    voice(out, CREW_F, 400)
+    pump(0.2)
+    v = voices_for(cop)
+    check("the crew hear what the aircraft's radios hear, though their own sims are elsewhere and tuned elsewhere",
+          t == [(CREW_F, out.sid, "YLOUT1", "YLPIC1, traffic two o'clock")] and v == [(CREW_F, out.sid, 400)], f"{t} {v}")
+    cop.text("traffic in sight", CREW_F)
+    pump(0.2)
+    t = text_freqs_for(out)
+    check("the copilot's text goes out as the aircraft", t == [(CREW_F, pic.sid, "YLPIC1", "traffic in sight")], str(t))
+    drain(pic); drain(obs)
+
+    print("\n0.7: crew are not aircraft of their own")
+    for _ in range(3):
+        for c in (pic, cop, obs, out):
+            c.position()
+        pump(0.12)
+    drain(out, 0.1)
+    seen = out.traffic_callsigns() or []
+    check("traffic shows the aircraft, not the crew sitting in it",
+          "YLPIC1" in seen and "YLCOP1" not in seen and "YLOBS1" not in seen, str(seen))
+    drain(obs, 0.1)
+    seen = obs.traffic_callsigns() or []
+    check("and the crew do not see the aircraft they are in", "YLPIC1" not in seen and "YLOUT1" in seen, str(seen))
+
+    print("\n0.7: the radio panel")
+    drain(cop); drain(obs); drain(pic)
+    panel = P.crew_panel(CREW_F, 121500, 118100, 121800, P.TX_COM1, P.RX_COM1 | P.RX_COM2,
+                         P.CP_COM1_POWER | P.CP_COM2_POWER, 0.8, 0.5)
+    pic.send(P.PT_CREW, P.crew(P.CREW_PANEL) + panel)
+    d1, d2 = crew_for(cop, op=P.CREW_PANEL), crew_for(obs, op=P.CREW_PANEL)
+    check("the pilot's panel reaches the crew, untouched",
+          d1 is not None and d2 is not None and P.CREW_PANEL_REC.pack(*d1["panel"]) == panel and d1["aircraft_sid"] == pic.sid,
+          str(d1))
+    want = P.crew_panel(com1=127905)
+    obs.send(P.PT_CREW, P.crew(P.CREW_TUNE) + want)
+    check("an observer cannot retune the radios", crew_for(pic, 0.3, op=P.CREW_TUNE) is None)
+    cop.send(P.PT_CREW, P.crew(P.CREW_TUNE) + want)
+    d = crew_for(pic, op=P.CREW_TUNE)
+    check("the copilot asks the pilot's sim to retune, and the pilot is told who asked",
+          d is not None and d["from_sid"] == cop.sid and d["panel"][0] == 127905, str(d))
+    late = Client("YLLAT1", 56.94, 24.12, com1=OTHER)
+    late.login(); late.position()
+    late.send(P.PT_CREW, P.crew(P.CREW_JOIN, "YLPIC1", code="ABC", role=P.CREW_ROLE_OBSERVER))
+    d = crew_for(late, op=P.CREW_PANEL)
+    check("crew who join later get the panel straight away", d is not None and P.CREW_PANEL_REC.pack(*d["panel"]) == panel, str(d))
+    full = Client("YLFUL1", 56.94, 24.13, com1=OTHER)
+    full.login()
+    full.send(P.PT_CREW, P.crew(P.CREW_JOIN, "YLPIC1", code="ABC", role=P.CREW_ROLE_OBSERVER))
+    d = crew_for(full, op=P.CREW_REFUSED)
+    check(f"a cockpit takes {P.MAX_CREW}, the pilot included", d is not None and d["reason"] == P.CREW_FULL, str(d))
+    pic.send(P.PT_CREW, P.crew(P.CREW_JOIN, "YLOUT1"))
+    d = crew_for(pic, op=P.CREW_REFUSED)
+    check("a pilot with an open cockpit cannot sit in somebody else's", d is not None and d["reason"] == P.CREW_BUSY, str(d))
+
+    print("\n0.7: leaving the cockpit")
+    drain(pic)
+    late.send(P.PT_CREW, P.crew(P.CREW_LEAVE))
+    d = crew_for(pic, op=P.CREW_STATE)
+    check("crew who leave leave a seat", d is not None and "YLLAT1" not in [n for _s, n, _r in d["members"]], str(d))
+    late.send(P.PT_LOGOUT)
+    drain(obs); drain(cop)
+    pic.send(P.PT_CREW, P.crew(P.CREW_CLOSE))
+    d = crew_for(obs, op=P.CREW_REFUSED)
+    check("the pilot closing the cockpit puts the crew off, and tells them", d is not None and d["reason"] == P.CREW_CLOSED, str(d))
+    pump(0.2)
+    check("after which nobody is crew", not any(x.crew_of for x in srv.sessions.values()))
+    pic.send(P.PT_CREW, P.crew(P.CREW_OPEN))
+    crew_for(pic, op=P.CREW_STATE)
+    cop.send(P.PT_CREW, P.crew(P.CREW_JOIN, "YLPIC1", role=P.CREW_ROLE_COPILOT))
+    crew_for(cop, op=P.CREW_STATE)
+    pic.send(P.PT_LOGOUT)
+    d = crew_for(cop, op=P.CREW_REFUSED)
+    check("a pilot who leaves the flight takes the cockpit with them", d is not None and d["reason"] == P.CREW_CLOSED, str(d))
+    for c in (pic, cop, obs, out, late, full):
+        c.send(P.PT_LOGOUT)
+        c.close()
+    pump(0.2)
+
+
+def host_scenarios(srv, pump):
+    """0.7: whoever runs the server -- the round trip, kick, mute, the pilot limit, the LAN search."""
+    F = 125600
+    print("\n0.7: the round trip")
+    a = Client("LYHST1", 54.63, 25.28, com1=F)
+    b = Client("LYHST2", 54.64, 25.29, com1=F)
+    a.login(); b.login(); a.position(); b.position()
+    pump(0.2)
+    drain(a); drain(b)
+    a.send(P.PT_PING, P.PING.pack(7, 123456))
+    pong = a.recv(P.PT_PONG)
+    check("a ping carrying a counter and a clock comes back with them", pong == P.PING.pack(7, 123456), repr(pong))
+    a.send(P.PT_PING)
+    check("an empty one, as every client before 0.7 sends, comes back empty", a.recv(P.PT_PONG) == b"")
+    a.send(P.PT_PING, b"x" * 40)
+    check("no more than 16 bytes are echoed", a.recv(P.PT_PONG) == b"x" * P.MAX_PING_ECHO)
+
+    print("\n0.7: the admin token")
+    srv.admin_token = "s3cret"
+    a.send(P.PT_ADMIN, P.admin(P.ADMIN_MUTE, "guess", target_sid=b.sid))
+    check("a wrong token gets no answer and does nothing", a.recv(P.PT_ADMIN, 0.3) is None and not srv.by_sid[b.sid].muted)
+    a.send(P.PT_ADMIN, P.admin(P.ADMIN_MUTE, "s3cret", target_sid=b.sid))
+    r = a.recv(P.PT_ADMIN)
+    check("the right one mutes, and says so", r is not None and P.ADMIN.unpack_from(r, 0)[1] == 1 and srv.by_sid[b.sid].muted)
+    t = text_freqs_for(b)
+    check("the muted pilot is told", t and t[0][2] == "XRADIO" and "muted" in t[0][3], str(t))
+    b.text("can anyone hear me", F)
+    voice(b, F, 1)
+    b.send(P.PT_TEXT, P.TEXT_HDR.pack(0, b.sid, P.pad("LYHST2", 16), 2, P.pad("LYHST1", 16)) + b"hi")
+    pump(0.2)
+    check("and nothing they say reaches anyone, direct messages included", text_freqs_for(a, 0.2) == [] and voices_for(a, 0.2) == [])
+    a.send(P.PT_ADMIN, P.admin(P.ADMIN_UNMUTE, "s3cret", target="LYHST2"))
+    a.recv(P.PT_ADMIN)
+    drain(b)
+    b.text("how about now", F)
+    pump(0.2)
+    check("unmuted by callsign, they are heard again", [x[3] for x in text_freqs_for(a)] == ["how about now"])
+    adm = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    adm.settimeout(0.5)
+    adm.sendto(P.pack(P.PT_ADMIN, 0, P.admin(P.ADMIN_LIMIT, "s3cret", value=0)), ("127.0.0.1", PORT))
+    try:
+        data, _ = adm.recvfrom(P.MAX_PACKET)
+        r = P.unpack_header(data)
+    except socket.timeout:
+        r = None
+    check("an admin tool needs no login", r is not None and r[0] == P.PT_ADMIN and P.ADMIN.unpack_from(r[4], 0)[1] == 1)
+    adm.close()
+
+    print("\n0.7: the pilot limit")
+    here = sum(1 for x in srv.sessions.values() if not x.injector)
+    srv.max_pilots = here
+    c = Client("LYHST3", 54.65, 25.30, com1=F)
+    c.sock.sendto(P.pack(P.PT_LOGIN, 0, P.login("LYHST3")), c.dest)
+    r = c.recv(P.PT_LOGIN_REJECT)
+    check("a full flight refuses one more, and says why", r is not None and P.LOGIN_REJECT.unpack_from(r, 0)[0] == P.RJ_FULL)
+    check("but somebody already in can log in again", a.login() != 0)
+    srv.max_pilots = 0
+    check("no limit, and they are in", c.login() != 0)
+
+    print("\n0.7: kick")
+    a.send(P.PT_ADMIN, P.admin(P.ADMIN_KICK, "s3cret", target_sid=c.sid))
+    r = c.recv(P.PT_LOGIN_REJECT)
+    check("a kicked pilot is told why", r is not None and P.LOGIN_REJECT.unpack_from(r, 0)[0] == P.RJ_KICKED)
+    a.recv(P.PT_ADMIN)
+    pump(0.1)
+    check("and is out of the flight", c.sid not in srv.by_sid)
+    check("with no minutes they may come straight back", c.login() != 0)
+    a.send(P.PT_ADMIN, P.admin(P.ADMIN_KICK, "s3cret", target_sid=a.sid))
+    r = a.recv(P.PT_ADMIN)
+    check("nobody can kick themselves", r is not None and P.ADMIN.unpack_from(r, 0)[1] == 0 and a.sid in srv.by_sid)
+    a.send(P.PT_ADMIN, P.admin(P.ADMIN_KICK, "s3cret", target="LYHST3", minutes=10))
+    a.recv(P.PT_ADMIN)
+    r = c.recv(P.PT_LOGIN_REJECT)
+    check("kicked for ten minutes, they are told how long", r is not None and P.LOGIN_REJECT.unpack_from(r, 0) == (P.RJ_KICKED, 10))
+    c.sock.sendto(P.pack(P.PT_LOGIN, 0, P.login("LYHST3")), c.dest)
+    r = c.recv(P.PT_LOGIN_REJECT)
+    check("and the address stays out", r is not None and P.LOGIN_REJECT.unpack_from(r, 0)[0] == P.RJ_KICKED)
+    srv.bans.clear()                     # every client here is 127.0.0.1
+    srv.admin_token = ""
+    a.send(P.PT_ADMIN, P.admin(P.ADMIN_MUTE, "", target_sid=b.sid))
+    check("a server without a token takes no orders, not even with an empty one", a.recv(P.PT_ADMIN, 0.3) is None)
+
+    print("\n0.7: the LAN search")
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    probe.settimeout(0.5)
+
+    def ask(payload):
+        probe.sendto(P.pack(P.PT_DISCOVER, 0, payload), ("127.0.0.1", PORT))
+        try:
+            data, _ = probe.recvfrom(P.MAX_PACKET)
+        except socket.timeout:
+            return None
+        parsed = P.unpack_header(data)
+        return P.unpack_discover(parsed[4]) if parsed and parsed[0] == P.PT_DISCOVER else None
+
+    srv.name, srv.password = "Baltic Wings", ""
+    d = ask(P.discover_probe(0xBEEF))
+    check("a search on the network is answered with what the flight is",
+          d is not None and d["nonce"] == 0xBEEF and d["port"] == PORT and d["name"] == "Baltic Wings"
+          and d["version"] == P.XRADIO_VERSION and d["proto"] == P.PROTO_VERSION and d["pilots"] >= 2, str(d))
+    check("a short question gets no answer: the server never sends more than it was sent",
+          ask(P.discover_probe(1)[:20]) is None)
+    srv.password = "x"
+    d = ask(P.discover_probe(2))
+    check("and it says when a password is needed", d is not None and d["flags"] & P.DF_PASSWORD, str(d))
+    srv.password, srv.visible = "", False
+    check("a hidden server does not answer at all", ask(P.discover_probe(3)) is None)
+    srv.visible = True
+    probe.close()
+    for x in (a, b, c):
+        x.send(P.PT_LOGOUT)
+        x.close()
 
 
 if __name__ == "__main__":

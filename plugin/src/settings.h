@@ -5,6 +5,7 @@
 // shown, or shown but not saved.
 #pragma once
 
+#include <cctype>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -31,6 +32,16 @@ struct Settings {
     float       reportHz   = 5.f;          // position reports per second
     float       smoothMs   = 350.f;        // interpolation delay
 
+    // --- shared cockpit (0.7, docs/crew.md) ---
+    // "off"; "pilot": my cockpit takes a crew; "join": I sit in crewJoin's cockpit.
+    std::string crewMode   = "off";
+    std::string crewJoin;                  // the pilot whose cockpit, by callsign
+    std::string crewRole   = "copilot";    // copilot (talks on the radios) / observer (listens)
+    std::string crewCode;                  // a pilot sets it; crew must give the same one
+    // As crew: my sim's radio panel follows the aircraft's, and a knob I turn
+    // asks the pilot's sim to turn it (a copilot's) -- off, my panel is my own.
+    bool        crewSyncRadios = true;
+
     // --- audio ---
     std::string micDevice;                 // empty = system default
     std::string outDevice;
@@ -45,6 +56,12 @@ struct Settings {
     // The other pilot's cockpit, as their microphone hears it, under their
     // voice. 0 for a studio.
     float       cabinNoise = 0.3f;
+    // 0.7: more of the radio sound, each a switch
+    bool        pttClick   = true;         // a click in the headset as you key and unkey
+    bool        squelchTail = true;        // the squelch's burst and click
+    bool        crackle    = true;         // static crashes on a weak signal
+    float       intercomVolume = 0.8f;     // the cockpit intercom's own knob
+    int         intercomKey = 0;           // key that keys the intercom; 0 = none
     // With the window closed a pilot sees nothing at all: no radio log, no
     // sign that anybody called. A small notice in the corner is the whole of
     // what they get, so it is on by default.
@@ -62,6 +79,10 @@ struct Settings {
     // shared weather may bring tropospheric ducting, and VHF reaches far past
     // the horizon over the sea (docs/radio.md). Rare, and off unless asked.
     bool        hostDucting = false;
+    // 0.7: the flight this server carries -- how many may join (0 = any number),
+    // and whether XRadio's search on the local network finds it.
+    float       hostMaxPilots = 0.f;
+    bool        hostVisible = true;
     // One sim decides the sky for everyone who wants it. Which one is settled
     // by the server, first come: on a flight hosted in X-Plane that is
     // naturally the host, but on a dedicated server -- which has no weather of
@@ -79,6 +100,11 @@ struct Settings {
     // library another traffic plugin already installed. A path here overrides
     // that search.
     std::string cslPath = "";
+    // 0.7: other pilots on X-Plane's map and on TCAS (both through XPMP2), and
+    // the traffic scope window's range.
+    bool        showOnMap = true;
+    bool        tcasTargets = true;
+    float       scopeRangeNm = 20.f;
 
     // --- ATC (v6) ---
     // Computer-flown aircraft an ATC program drives (TowerTrainer's traffic)
@@ -100,6 +126,8 @@ struct Settings {
     std::string fpRoute   = "DCT";
     std::string fpRemarks;
     std::string simbriefUser;              // SimBrief username or pilot ID (S3); local only, never sent anywhere but SimBrief
+    // 0.7: quick-tune slots, "TWR=118.100;GND=121.800" -- up to eight, a label and a frequency each
+    std::string presets = "GUARD=121.500";
 
     // --- Tower mode (TowerTrainer) ---
     std::string towerHost = "127.0.0.1";
@@ -124,6 +152,8 @@ struct Settings {
     std::string uiOverlayPos;              // remembered overlay position "l,t"
     std::string uiTab = "0";               // remembered tab
     std::string towerLayout;               // remembered Tower windows "l,t,r,b|..." (radar, strips, Delivery, frequency, ops, banner)
+    bool        uiTraffic = false;         // 0.7: the traffic scope window is open
+    std::string uiTrafficWin;              // ...and where it was "l,t,r,b"
 
     int         port_i() const { return atoi(port.c_str()); }
     int         hostPort_i() const { return atoi(hostPort.c_str()); }
@@ -176,6 +206,11 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"autoconnect", "Connect on startup", Kind::Bool, 0, &s.autoConnect},
         {"reporthz",  "Report rate",    Kind::Slider, 0, &s.reportHz,   1.f, 10.f, " Hz", 0},
         {"smoothms",  "Smoothing delay", Kind::Slider, 0, &s.smoothMs, 100.f, 1000.f, " ms", 0},
+        {"crewmode",  "Shared cockpit (off, pilot, join)", Kind::Text, 0, &s.crewMode, 0,0,"",0, 5},
+        {"crewjoin",  "Pilot to join (callsign)", Kind::Text, 0, &s.crewJoin, 0,0,"",0, 15},
+        {"crewrole",  "Role (copilot, observer)", Kind::Text, 0, &s.crewRole, 0,0,"",0, 8},
+        {"crewcode",  "Crew code",       Kind::Text,   0, &s.crewCode,   0,0,"",0, 15},
+        {"crewsync",  "My radios follow the aircraft's", Kind::Bool, 0, &s.crewSyncRadios},
 
         {"mic",       "Microphone",     Kind::Choice, 1, &s.micDevice},
         {"speakers",  "Output",         Kind::Choice, 1, &s.outDevice},
@@ -186,7 +221,12 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"cabinnoise", "Cockpit noise in transmissions", Kind::Slider, 1, &s.cabinNoise,
                        0.f, 1.f, "%", 0},
         {"radiofilter", "Radio sound (limiter, squelch, filter)", Kind::Bool, 1, &s.radioFilter},
+        {"pttclick",  "Click when keying", Kind::Bool, 1, &s.pttClick},
+        {"squelchtail", "Squelch burst and click", Kind::Bool, 1, &s.squelchTail},
+        {"crackle",   "Static crackle on weak signals", Kind::Bool, 1, &s.crackle},
+        {"icvolume",  "Intercom volume", Kind::Slider, 1, &s.intercomVolume, 0.f, 1.f, "%", 0},
         {"pttkey",    "Push-to-talk key", Kind::KeyBind, 1, &s.pttKey},
+        {"intercomkey", "Intercom key",  Kind::KeyBind, 1, &s.intercomKey},
         {"popups",    "Show messages when the window is closed", Kind::Bool, 1,
                       &s.popUps},
 
@@ -196,6 +236,9 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"range",       "Traffic range", Kind::Slider, 2, &s.trafficRangeNm, 5.f, 200.f, " nm", 0},
         {"cslpath",     "CSL folder (blank = find one)", Kind::Text, 2, &s.cslPath,
                         0, 0, "", 0, 255},
+        {"showonmap",   "Traffic on X-Plane's map", Kind::Bool, 2, &s.showOnMap},
+        {"tcastargets", "Traffic on TCAS", Kind::Bool, 2, &s.tcasTargets},
+        {"scoperange",  "Traffic scope range", Kind::Slider, 2, &s.scopeRangeNm, 2.f, 80.f, " nm", 0},
         {"shareweather",  "Offer my weather and time to the flight", Kind::Bool, 2,
                           &s.shareWeather},
         {"followweather", "Fly the flight's weather and time", Kind::Bool, 2,
@@ -205,6 +248,8 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"hostport",    "Port to host on",    Kind::Text, 3, &s.hostPort, 0,0,"",0, 5, true},
         {"hostupnp",    "Ask the router to open it", Kind::Bool, 3, &s.hostUpnp},
         {"hostducting", "Rare tropospheric ducting (realism)", Kind::Bool, 3, &s.hostDucting},
+        {"hostmax",     "Most pilots (0 = no limit)", Kind::Slider, 3, &s.hostMaxPilots, 0.f, 32.f, "", 0},
+        {"hostvisible", "Findable on this network", Kind::Bool, 3, &s.hostVisible},
 
         {"showai",      "List computer-flown aircraft (AI)", Kind::Bool, 4, &s.showAiTraffic},
         {"aimax",       "Computer-flown aircraft drawn", Kind::Slider, 4, &s.aiMax, 0.f, 60.f, "", 0},
@@ -217,6 +262,7 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"fproute",     "Route",          Kind::Text, 4, &s.fpRoute, 0,0,"",0, 127},
         {"fpremarks",   "Remarks",        Kind::Text, 4, &s.fpRemarks, 0,0,"",0, 63},
         {"simbriefuser", "SimBrief username or pilot ID", Kind::Text, 4, &s.simbriefUser, 0,0,"",0, 63},
+        {"presets",     "Quick-tune (NAME=118.100;...)", Kind::Text, 4, &s.presets, 0,0,"",0, 255},
 
         {"towerhost",   "TowerTrainer address", Kind::Text, 5, &s.towerHost, 0,0,"",0, 63},
         {"towerport",   "Tower link port", Kind::Text, 5, &s.towerPort, 0,0,"",0, 5, true},
@@ -239,6 +285,8 @@ inline std::vector<FieldRef> describe(Settings& s) {
         {"uioverlaypos", "Overlay position", Kind::Text, 6, &s.uiOverlayPos, 0,0,"",0, 20},
         {"uitab",       "Last tab",       Kind::Text, 6, &s.uiTab, 0,0,"",0, 2, true},
         {"towerlayout", "Tower windows",  Kind::Text, 6, &s.towerLayout, 0,0,"",0, 255},
+        {"uitraffic",   "Traffic scope window", Kind::Bool, 6, &s.uiTraffic},
+        {"uitrafficwin", "Traffic window geometry", Kind::Text, 6, &s.uiTrafficWin, 0,0,"",0, 40},
     };
 }
 
@@ -376,6 +424,19 @@ inline bool loadSettings(Settings& s, const std::string& path) {
 // Anything the user could have hand-edited into nonsense.
 inline std::string validate(const Settings& s) {
     if (detail::trim(s.callsign).empty())  return "Callsign cannot be empty";
+    // 0.7: the shared cockpit
+    if (s.crewMode != "off" && s.crewMode != "pilot" && s.crewMode != "join")
+        return "Shared cockpit is off, pilot or join";
+    if (s.crewMode == "join" && detail::trim(s.crewJoin).empty())
+        return "To join a cockpit, give the pilot's callsign";
+    if (s.crewMode == "join") {
+        std::string a = detail::trim(s.crewJoin), b = detail::trim(s.callsign);
+        for (char& c : a) c = (char)toupper((unsigned char)c);
+        for (char& c : b) c = (char)toupper((unsigned char)c);
+        if (a == b) return "That is your own callsign: to take a crew, choose pilot";
+    }
+    if (s.crewRole != "copilot" && s.crewRole != "observer")
+        return "Crew role is copilot or observer";
     if (s.hostEnabled) {
         const int hp = s.hostPort_i();
         if (hp < 1 || hp > 65535)          return "Host port must be 1-65535";

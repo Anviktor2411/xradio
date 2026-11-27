@@ -24,6 +24,11 @@ void resetPositions();
 std::string mainGeometry();                                     // "l,t,r,b"
 std::string overlayPosition();                                  // "l,t"
 int  currentTab();
+// 0.7: the traffic scope's window -- created after the tower's, so every window keeps its number
+void initTraffic(const std::string& geometry, bool visible);
+void showTraffic(bool on);
+bool trafficVisible();
+std::string trafficGeometry();                                  // "l,t,r,b", "" while popped out or in VR
 
 // Tower mode's windows (ground radar, strips, Delivery, frequency, ATIS / operations, the connection banner):
 // created hidden, shown and hidden every frame from the tower's state. The five work windows open once the

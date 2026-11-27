@@ -180,6 +180,26 @@ std::string Peer::text() const {
     return std::string(host) + ":" + serv;
 }
 
+std::string Peer::host() const {
+    if (len <= 0) return "";
+    char h[NI_MAXHOST] = {0};
+    if (getnameinfo((const sockaddr*)addr, (socklen_t)len, h, sizeof(h), nullptr, 0, NI_NUMERICHOST) != 0)
+        return "";
+    return h;
+}
+
+bool makePeer(const std::string& ip, uint16_t port, Peer* out) {
+    if (!out) return false;
+    sockaddr_in a{};
+    a.sin_family = AF_INET;
+    a.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip.c_str(), &a.sin_addr) != 1) return false;
+    *out = Peer{};
+    memcpy(out->addr, &a, sizeof(a));
+    out->len = (int)sizeof(a);
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // UdpServerSocket
 // ---------------------------------------------------------------------------
@@ -327,6 +347,16 @@ bool UdpServerSocket::sendTo(const Peer& to, const void* data, int len) {
 #endif
         (const sockaddr*)to.addr, (socklen_t)to.len);
     return n == len;
+}
+
+bool UdpServerSocket::enableBroadcast() {
+    if (fd_ == XR_INVALID) return false;
+    int on = 1;
+#ifdef _WIN32
+    return setsockopt((SOCKET)fd_, SOL_SOCKET, SO_BROADCAST, (const char*)&on, sizeof(on)) == 0;
+#else
+    return setsockopt((int)fd_, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on)) == 0;
+#endif
 }
 
 // Ask the routing table which local address would be used to reach the wider

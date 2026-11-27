@@ -31,6 +31,7 @@ enum class Mode {
 struct OutFrame {
     uint16_t seq;
     std::vector<uint8_t> opus;
+    bool     intercom = false;   // 0.7: for the cockpit intercom, not the radio (decided as it was encoded)
 };
 
 struct Stats {
@@ -83,6 +84,48 @@ void releaseMicrophone();
 
 void setTransmitting(bool on);   // PTT
 bool transmitting();
+
+// --- 0.7: the cockpit intercom (docs/crew.md) -------------------------------
+// The intercom's own push-to-talk. Frames encoded while it is down and the radio
+// PTT is not come out of pollOutgoing() marked `intercom`; with both down the
+// radio wins, as it does on a real audio panel. Talking on the intercom does not
+// make the radio half duplex: you still hear the COMs.
+void setIntercomTransmit(bool on);
+bool intercomTransmitting();
+// Incoming voice on kIntercomKhz is the intercom: its own volume, and none of the
+// radio's squelch, noise, capture or break-up -- it is a wire, not a radio. It is
+// heard while you transmit on the radio, too.
+void setIntercomVolume(float v);   // 0..1
+std::vector<uint32_t> activeIntercomSpeakers();
+
+// Who is coming in right now, radio and intercom, for the window: the frequency,
+// the signal and its level at the receiver.
+struct SpeakerInfo {
+    uint32_t sid = 0;
+    uint32_t freqKhz = 0;
+    float    quality = 1.f;      // 1 next door, 0 at the edge of coverage
+    float    levelDbm = 0.f;
+    bool     intercom = false;
+};
+std::vector<SpeakerInfo> speakers();
+
+// --- 0.7: more of the radio sound, each one a switch ------------------------
+void setSquelchTail(bool on);    // the burst and click as the squelch opens and closes (default on)
+void setPttClick(bool on);       // a click in your own headset as you key and unkey (default off here;
+                                 // the plugin's setting turns it on)
+void setCrackle(bool on);        // static crashes on a weak signal, more of them towards the horizon
+                                 // (default off here; on in the plugin's settings)
+
+// --- 0.7: the microphone test ------------------------------------------------
+// Hold to record (nothing is sent anywhere), let go to hear it back -- through
+// the Opus codec and the whole radio chain, exactly as the others hear you. Six
+// seconds at most; keying the radio or the intercom ends it. Main thread.
+enum class MicTest { Idle, Recording, Playing };
+constexpr float kMicTestMaxS = 6.f;
+bool    startMicTest();          // false while transmitting, or without a codec
+void    stopMicTest();           // recording -> playing; playing -> stopped
+MicTest micTest();
+float   micTestSeconds();        // recorded so far, or left to play
 
 // A frame from another pilot, in the order the network delivered them.
 // `freqKhz` is the frequency it came in on, so the cockpit's per-radio
@@ -148,6 +191,8 @@ Stats stats();
 // as the audio devices would. Only meaningful in Mode::NoDevices.
 void testCapture(const int16_t* samples, int count);
 void testRender(int16_t* out, int count);
+// The receiver's random numbers from a fixed start, so a test of the static is repeatable.
+void testSeed(uint32_t seed);
 
 }  // namespace voice
 }  // namespace xr

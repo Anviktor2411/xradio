@@ -10,11 +10,10 @@
 #include <cstring>
 
 #include "XPLMGraphics.h"
+#include "version.h"   // version(): the one place it lives
 
 namespace xr {
 namespace brand {
-
-inline const char* version() { return "0.6.1"; }
 
 // Width of one character of the fixed-pitch font, asked of X-Plane once.
 inline int charWidth() {

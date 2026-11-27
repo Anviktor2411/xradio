@@ -29,6 +29,7 @@
 #include "acftype.h"
 #include "tcasread.h"
 #include "crashlog.h"
+#include "cockpit.h"
 #ifdef XRADIO_UI_IMGUI
 #  include "ui2/host.h"
 #  include "ui2/imgui_assert.h"
@@ -56,6 +57,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <random>
 #include <string>
 #include <thread>
 #include <vector>
@@ -138,6 +140,7 @@ struct Refs {
     XPLMDataRef gear, flap, onGround;
     XPLMDataRef com1, com2, audioComSel, rxCom1, rxCom2, volCom1, volCom2;
     XPLMDataRef com1Hz, com2Hz;         // the 25 kHz radios of a sim before 11.30
+    XPLMDataRef com1Stby, com2Stby;     // 0.7: standby, 8.33 kHz (the crew's panel carries them)
     XPLMDataRef ltNav, ltBeacon, ltStrobe, ltLanding, ltTaxi;
     XPLMDataRef avionicsOn, com1Power, com2Power, busVolts;
     XPLMDataRef xpdrMode, xpdrCode, xpdrIdent;
@@ -202,6 +205,8 @@ void findRefs() {
         g_ref.com2Hz  = findRef("sim/cockpit2/radios/actuators/com2_frequency_hz");
         logMsg("no 8.33 kHz radio datarefs (X-Plane before 11.30) -- using the 25 kHz ones");
     }
+    g_ref.com1Stby    = firstRefOf({"sim/cockpit2/radios/actuators/com1_standby_frequency_hz_833"});
+    g_ref.com2Stby    = firstRefOf({"sim/cockpit2/radios/actuators/com2_standby_frequency_hz_833"});
     g_ref.audioComSel = findRef("sim/cockpit2/radios/actuators/audio_com_selection");
     g_ref.rxCom1      = findRef("sim/cockpit2/radios/actuators/audio_selection_com1");
     g_ref.rxCom2      = findRef("sim/cockpit2/radios/actuators/audio_selection_com2");
@@ -296,6 +301,26 @@ uint32_t comKhz(int which) {
 
 // The radio the audio panel has selected for transmit: 6 is COM1, 7 is COM2.
 int txCom() { return id(g_ref.audioComSel) == 7 ? 2 : 1; }
+
+// 0.7: the standby frequencies, and writing frequencies without a word in the radio
+// log -- the crew's panel follows the aircraft's that way, many times a flight.
+uint32_t standbyKhz(int which) {
+    XPLMDataRef r = which == 2 ? g_ref.com2Stby : g_ref.com1Stby;
+    return r ? (uint32_t)XPLMGetDatai(r) : 0;
+}
+void setStandbyKhz(int which, uint32_t khz) {
+    XPLMDataRef r = which == 2 ? g_ref.com2Stby : g_ref.com1Stby;
+    if (r && khz) XPLMSetDatai(r, (int)khz);
+}
+bool writeComKhz(int which, uint32_t khz) {
+    if (khz == 0) return false;
+    XPLMDataRef fine   = (which == 2) ? g_ref.com2   : g_ref.com1;
+    XPLMDataRef coarse = (which == 2) ? g_ref.com2Hz : g_ref.com1Hz;
+    if (fine)        XPLMSetDatai(fine, (int)khz);
+    else if (coarse) XPLMSetDatai(coarse, (int)(khz / 10u));
+    else return false;
+    return true;
+}
 
 // Our own transponder, as it would answer an interrogation.
 //
@@ -442,6 +467,7 @@ struct Remote {
     // (docs/radio.md); unknown from a server that sends 108-byte entries.
     float       aglM = 0.f;
     bool        aglKnown = false;
+    float       vsMs = 0.f, track = 0.f;   // 0.7: for the traffic scope's arrows
 };
 
 std::map<uint32_t, Remote> g_remote;
@@ -517,6 +543,11 @@ bool isAtcStation(const std::string& callsign) {
     for (const auto& s : g_atcList) if (s.callsign == callsign) return true;
     return false;
 }
+
+// 0.7: the radios as they count for us -- as crew aboard somebody's aircraft, its
+// (the shared cockpit, below).
+uint32_t comKhzEff(int which);
+int      txComEff();
 
 // Defined with the hosting and settings code further down; the main window
 // needs them.
@@ -613,6 +644,7 @@ float            g_elapsed      = 0.f;
 float            g_lastLogin    = -99.f;
 float            g_firstLogin   = -1.f;     // when this connection attempt began
 std::string      g_loginProblem;            // why the server will not have us
+bool             g_kickedHold = false;      // 0.7: kicked with no minutes -- no automatic login until Reconnect
 std::string      g_loginIcao, g_loginLivery;   // what the current session was logged in as
 float            g_lastRxTime   = -99.f;
 bool             g_pttDown      = false;
@@ -662,6 +694,9 @@ bool  g_mainCopyOk = false;             // ...and whether the clipboard took it
 XPLMWindowID     g_window       = nullptr;
 XPLMFlightLoopID g_loop         = nullptr;
 XPLMCommandRef   g_cmdPtt       = nullptr;
+XPLMCommandRef   g_cmdIntercom  = nullptr;   // 0.7
+XPLMCommandRef   g_cmdTraffic   = nullptr;
+XPLMCommandRef   g_cmdPreset[8] = {};
 XPLMMenuID       g_menu         = nullptr;
 bool             g_enabled      = false;   // between XPluginEnable and XPluginDisable: the flight loop runs
 
@@ -703,6 +738,7 @@ void runDeferred() {
 // settings window below). Two presses before the loop runs save the later one, once.
 Settings g_applyWanted;
 bool     g_applyQueued = false;
+float    g_saveAt = -1.f;            // 0.7: settings changed outside Apply (a slider), saved once it rests
 void runApply();
 void requestApply(const Settings& s) {
     g_applyWanted = s;
@@ -988,6 +1024,7 @@ void sendPosition() {
 // to and a pilot should know that before they say something on it.
 std::string freqLabel(uint32_t khz) {
     if (xr::isGuard(khz)) return "GUARD 121.500";
+    if (xr::isIntercom(khz)) return "INTERCOM";
     char buf[24];
     snprintf(buf, sizeof(buf), "%.3f", (double)(khz % 1000000u) / 1000.0);
     return buf;
@@ -1017,8 +1054,16 @@ std::string splitDirect(const std::string& in, std::string* body) {
 void sendText(const std::string& text) {
     if (!g_connected || text.empty()) return;
 
+    // 0.7: "/ic ..." goes on the cockpit intercom
+    bool intercom = false;
+    std::string said = text;
+    if (said.size() > 4 && (said.compare(0, 4, "/ic ") == 0 || said.compare(0, 4, "/IC ") == 0)) {
+        intercom = true;
+        said = said.substr(4);
+    }
     std::string body;
-    const std::string to = splitDirect(text, &body);
+    const std::string to = intercom ? std::string() : splitDirect(said, &body);
+    if (intercom) body = said;
     if (body.empty()) return;
 
     uint8_t buf[xr::kMaxPacket];
@@ -1030,7 +1075,7 @@ void sendText(const std::string& text) {
     // are tuned there before relaying. A message addressed to a callsign
     // names no radio at all -- it is not a transmission.
     xr::TextHeader th{};
-    th.freqKhz     = to.empty() ? comKhz(txCom()) : 0u;
+    th.freqKhz     = intercom ? xr::kIntercomKhz : to.empty() ? comKhzEff(txComEff()) : 0u;
     th.fromSession = g_sessionId;
     strncpy(th.from, g_cfg.callsign.c_str(), sizeof(th.from) - 1);
     th.textLen     = len;
@@ -1134,6 +1179,8 @@ void handleTraffic(const uint8_t* payload, int len) {
         r.xpdrIdent = e.xpdrIdent ? 1 : 0;
         r.aglM      = e.aglM;
         r.aglKnown  = v6;
+        r.vsMs      = e.vsMs;
+        r.track     = e.trackTrue;
         r.lastSeen  = g_elapsed;
 
         xr::RemoteState st;
@@ -1162,8 +1209,9 @@ void handleTraffic(const uint8_t* payload, int len) {
         // aircraft are still out of the window, but the TCAS display is
         // blank -- so their mode is passed on as standby, which is exactly
         // what XPMP2 reads as "not a TCAS target".
-        st.xpdrMode = xr::xpdrTransmitting(ownXpdrMode()) ? r.xpdrMode
-                                                          : (uint8_t)xr::XPDR_STANDBY;
+        // 0.7: and the pilot can keep them off TCAS altogether (Settings > Traffic).
+        st.xpdrMode = (g_cfg.tcasTargets && xr::xpdrTransmitting(ownXpdrMode())) ? r.xpdrMode
+                                                                                : (uint8_t)xr::XPDR_STANDBY;
         st.xpdrIdent = r.xpdrIdent != 0;
         // Computer-flown aircraft over the cap are kept in the list but not
         // in the sky; the cap is applied below, nearest first, once the
@@ -1363,12 +1411,7 @@ void cancelFlightPlan() {
 // Tune a radio from the ATC list: COM1 for a station, COM2 for an ATIS. The
 // 8.33 kHz dataref takes kHz; the older 25 kHz one takes units of 10 kHz.
 void tuneRadio(int which, uint32_t khz) {
-    if (khz == 0) return;
-    XPLMDataRef fine   = (which == 2) ? g_ref.com2   : g_ref.com1;
-    XPLMDataRef coarse = (which == 2) ? g_ref.com2Hz : g_ref.com1Hz;
-    if (fine)        XPLMSetDatai(fine, (int)khz);
-    else if (coarse) XPLMSetDatai(coarse, (int)(khz / 10u));
-    else return;
+    if (!writeComKhz(which, khz)) return;
     char line[96];
     snprintf(line, sizeof(line), "COM%d tuned to %s", which, freqLabel(khz).c_str());
     addChat(line);
@@ -1400,6 +1443,8 @@ void handleText(const uint8_t* payload, int len) {
     const bool fromAtc = isAtcStation(from);
     if (!to.empty()) {
         snprintf(line, sizeof(line), "[direct] %s: %s", from.c_str(), msg.c_str());
+    } else if (xr::isIntercom(th.freqKhz)) {
+        snprintf(line, sizeof(line), "[intercom] %s: %s", from.c_str(), msg.c_str());
     } else if (fromAtc) {
         snprintf(line, sizeof(line), "[%s] ATC %s: %s", freqLabel(th.freqKhz).c_str(),
                  from.c_str(), msg.c_str());
@@ -1443,6 +1488,19 @@ std::vector<bool>                     g_rosterHave;
 // build -- and then the @ list offers the aircraft in the traffic list.
 constexpr float kRosterFreshS = 15.f;
 bool rosterFresh() { return g_elapsed - g_rosterAt < kRosterFreshS; }
+
+// Who a voice comes from, by name. The radio reaches past the 80 nm that
+// traffic is sent within (README, "Two ranges, on purpose"), so a pilot far
+// away can be heard after their aircraft has left g_remote. The roster lists
+// everyone in the flight whatever the distance, so the callsign comes from
+// there; only a sid nobody has named yet is shown as "unknown station".
+std::string speakerName(uint32_t sid) {
+    auto it = g_remote.find(sid);
+    if (it != g_remote.end() && !it->second.callsign.empty()) return it->second.callsign;
+    for (const auto& p : g_roster)
+        if (p.sid == sid && !p.callsign.empty()) return p.callsign;
+    return "unknown station";
+}
 
 // What comes after "@" has to be something splitDirect() will accept, so a
 // name that could not be typed back is not offered.
@@ -1564,6 +1622,509 @@ void atComplete(const std::string& callsign) {
 }
 
 // ---------------------------------------------------------------------------
+// 0.7: the shared cockpit (docs/crew.md)
+// ---------------------------------------------------------------------------
+// One pilot opens their cockpit (Shared cockpit: pilot); a copilot or an observer
+// joins it from their own X-Plane (Shared cockpit: join, with the pilot's
+// callsign). The server keeps who is aboard; this keeps asking until it is so,
+// follows the aircraft's radio panel as crew, and sends it as the pilot.
+struct CrewSeat { uint32_t sid = 0; std::string callsign; uint8_t role = 0; };
+struct CrewClient {
+    bool        aboard = false;          // the server says we are in a cockpit (our own open one, or theirs)
+    uint8_t     role = 0;                // xr::CrewRole, ours
+    uint32_t    aircraftSid = 0;
+    std::string aircraft;                // its callsign
+    std::vector<CrewSeat> seats;         // the pilot first
+    float       stateAt = -1000.f;       // when the server last said so
+    std::string problem;                 // the last refusal, in words
+    float       askedAt = -1000.f;       // the last OPEN / JOIN / CLOSE / LEAVE we sent
+    // as crew: the aircraft's panel, and what we last wrote into our own sim
+    bool        havePanel = false;
+    xr::CrewPanel panel{};
+    float       panelAt = -1000.f;
+    bool        wroteValid = false;
+    xr::CrewPanel wrote{};
+    float       tuneSentAt = -1000.f;
+    xr::CrewPanel tuneSent{};
+    // as pilot: the panel as last sent
+    xr::CrewPanel sentPanel{};
+    float       panelSentAt = -1000.f;
+};
+CrewClient g_crew;
+bool       g_icDown = false;             // the intercom's push-to-talk
+float      g_icRefusedAt = -1000.f;      // "no crew aboard" said, so it is not said every press
+
+// Aboard somebody else's aircraft, with its panel: the radios that count are its.
+bool crewAboardOther() {
+    return g_crew.aboard && g_crew.role != xr::CREW_ROLE_PILOT && g_crew.havePanel;
+}
+bool crewHasOthers() { return g_crew.aboard && g_crew.seats.size() > 1; }
+
+// The radios as they count for us: our own, or as crew, the aircraft's.
+bool comPoweredEff(int which) {
+    if (crewAboardOther())
+        return (g_crew.panel.flags & (which == 2 ? xr::CP_COM2_POWER : xr::CP_COM1_POWER)) != 0;
+    return comPowered(which);
+}
+bool anyComPoweredEff() { return comPoweredEff(1) || comPoweredEff(2); }
+uint32_t comKhzEff(int which) {
+    if (crewAboardOther()) return which == 2 ? g_crew.panel.com2Khz : g_crew.panel.com1Khz;
+    return comKhz(which);
+}
+int txComEff() {
+    if (crewAboardOther()) return g_crew.panel.txSel == xr::TX_COM2 ? 2 : 1;
+    return txCom();
+}
+
+// Our own panel, as the sim has it.
+xr::CrewPanel ownPanel() {
+    xr::CrewPanel p{};
+    p.com1Khz = comKhz(1); p.com2Khz = comKhz(2);
+    p.com1StbyKhz = standbyKhz(1); p.com2StbyKhz = standbyKhz(2);
+    p.txSel = txCom() == 2 ? xr::TX_COM2 : xr::TX_COM1;
+    uint8_t rx = 0;
+    if (id(g_ref.rxCom1)) rx |= xr::RX_COM1;
+    if (id(g_ref.rxCom2)) rx |= xr::RX_COM2;
+    p.rxMask = rx ? rx : (uint8_t)xr::RX_COM1;
+    p.flags = (uint8_t)((comPowered(1) ? xr::CP_COM1_POWER : 0) | (comPowered(2) ? xr::CP_COM2_POWER : 0));
+    p.com1Vol = g_ref.volCom1 ? fd(g_ref.volCom1) : 1.f;
+    p.com2Vol = g_ref.volCom2 ? fd(g_ref.volCom2) : 1.f;
+    return p;
+}
+
+void sendCrew(uint8_t op, const std::string& callsign = "", const std::string& code = "", uint8_t role = 0,
+              const xr::CrewPanel* panel = nullptr) {
+    if (!g_connected) return;
+    uint8_t buf[sizeof(xr::Header) + sizeof(xr::CrewPayload) + sizeof(xr::CrewPanel)];
+    const uint16_t len = (uint16_t)(sizeof(xr::CrewPayload) + (panel ? sizeof(xr::CrewPanel) : 0));
+    int off = writeHeader(buf, xr::PT_CREW, len);
+    xr::CrewPayload c{};
+    c.op = op; c.role = role;
+    strncpy(c.callsign, callsign.c_str(), sizeof(c.callsign) - 1);
+    strncpy(c.code, code.c_str(), sizeof(c.code) - 1);
+    memcpy(buf + off, &c, sizeof(c));
+    if (panel) memcpy(buf + off + sizeof(c), panel, sizeof(*panel));
+    g_sock.send(buf, off + (int)len);
+}
+
+// Write the aircraft's tuning into our own sim: frequencies, the transmit
+// selector, the receive buttons. Not the volume knobs -- each headset is its own.
+void writePanel(const xr::CrewPanel& want, const xr::CrewPanel& have) {
+    if (want.com1Khz && want.com1Khz != have.com1Khz) writeComKhz(1, want.com1Khz);
+    if (want.com2Khz && want.com2Khz != have.com2Khz) writeComKhz(2, want.com2Khz);
+    if (want.com1StbyKhz && want.com1StbyKhz != have.com1StbyKhz) setStandbyKhz(1, want.com1StbyKhz);
+    if (want.com2StbyKhz && want.com2StbyKhz != have.com2StbyKhz) setStandbyKhz(2, want.com2StbyKhz);
+    if (want.txSel && want.txSel != have.txSel && g_ref.audioComSel)
+        XPLMSetDatai(g_ref.audioComSel, want.txSel == xr::TX_COM2 ? 7 : 6);
+    if (want.rxMask != 0xFF && want.rxMask != have.rxMask) {
+        if (g_ref.rxCom1) XPLMSetDatai(g_ref.rxCom1, (want.rxMask & xr::RX_COM1) ? 1 : 0);
+        if (g_ref.rxCom2) XPLMSetDatai(g_ref.rxCom2, (want.rxMask & xr::RX_COM2) ? 1 : 0);
+    }
+}
+
+std::string crewSummary() {
+    std::string who;
+    for (const CrewSeat& m : g_crew.seats) {
+        if (!who.empty()) who += ", ";
+        who += m.callsign + " (" + xr::cockpit::roleName(m.role) + ")";
+    }
+    return who;
+}
+
+void handleCrew(const uint8_t* payload, int len) {
+    if (len < (int)sizeof(xr::CrewPayload)) return;
+    xr::CrewPayload c{};
+    memcpy(&c, payload, sizeof(c));
+    const std::string callsign = sanitizeText(c.callsign, sizeof(c.callsign));
+    switch (c.op) {
+        case xr::CREW_STATE: {
+            const bool was = g_crew.aboard;
+            const size_t wasSeats = g_crew.seats.size();
+            if (c.count == 0) {
+                if (was) addChat(g_crew.role == xr::CREW_ROLE_PILOT ? "your cockpit is closed to a crew"
+                                                                    : "you have left " + g_crew.aircraft + "'s cockpit");
+                g_crew.aboard = false; g_crew.seats.clear(); g_crew.havePanel = false; g_crew.wroteValid = false;
+                g_crew.role = 0; g_crew.stateAt = g_elapsed;
+                break;
+            }
+            std::vector<CrewSeat> seats;
+            const int n = std::min<int>(c.count, xr::kMaxCrew);
+            for (int i = 0; i < n; ++i) {
+                const size_t off = sizeof(c) + (size_t)i * sizeof(xr::CrewMember);
+                if (off + sizeof(xr::CrewMember) > (size_t)len) break;
+                xr::CrewMember m{};
+                memcpy(&m, payload + off, sizeof(m));
+                CrewSeat seat;
+                seat.sid = m.sid; seat.callsign = sanitizeText(m.callsign, sizeof(m.callsign));
+                seat.role = m.role <= xr::CREW_ROLE_OBSERVER ? m.role : (uint8_t)xr::CREW_ROLE_OBSERVER;
+                seats.push_back(seat);
+            }
+            g_crew.aboard = true;
+            g_crew.role = c.role <= xr::CREW_ROLE_OBSERVER ? c.role : (uint8_t)xr::CREW_ROLE_OBSERVER;
+            g_crew.aircraftSid = c.aircraftSid;
+            g_crew.aircraft = callsign;
+            g_crew.stateAt = g_elapsed;
+            g_crew.problem.clear();
+            const bool changed = !was || seats.size() != wasSeats;
+            g_crew.seats = seats;
+            if (changed) {
+                std::string line;
+                if (g_crew.role == xr::CREW_ROLE_PILOT)
+                    line = seats.size() > 1 ? "aboard your aircraft: " + crewSummary() : "your cockpit is open to a crew";
+                else
+                    line = "aboard " + g_crew.aircraft + " as " + xr::cockpit::roleName(g_crew.role) + ": " + crewSummary();
+                addChat(line);
+                pushNotice(line, 2);
+                logMsg("crew: %s", line.c_str());
+            }
+            break;
+        }
+        case xr::CREW_REFUSED: {
+            const bool wasAboard = g_crew.aboard;
+            const std::string before = g_crew.problem;
+            g_crew.aboard = false; g_crew.seats.clear(); g_crew.havePanel = false; g_crew.wroteValid = false;
+            g_crew.role = 0;
+            g_crew.problem = xr::cockpit::refusalText(c.reason, callsign);
+            // asked again every ten seconds: said once, not every time the answer is the same
+            if (wasAboard || g_crew.problem != before) {
+                addChat("shared cockpit: " + g_crew.problem);
+                pushNotice("Shared cockpit: " + g_crew.problem, 1);
+                logMsg("crew refused: %s", g_crew.problem.c_str());
+            }
+            break;
+        }
+        case xr::CREW_PANEL: {
+            if (len < (int)(sizeof(c) + sizeof(xr::CrewPanel))) break;
+            if (g_crew.aboard && g_crew.role != xr::CREW_ROLE_PILOT && c.aircraftSid != g_crew.aircraftSid) break;
+            xr::CrewPanel cp{};
+            memcpy(&cp, payload + sizeof(c), sizeof(cp));
+            g_crew.panel = xr::cockpit::sanitized(cp);
+            g_crew.havePanel = true;
+            g_crew.panelAt = g_elapsed;
+            break;
+        }
+        case xr::CREW_TUNE: {
+            // We are the aircraft: a copilot asks for a change on our panel.
+            if (!(g_crew.aboard && g_crew.role == xr::CREW_ROLE_PILOT)) break;
+            if (len < (int)(sizeof(c) + sizeof(xr::CrewPanel))) break;
+            xr::CrewPanel t{};
+            memcpy(&t, payload + sizeof(c), sizeof(t));
+            t = xr::cockpit::sanitized(t);
+            const xr::CrewPanel have = ownPanel();
+            writePanel(t, have);
+            if (t.com1Vol >= 0.f && g_ref.volCom1) XPLMSetDataf(g_ref.volCom1, t.com1Vol);
+            if (t.com2Vol >= 0.f && g_ref.volCom2) XPLMSetDataf(g_ref.volCom2, t.com2Vol);
+            std::string what;
+            if (t.com1Khz) what += " COM1 " + freqLabel(t.com1Khz);
+            if (t.com2Khz) what += " COM2 " + freqLabel(t.com2Khz);
+            if (t.com1StbyKhz) what += " COM1 standby " + freqLabel(t.com1StbyKhz);
+            if (t.com2StbyKhz) what += " COM2 standby " + freqLabel(t.com2StbyKhz);
+            if (t.txSel) what += t.txSel == xr::TX_COM2 ? " transmit on COM2" : " transmit on COM1";
+            if (!what.empty()) addChat(callsign + " set" + what);
+            if (g_connected) sendPosition();     // the server routes by the new frequencies at once
+            g_crew.panelSentAt = -1000.f;        // ...and the crew see it at once
+            break;
+        }
+        default: break;
+    }
+}
+
+// Every frame while connected: ask until the server has us where the settings
+// say, keep the panel in step, and let go of a cockpit we no longer want.
+void crewTick() {
+    if (!g_connected) return;
+    const std::string& mode = g_cfg.crewMode;
+    const bool wantPilot = mode == "pilot", wantJoin = mode == "join";
+    std::string target = trim(g_cfg.crewJoin);
+    for (char& ch : target) ch = (char)toupper((unsigned char)ch);
+    const uint8_t wantRole = xr::cockpit::roleFromSetting(g_cfg.crewRole);
+    const float again = g_crew.problem.empty() ? 3.f : 10.f;
+    const bool asPilot = g_crew.aboard && g_crew.role == xr::CREW_ROLE_PILOT;
+    const bool asCrew = g_crew.aboard && g_crew.role != xr::CREW_ROLE_PILOT;
+
+    // The server says it again every five seconds; silence for three times that is a server
+    // from before 0.7, or one that forgot us.
+    if (g_crew.aboard && g_elapsed - g_crew.stateAt > 16.f) {
+        g_crew.aboard = false; g_crew.seats.clear(); g_crew.havePanel = false; g_crew.wroteValid = false;
+    }
+
+    if (asPilot && !wantPilot) {
+        if (g_elapsed - g_crew.askedAt > 3.f) { sendCrew(xr::CREW_CLOSE); g_crew.askedAt = g_elapsed; }
+    } else if (asCrew && !wantJoin) {
+        if (g_elapsed - g_crew.askedAt > 3.f) { sendCrew(xr::CREW_LEAVE); g_crew.askedAt = g_elapsed; }
+    } else if (wantPilot) {
+        if (!asPilot && g_elapsed - g_crew.askedAt > again) {
+            sendCrew(xr::CREW_OPEN, "", trim(g_cfg.crewCode), xr::CREW_ROLE_PILOT);
+            g_crew.askedAt = g_elapsed;
+        }
+        if (asPilot) {
+            // The panel, to the crew: when it changes, and every two seconds besides.
+            const xr::CrewPanel now = ownPanel();
+            if (!xr::cockpit::samePanel(now, g_crew.sentPanel) || g_elapsed - g_crew.panelSentAt > 2.f) {
+                sendCrew(xr::CREW_PANEL, "", "", xr::CREW_ROLE_PILOT, &now);
+                g_crew.sentPanel = now;
+                g_crew.panelSentAt = g_elapsed;
+            }
+        }
+    } else if (wantJoin && !target.empty()) {
+        const bool in = asCrew && g_crew.aircraft == target && g_crew.role == wantRole;
+        if (!in && g_elapsed - g_crew.askedAt > again) {
+            sendCrew(xr::CREW_JOIN, target, trim(g_cfg.crewCode), wantRole);
+            g_crew.askedAt = g_elapsed;
+        }
+        if (in && g_crew.havePanel && g_cfg.crewSyncRadios) {
+            const xr::CrewPanel mine = ownPanel();
+            // A knob turned in our own cockpit since we last wrote it: ask the aircraft (a copilot may).
+            if (g_crew.wroteValid && g_crew.role == xr::CREW_ROLE_COPILOT) {
+                const xr::CrewPanel t = xr::cockpit::changes(g_crew.wrote, mine);
+                if (xr::cockpit::asksAnything(t)) {
+                    sendCrew(xr::CREW_TUNE, "", "", g_crew.role, &t);
+                    g_crew.tuneSent = t;
+                    g_crew.tuneSentAt = g_elapsed;
+                    g_crew.wrote = mine;
+                }
+            }
+            // The aircraft's panel into our sim -- unless a change of ours is still on its way
+            // and the panel does not show it yet.
+            const bool tuneInFlight = g_elapsed - g_crew.tuneSentAt < 1.5f &&
+                                      !xr::cockpit::shows(g_crew.panel, g_crew.tuneSent);
+            if (!tuneInFlight && !xr::cockpit::sameTuning(g_crew.panel, mine)) {
+                writePanel(g_crew.panel, mine);
+                xr::CrewPanel w = g_crew.panel;
+                w.com1Vol = mine.com1Vol; w.com2Vol = mine.com2Vol; w.flags = mine.flags;
+                g_crew.wrote = w;
+                g_crew.wroteValid = true;
+            } else if (!g_crew.wroteValid) {
+                g_crew.wrote = mine;
+                g_crew.wroteValid = true;
+            }
+        }
+    }
+    // The intercom needs somebody to talk to.
+    if (g_icDown && !crewHasOthers()) {
+        g_icDown = false;
+        xr::voice::setIntercomTransmit(false);
+    }
+}
+
+// The intercom's push-to-talk: the command, the key, the window's button.
+void setIntercom(bool down) {
+    if (down && !crewHasOthers()) {
+        if (g_elapsed - g_icRefusedAt > 10.f) {
+            pushNotice("Intercom: nobody else is aboard (Settings > Connection > Shared cockpit)", 1);
+            g_icRefusedAt = g_elapsed;
+        }
+        return;
+    }
+    if (down == g_icDown) return;
+    g_icDown = down;
+    xr::voice::setIntercomTransmit(down);
+}
+
+// ---------------------------------------------------------------------------
+// 0.7: the connection's round trip
+// ---------------------------------------------------------------------------
+xr::cockpit::RttMeter g_rtt;
+uint32_t              g_pingSeq = 0;
+float                 g_lastPing = -1000.f;
+constexpr float       kPingIntervalS = 2.f;
+// Voice lost on the way, from the codec's counts over the last few seconds.
+uint64_t g_voicePlayedAt = 0, g_voiceConcealedAt = 0;
+float    g_voiceLossAt = -1000.f;
+double   g_voiceLossPct = 0.0;
+
+void sendPing() {
+    uint8_t buf[sizeof(xr::Header) + sizeof(xr::PingPayload)];
+    int off = writeHeader(buf, xr::PT_PING, sizeof(xr::PingPayload));
+    xr::PingPayload pp{};
+    pp.seq = ++g_pingSeq;
+    pp.timeMs = nowMs();
+    memcpy(buf + off, &pp, sizeof(pp));
+    g_sock.send(buf, off + (int)sizeof(pp));
+    g_rtt.sent(pp.seq, g_elapsed);
+    g_lastPing = g_elapsed;
+}
+
+void handlePong(const uint8_t* payload, int len) {
+    if (len >= (int)sizeof(xr::PingPayload)) {
+        xr::PingPayload pp{};
+        memcpy(&pp, payload, sizeof(pp));
+        g_rtt.answered(pp.seq, g_elapsed);
+    } else {
+        g_rtt.answeredAnonymous(g_elapsed);   // a server from before 0.7 sends them empty
+    }
+}
+
+void telemetryTick() {
+    if (g_connected && g_elapsed - g_lastPing >= kPingIntervalS) sendPing();
+    if (g_elapsed - g_voiceLossAt >= 5.f) {
+        const xr::voice::Stats st = xr::voice::stats();
+        g_voiceLossPct = xr::cockpit::voiceLossPct(st.framesPlayed - g_voicePlayedAt,
+                                                   st.framesConcealed - g_voiceConcealedAt);
+        g_voicePlayedAt = st.framesPlayed; g_voiceConcealedAt = st.framesConcealed;
+        g_voiceLossAt = g_elapsed;
+    }
+}
+
+// One line for the windows: "RTT 42 ms  jitter 3 ms  loss 0 %".
+std::string telemetryLine() {
+    if (!g_connected) return "";
+    char line[160];
+    if (!g_rtt.haveRtt()) snprintf(line, sizeof(line), "round trip: measuring...");
+    else snprintf(line, sizeof(line), "round trip %.0f ms  ·  jitter %.0f ms  ·  lost %.0f %%  ·  voice lost %.0f %%",
+                  g_rtt.rttMs(), g_rtt.jitterMs(), g_rtt.lossPct(g_elapsed), g_voiceLossPct);
+    return line;
+}
+
+// ---------------------------------------------------------------------------
+// 0.7: quick-tune slots
+// ---------------------------------------------------------------------------
+std::vector<xr::cockpit::Preset> presets() { return xr::cockpit::parsePresets(g_cfg.presets); }
+
+// Tune a slot onto COM1 or COM2. As crew, the aircraft's radios: a copilot asks the pilot's sim.
+void tunePreset(int slot, int which) {
+    const auto list = presets();
+    if (slot < 0 || slot >= (int)list.size()) return;
+    const uint32_t khz = list[(size_t)slot].khz;
+    if (crewAboardOther()) {
+        if (g_crew.role != xr::CREW_ROLE_COPILOT) { pushNotice("An observer cannot retune the aircraft's radios", 1); return; }
+        xr::CrewPanel t = xr::cockpit::nothing();
+        (which == 2 ? t.com2Khz : t.com1Khz) = khz;
+        sendCrew(xr::CREW_TUNE, "", "", g_crew.role, &t);
+        g_crew.tuneSent = t; g_crew.tuneSentAt = g_elapsed;
+        addChat("asked " + g_crew.aircraft + " to tune COM" + std::to_string(which) + " to " + freqLabel(khz));
+        return;
+    }
+    tuneRadio(which, khz);
+}
+
+// Store what COM1 has now into a slot, keeping the slot's label.
+void storePreset(int slot) {
+    auto list = presets();
+    const uint32_t khz = comKhzEff(1);
+    if (!xr::cockpit::validComKhz(khz) || slot < 0 || slot >= xr::cockpit::kMaxPresets) return;
+    while ((int)list.size() <= slot) list.push_back({"", 0});
+    list[(size_t)slot].khz = khz;
+    if (list[(size_t)slot].label.empty()) list[(size_t)slot].label = xr::cockpit::khzText(khz);
+    std::vector<xr::cockpit::Preset> kept;
+    for (const auto& p : list) if (p.khz) kept.push_back(p);
+    g_cfg.presets = xr::cockpit::formatPresets(kept);
+    xr::saveSettings(g_cfg, g_cfgPath);
+    addChat("quick-tune slot " + std::to_string(slot + 1) + ": " + freqLabel(khz));
+}
+
+// ---------------------------------------------------------------------------
+// 0.7: the flights on this network (the Host / Connect tab's search)
+// ---------------------------------------------------------------------------
+struct LanFlight {
+    std::string address, name, version;
+    uint16_t    port = 0;
+    int         pilots = 0, maxPilots = 0;
+    bool        password = false, hosted = false, sameVersion = true;
+};
+std::mutex             g_lanMx;
+std::vector<LanFlight> g_lanFound;       // guarded by g_lanMx
+std::thread            g_lanThread;
+std::atomic<bool>      g_lanBusy{false};
+float                  g_lanAt = -1000.f;
+
+// The search itself, on a thread of its own: a probe to the network's broadcast
+// address (and this machine) on the usual ports, then a second of listening.
+void lanSearchWorker(std::vector<uint16_t> ports) {
+    std::vector<LanFlight> found;
+    xr::UdpServerSocket sock;
+    std::string err;
+    if (sock.open(0, "", &err)) {
+        sock.enableBroadcast();
+        std::random_device rd;
+        const uint32_t nonce = rd();
+        uint8_t probe[sizeof(xr::Header) + sizeof(xr::DiscoverPayload)];
+        xr::Header h{};
+        h.magic = xr::kMagic; h.type = xr::PT_DISCOVER; h.version = (uint8_t)xr::kProtoVersion;
+        h.payloadLen = sizeof(xr::DiscoverPayload); h.sessionId = 0;
+        xr::DiscoverPayload q{};
+        q.nonce = nonce;
+        memcpy(probe, &h, sizeof(h));
+        memcpy(probe + sizeof(h), &q, sizeof(q));
+        for (int round = 0; round < 2; ++round) {          // twice: one probe lost is a flight not found
+            for (uint16_t port : ports) {
+                xr::Peer to;
+                if (xr::makePeer("255.255.255.255", port, &to)) sock.sendTo(to, probe, (int)sizeof(probe));
+                if (xr::makePeer("127.0.0.1", port, &to)) sock.sendTo(to, probe, (int)sizeof(probe));
+            }
+            const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(round ? 700 : 500);
+            while (std::chrono::steady_clock::now() < until) {
+                uint8_t buf[xr::kMaxPacket];
+                xr::Peer from;
+                const int n = sock.recvFrom(buf, (int)sizeof(buf), &from, 50);
+                if (n < (int)(sizeof(xr::Header) + sizeof(xr::DiscoverPayload))) continue;
+                xr::Header rh{};
+                memcpy(&rh, buf, sizeof(rh));
+                if (rh.magic != xr::kMagic || rh.type != xr::PT_DISCOVER) continue;
+                xr::DiscoverPayload a{};
+                memcpy(&a, buf + sizeof(rh), sizeof(a));
+                if (a.nonce != nonce) continue;
+                LanFlight f;
+                f.address = from.host();
+                f.port = a.port;
+                f.name = sanitizeText(a.name, sizeof(a.name));
+                f.version = sanitizeText(a.version, sizeof(a.version));
+                f.pilots = a.pilots; f.maxPilots = a.maxPilots;
+                f.password = (a.flags & xr::DF_PASSWORD) != 0;
+                f.hosted = (a.flags & xr::DF_HOSTED) != 0;
+                f.sameVersion = a.protoVer == xr::kProtoVersion;
+                bool dup = false;
+                for (auto& g : found) {
+                    // the same server answering on loopback and on the LAN address: keep the LAN one
+                    if (g.port == f.port && g.name == f.name && (g.address == f.address || f.address == "127.0.0.1")) dup = true;
+                    else if (g.port == f.port && g.name == f.name && g.address == "127.0.0.1") { g = f; dup = true; }
+                }
+                if (!dup && !f.address.empty()) found.push_back(f);
+            }
+        }
+        sock.close();
+    }
+    std::lock_guard<std::mutex> lk(g_lanMx);
+    g_lanFound = found;
+    g_lanBusy.store(false);
+}
+
+void startLanSearch() {
+    if (g_lanBusy.load()) return;
+    if (g_lanThread.joinable()) g_lanThread.join();
+    std::vector<uint16_t> ports = {49100};
+    for (int p : {g_cfg.port_i(), g_cfg.hostPort_i()})
+        if (p > 0 && p < 65536 && std::find(ports.begin(), ports.end(), (uint16_t)p) == ports.end()) ports.push_back((uint16_t)p);
+    g_lanBusy.store(true);
+    g_lanAt = g_elapsed;
+    g_lanThread = std::thread(lanSearchWorker, ports);
+}
+
+// ---------------------------------------------------------------------------
+// 0.7: hosting -- kick, mute, the limit, through our own server's admin token
+// ---------------------------------------------------------------------------
+void sendAdmin(uint8_t op, uint32_t sid, uint16_t minutes = 0, uint32_t value = 0) {
+    const std::string token = xr::relay::adminToken();
+    if (!g_connected || token.empty()) return;
+    uint8_t buf[sizeof(xr::Header) + sizeof(xr::AdminPayload)];
+    int off = writeHeader(buf, xr::PT_ADMIN, sizeof(xr::AdminPayload));
+    xr::AdminPayload a{};
+    a.op = op; a.targetSid = sid; a.minutes = minutes; a.value = value;
+    strncpy(a.token, token.c_str(), sizeof(a.token) - 1);
+    memcpy(buf + off, &a, sizeof(a));
+    g_sock.send(buf, off + (int)sizeof(a));
+}
+
+void handleAdminAnswer(const uint8_t* payload, int len) {
+    if (len < (int)sizeof(xr::AdminPayload)) return;
+    xr::AdminPayload a{};
+    memcpy(&a, payload, sizeof(a));
+    const char* what = a.op == xr::ADMIN_KICK ? "kick" : a.op == xr::ADMIN_MUTE ? "mute" :
+                       a.op == xr::ADMIN_UNMUTE ? "unmute" : "limit";
+    if (!a.result) pushNotice(std::string("Host: ") + what + " did not go through", 1);
+}
+
+// ---------------------------------------------------------------------------
 // network thread
 // ---------------------------------------------------------------------------
 // Voice cannot wait for the 5 Hz flight loop, and must not depend on the frame
@@ -1607,11 +2168,13 @@ void sendVoiceFrames() {
     static std::vector<xr::voice::OutFrame> frames;
     xr::voice::pollOutgoing(frames);
     if (frames.empty()) return;
-    const uint32_t freq = g_txFreqKhz.load();
-    if (freq == 0) return;                       // no radio selected: nothing to key
+    const uint32_t radioFreq = g_txFreqKhz.load();
     uint8_t buf[xr::kMaxPacket];
     for (const auto& f : frames) {
         if (f.opus.empty() || f.opus.size() > 1000) continue;
+        // 0.7: a frame is for the intercom or the radio as it was spoken
+        const uint32_t freq = f.intercom ? xr::kIntercomKhz : radioFreq;
+        if (freq == 0) continue;                 // no radio selected: nothing to key
         xr::VoiceHeader vh{};
         vh.freqKhz     = freq;
         vh.fromSession = g_sessionId.load();
@@ -1670,6 +2233,7 @@ void netStart() {
     g_netPort = (uint16_t)g_cfg.activePort();
     g_firstLogin = -1.f;
     g_loginProblem.clear();
+    g_kickedHold = false;
     g_lastLogin = -99.f;
     g_roster.clear();                  // another server, another flight
     g_rosterAt = -1000.f;
@@ -1713,6 +2277,9 @@ void pumpNetwork() {
                 g_sessionId.store(a.sessionId);
                 g_connected = true;
                 g_loginProblem.clear();
+                g_crew = CrewClient{};           // a new session: the server knows nothing of a cockpit yet
+                g_rtt.reset();
+                g_lastPing = -1000.f;
                 g_status    = "connected to " + g_sock.endpoint();
                 logMsg("connected, session %u, as %s%s%s", (unsigned)g_sessionId.load(),
                        g_loginIcao.c_str(), g_loginLivery.empty() ? "" : " / ",
@@ -1737,6 +2304,20 @@ void pumpNetwork() {
                     g_loginProblem = g_cfg.password.empty()
                         ? "this flight needs a password (Settings > Connection)"
                         : "wrong flight password";
+                } else if (rj.reason == xr::RJ_KICKED) {
+                    // 0.7: the host removed us; with minutes, the server keeps saying so until they are up
+                    g_loginProblem = rj.reserved
+                        ? "the host removed you from this flight for " + std::to_string(rj.reserved) + " min"
+                        : "the host removed you from this flight -- Reconnect to try again";
+                    if (!rj.reserved) g_kickedHold = true;     // no automatic way back in
+                    g_connected = false;
+                    g_sessionId.store(0);
+                    g_remote.clear();
+                    xr::csl::removeAll();
+                    g_crew = CrewClient{};
+                    pushNotice(g_loginProblem, 1);
+                } else if (rj.reason == xr::RJ_FULL) {
+                    g_loginProblem = "this flight is full -- trying again every few seconds";
                 } else if (rj.reason == xr::RJ_VERSION) {
                     char why[160];
                     snprintf(why, sizeof(why),
@@ -1757,7 +2338,9 @@ void pumpNetwork() {
             case xr::PT_ATC_LIST:   handleAtcList(payload, h.payloadLen);    break;
             case xr::PT_ATIS:       handleAtis(payload, h.payloadLen);       break;
             case xr::PT_FLIGHTPLAN: handleFlightPlan(payload, h.payloadLen); break;
-            case xr::PT_PONG:    break;
+            case xr::PT_PONG:    handlePong(payload, h.payloadLen); break;
+            case xr::PT_CREW:    handleCrew(payload, h.payloadLen); break;
+            case xr::PT_ADMIN:   handleAdminAnswer(payload, h.payloadLen); break;
             default:             break;
         }
     }
@@ -1801,6 +2384,7 @@ float g_lastAircraftCheck = 0.f;
 float flightLoop(float elapsedSinceLast, float, int, void*) {
     g_elapsed += elapsedSinceLast;
     runDeferred();              // what the windows' buttons asked for, outside their frames
+    if (g_saveAt > 0.f && g_elapsed > g_saveAt) { g_saveAt = -1.f; xr::saveSettings(g_cfg, g_cfgPath); }
     pollHosting();              // a hosted server the worker has (re)started or stopped
     xr::tower::tick(elapsedSinceLast, g_elapsed);
     {   // S3: a finished SimBrief fetch lands here, on the main thread
@@ -1849,6 +2433,8 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
 
     pumpNetwork();
     xr::voice::tick();
+    crewTick();          // 0.7: the shared cockpit
+    telemetryTick();     // 0.7: the round trip
     if (g_acfDirty) {                       // a plane or livery was loaded (XPluginReceiveMessage)
         detectAircraft();
         if (g_connected && (g_acf.icao != g_loginIcao || effectiveLivery() != g_loginLivery)) {
@@ -1867,9 +2453,7 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
         for (uint32_t sid : now) {
             if (std::find(wasSpeaking.begin(), wasSpeaking.end(), sid) != wasSpeaking.end())
                 continue;
-            auto it = g_remote.find(sid);
-            const std::string who = it != g_remote.end() ? it->second.callsign
-                                                         : std::to_string(sid);
+            const std::string who = speakerName(sid);
             const uint32_t f = xr::voice::speakerFreq(sid);
             char line[160];
             if (f) snprintf(line, sizeof(line), "%s is calling on %s", who.c_str(),
@@ -1915,7 +2499,8 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
     }
 
     // Which COM the PTT keys, published for the network thread's voice packets.
-    g_txFreqKhz.store(comKhz(txCom()));
+    // As crew aboard somebody's aircraft, its radio.
+    g_txFreqKhz.store(comKhzEff(txComEff()));
 
     // The audio panel's volume knobs, so turning a radio down in the cockpit
     // turns it down in the headset. A missing dataref reads 0, which would
@@ -1923,16 +2508,17 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
     // A radio with no power is silent in both directions: zero volume here
     // stops anything already in the mixer, and the position packet has
     // already told the server we are not listening.
-    const float vol1 = comPowered(1) ? (g_ref.volCom1 ? fd(g_ref.volCom1) : 1.f) : 0.f;
-    const float vol2 = comPowered(2) ? (g_ref.volCom2 ? fd(g_ref.volCom2) : 1.f) : 0.f;
-    xr::voice::setRadioVolumes(comKhz(1), vol1, comKhz(2), vol2);
+    // As crew the aircraft's radios decide what is on and where; the knobs are our own headset's.
+    const float vol1 = comPoweredEff(1) ? (g_ref.volCom1 ? fd(g_ref.volCom1) : 1.f) : 0.f;
+    const float vol2 = comPoweredEff(2) ? (g_ref.volCom2 ? fd(g_ref.volCom2) : 1.f) : 0.f;
+    xr::voice::setRadioVolumes(comKhzEff(1), vol1, comKhzEff(2), vol2);
     // Guard reaches every aeroplane with a working radio, on whichever is
     // turned up louder. With the avionics off it reaches this one too, and is
     // heard exactly as much as anything else is: not at all.
-    xr::voice::setGuardGain(anyComPowered() ? std::max(vol1, vol2) : 0.f);
+    xr::voice::setGuardGain(anyComPoweredEff() ? std::max(vol1, vol2) : 0.f);
 
     // Switching the avionics off mid-transmission has to unkey us.
-    if (g_pttDown && !anyComPowered()) setPtt(false);
+    if (g_pttDown && !anyComPoweredEff()) setPtt(false);
 
     // So does the stuck-mic timer; see pttTimeoutS().
     if (g_pttDown && g_elapsed - g_pttDownAt > pttTimeoutS()) {
@@ -1951,7 +2537,7 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
         // answer will not change until the settings do -- and after a while
         // with no answer at all, say what that usually means.
         const float every = g_loginProblem.empty() ? 2.0f : 10.0f;
-        if (g_elapsed - g_lastLogin > every) sendLogin();
+        if (!g_kickedHold && g_elapsed - g_lastLogin > every) sendLogin();
         if (g_loginProblem.empty() && g_firstLogin >= 0.f && g_elapsed - g_firstLogin > 8.0f) {
             g_status = "no answer from " + g_sock.endpoint() +
                        " (offline, wrong address, or a different XRadio version)";
@@ -2007,6 +2593,8 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
         g_lastWeatherSend = -1000.f;
         g_ducting = false;
         g_shadow.clear();
+        g_crew = CrewClient{};
+        g_rtt.reset();
         g_status = "lost server, retrying...";
         logMsg("server went quiet, re-logging in");
     }
@@ -2020,7 +2608,17 @@ float flightLoop(float elapsedSinceLast, float, int, void*) {
 void setPtt(bool down) {
     // Keying a radio that has no power should do nothing at all -- no
     // sidetone, no carrier for anyone else, no [TX] on our aircraft.
-    if (down && !anyComPowered()) return;
+    // As crew, the aircraft's radios are the ones with or without power.
+    if (down && !anyComPoweredEff()) return;
+    // 0.7: an observer has no transmitter; the intercom is theirs.
+    if (down && g_crew.aboard && g_crew.role == xr::CREW_ROLE_OBSERVER) {
+        if (g_elapsed - g_icRefusedAt > 10.f) {
+            pushNotice("Observers talk on the intercom, not the radio", 1);
+            g_icRefusedAt = g_elapsed;
+        }
+        return;
+    }
+    if (down && xr::voice::micTest() != xr::voice::MicTest::Idle) xr::voice::stopMicTest();
     if (down == g_pttDown) return;
     g_pttDown = down;
     if (down) g_pttDownAt = g_elapsed;
@@ -2036,6 +2634,22 @@ int pttHandler(XPLMCommandRef, XPLMCommandPhase phase, void*) {
     return 0;   // let other plugins see it too
 }
 
+// 0.7: the intercom's push-to-talk, the traffic scope, and the quick-tune slots as commands.
+int intercomHandler(XPLMCommandRef, XPLMCommandPhase phase, void*) {
+    if (phase == xplm_CommandBegin)      setIntercom(true);
+    else if (phase == xplm_CommandEnd)   setIntercom(false);
+    return 0;
+}
+void toggleTrafficWindow();
+int trafficWindowHandler(XPLMCommandRef, XPLMCommandPhase phase, void*) {
+    if (phase == xplm_CommandBegin) toggleTrafficWindow();
+    return 0;
+}
+int presetHandler(XPLMCommandRef, XPLMCommandPhase phase, void* ref) {
+    if (phase == xplm_CommandBegin) tunePreset((int)(intptr_t)ref, 1);
+    return 0;
+}
+
 // The push-to-talk key from the settings window. A hot key would only tell
 // us about the press, and a radio needs the release too, so the key is
 // sniffed instead -- after the windows have had it, so typing that letter
@@ -2045,6 +2659,11 @@ int g_pttKeyVk = 0;
 int pttKeySniffer(char, XPLMKeyFlags flags, char vk, void*) {
     if (g_cfg.towerKey > 0 && (unsigned char)vk == (unsigned char)g_cfg.towerKey && (flags & xplm_DownFlag) && !(flags & xplm_UpFlag)) { xr::tower::toggle(); return 0; }
     const int k = (unsigned char)vk;
+    if (g_cfg.intercomKey > 0 && k == g_cfg.intercomKey) {   // 0.7: the intercom's key
+        if (flags & xplm_DownFlag) setIntercom(true);
+        else if (flags & xplm_UpFlag) setIntercom(false);
+        return 0;
+    }
     if (g_pttKeyVk == 0 || k != g_pttKeyVk) return 1;      // not ours, pass it on
     if (flags & xplm_DownFlag) setPtt(true);
     else if (flags & xplm_UpFlag) setPtt(false);
@@ -2054,6 +2673,15 @@ int pttKeySniffer(char, XPLMKeyFlags flags, char vk, void*) {
 // ---------------------------------------------------------------------------
 // window
 // ---------------------------------------------------------------------------
+// 0.7: the initial great-circle bearing from one point to another, degrees true.
+double bearingDeg(double lat1, double lon1, double lat2, double lon2) {
+    const double p1 = lat1 * xr::kPi / 180.0, p2 = lat2 * xr::kPi / 180.0, dl = (lon2 - lon1) * xr::kPi / 180.0;
+    const double y = sin(dl) * cos(p2), x = cos(p1) * sin(p2) - sin(p1) * cos(p2) * cos(dl);
+    double b = atan2(y, x) * 180.0 / xr::kPi;
+    if (b < 0.0) b += 360.0;
+    return b;
+}
+
 double distanceNm(double lat1, double lon1, double lat2, double lon2) {
     const double R = 3440.065;
     double p1 = lat1 * xr::kPi / 180.0, p2 = lat2 * xr::kPi / 180.0;
@@ -2138,6 +2766,11 @@ void drawWindow(XPLMWindowID win, void*) {
 
     drawFit(g_connected ? green : amber, x, y, r, g_status, xplmFont_Proportional);
     y -= 16;
+    // 0.7: how the connection is doing -- the round trip, its jitter, what is lost
+    if (g_connected && g_rtt.haveRtt()) {
+        drawFit(grey, x, y, r, telemetryLine(), xplmFont_Basic);
+        y -= 16;
+    }
     char who[200];
     // The network thread writes the endpoint while it opens the socket, so it
     // is only read here once that thread has said it is done. Reading it
@@ -2208,6 +2841,24 @@ void drawWindow(XPLMWindowID win, void*) {
     drawFit(g_pttDown ? green : white, x, y, r, hdr, xplmFont_Proportional);
     y -= 16;
 
+    // 0.7: the shared cockpit, when there is one -- who is aboard, and the intercom.
+    if (g_connected && (g_crew.aboard || !g_crew.problem.empty() || g_cfg.crewMode != "off")) {
+        std::string line;
+        if (g_crew.aboard && g_crew.role == xr::CREW_ROLE_PILOT)
+            line = g_crew.seats.size() > 1 ? "Crew aboard: " + crewSummary() : "Cockpit open to a crew";
+        else if (g_crew.aboard)
+            line = "Aboard " + g_crew.aircraft + " as " + xr::cockpit::roleName(g_crew.role) + ": " + crewSummary();
+        else if (!g_crew.problem.empty())
+            line = "Shared cockpit: " + g_crew.problem;
+        else
+            line = g_cfg.crewMode == "pilot" ? "Opening the cockpit to a crew..." : "Joining " + g_cfg.crewJoin + "'s cockpit...";
+        const auto ic = xr::voice::activeIntercomSpeakers();
+        if (g_icDown) line += "   IC: talking";
+        else if (!ic.empty()) line += "   IC: " + speakerName(ic.front());
+        drawFit(g_crew.aboard ? green : amber, x, y, r, line, xplmFont_Basic);
+        y -= 16;
+    }
+
     // Voice: device status, a mic meter while keyed, and who we are hearing.
     {
         std::string line = "Voice: " + xr::voice::status();
@@ -2221,8 +2872,7 @@ void drawWindow(XPLMWindowID win, void*) {
         if (!rx.empty()) {
             line += "   RX:";
             for (uint32_t sid : rx) {
-                auto it = g_remote.find(sid);
-                line += " " + (it != g_remote.end() ? it->second.callsign : std::to_string(sid));
+                line += " " + speakerName(sid);
                 // signal bars, like a phone: five for next door, one at the horizon
                 const int bars = 1 + (int)(xr::voice::signalQualityOf(sid) * 4.f + 0.5f);
                 line += " [";
@@ -2660,7 +3310,8 @@ bool        g_copyOk = false;
 // 20 ms receive wait) and start() binds a port, and the sim should not sit through either. pollHosting()
 // collects the answer on the flight loop and does what belongs on the main thread: the router request, the
 // log line, and the reconnect that was waiting for the server.
-struct HostingJob { bool enable = false; uint16_t port = 0; std::string password; bool ducting = false, upnp = false; };
+struct HostingJob { bool enable = false; uint16_t port = 0; std::string password; bool ducting = false, upnp = false;
+                    int maxPilots = 0; bool visible = true; std::string name; };
 struct HostingResult { bool done = false, enable = false, wasRunning = false, ok = false, upnp = false; uint16_t port = 0; std::string err; };
 std::thread   g_hostWorker;
 std::mutex    g_hostMx;
@@ -2671,6 +3322,8 @@ HostingJob hostingJob() {
     HostingJob j;
     j.enable = g_cfg.hostEnabled; j.port = (uint16_t)g_cfg.hostPort_i(); j.password = g_cfg.password;
     j.ducting = g_cfg.hostDucting; j.upnp = g_cfg.hostUpnp;
+    j.maxPilots = (int)(g_cfg.hostMaxPilots + 0.5f); j.visible = g_cfg.hostVisible;
+    j.name = upper(trim(g_cfg.callsign));       // the LAN search shows the flight by its host's callsign
     return j;
 }
 
@@ -2680,7 +3333,11 @@ HostingResult runHosting(const HostingJob& j) {
     r.enable = j.enable; r.port = j.port; r.upnp = j.upnp;
     r.wasRunning = xr::relay::running();
     if (!j.enable) { xr::relay::stop(); r.ok = true; return r; }
-    r.ok = xr::relay::start(j.port, j.password, &r.err, j.ducting);   // stops the old one first
+    xr::relay::Options o;
+    o.port = j.port; o.password = j.password; o.ducting = j.ducting;
+    o.maxPilots = j.maxPilots; o.visible = j.visible; o.name = j.name; o.hosted = true;
+    o.adminToken = xr::relay::newAdminToken();      // kick and mute go through our own connection with it
+    r.ok = xr::relay::start(o, &r.err);             // stops the old one first
     return r;
 }
 
@@ -2818,6 +3475,9 @@ void reconnect() {
     g_shadow.clear();
     g_atis.clear();
     g_fp = FlightPlanState{};
+    g_crew = CrewClient{};                        // 0.7: the server forgets the cockpit with the session
+    g_rtt.reset();
+    if (g_icDown) { g_icDown = false; xr::voice::setIntercomTransmit(false); }
     // A new connection knows nothing about who holds the sky, so offer again
     // rather than staying quiet on the strength of the old flight's answer.
     g_lastWeatherRx  = -1000.f;
@@ -2861,7 +3521,8 @@ void applyOfp(const xr::simbrief::Ofp& o) {
 }
 int          g_tab = 0;
 std::string  g_settingsNote;       // one-line feedback under the buttons
-bool         g_captureKey = false; // the PTT-key row is waiting for a key press
+int*         g_captureKey = nullptr; // the key row (PTT, intercom) waiting for a key press: its g_edit field
+int          g_settingsGrownTo = 0, g_settingsGrownFrom = 0;   // drawSettings: the last growth asked for, and from
 xr::ui::Ctx  g_ui;
 std::vector<std::string> g_micList, g_outList;
 
@@ -2896,6 +3557,13 @@ void applyLiveSettings() {
     xr::voice::setRadioFilter(g_cfg.radioFilter);
     xr::voice::setSquelch(g_cfg.squelch);
     xr::voice::setCabinNoise(g_cfg.cabinNoise);
+    // 0.7
+    xr::voice::setPttClick(g_cfg.pttClick);
+    xr::voice::setSquelchTail(g_cfg.squelchTail);
+    xr::voice::setCrackle(g_cfg.crackle);
+    xr::voice::setIntercomVolume(g_cfg.intercomVolume);
+    xr::csl::setMapVisible(g_cfg.showOnMap, g_cfg.showLabels);
+    xr::relay::setLimits((int)(g_cfg.hostMaxPilots + 0.5f), g_cfg.hostVisible);
     xr::Smoother::setDefaultPlayout(g_cfg.smoothMs / 1000.0);
     g_pttKeyVk = g_cfg.pttKey;
     xr::csl::setTrafficVisible(g_cfg.showTraffic);
@@ -2912,14 +3580,27 @@ void openSettings() {
     if (!g_settingsWin) return;
     g_edit = g_cfg;
     g_settingsNote.clear();
-    g_captureKey = false;
+    g_captureKey = nullptr;
     g_ui.focus = -1;
     g_keyQueue.clear();
     g_specialKey = kSpecialNone;
     refreshDeviceLists();
 
+    // Tall enough for the longest tab of settings, so no tab opens with rows cut off under the buttons.
+    // A row is kRowH; around the rows go the mark, the tabs, a spacer, the note row and the buttons
+    // (drawSettings). The Hosting tab's status text is not counted: that tab grows the window as it needs.
+    int perTab[xr::kNumTabs] = {};
+    for (const auto& f : xr::describe(g_edit))
+        if (f.tab >= 0 && f.tab < xr::kNumTabs) ++perTab[f.tab];
+    static_assert(xr::kNumTabs > 4, "the ATC tab is tab 4");
+    perTab[4] += 4;                                 // the ATC tab: two rows of buttons and two lines under them
+    int rows = 0;
+    for (int i = 0; i < xr::kNumTabs; ++i) if (i != 3 && perTab[i] > rows) rows = perTab[i];
+    const int wantH = std::max(330, 124 + xr::ui::Ctx::kRowH * rows);
+    g_settingsGrownTo = g_settingsGrownFrom = 0;   // a reopened window may grow again for a tall tab
+
     int l, t, r, b;
-    safeWindowRect(560, 330, 520, &l, &t, &r, &b);
+    safeWindowRect(560, wantH, 520, &l, &t, &r, &b);
     XPLMSetWindowGeometry(g_settingsWin, l, t, r, b);
     XPLMSetWindowIsVisible(g_settingsWin, 1);
     XPLMBringWindowToFront(g_settingsWin);
@@ -2929,7 +3610,7 @@ void openSettings() {
 // The text window's; the ImGui build never shows it and does not come here (applySettings).
 void closeSettings() {
     g_ui.focus = -1;
-    g_captureKey = false;
+    g_captureKey = nullptr;
     g_keyQueue.clear();
     if (!g_settingsWin) return;
     if (XPLMHasKeyboardFocus(g_settingsWin)) XPLMTakeKeyboardFocus(nullptr);
@@ -2946,6 +3627,13 @@ bool applySettings() {
     g_edit.acIcao   = upper(trim(g_edit.acIcao));
     g_edit.host     = trim(g_edit.host);
     g_edit.password = trim(g_edit.password);
+    // 0.7: the shared cockpit's words as the table spells them
+    for (std::string* w : {&g_edit.crewMode, &g_edit.crewRole})
+        for (char& c : *w) c = (char)tolower((unsigned char)c);
+    g_edit.crewMode = trim(g_edit.crewMode);
+    g_edit.crewRole = trim(g_edit.crewRole);
+    g_edit.crewJoin = upper(trim(g_edit.crewJoin));
+    g_edit.crewCode = trim(g_edit.crewCode);
 
     const std::string problem = xr::validate(g_edit);
     if (!problem.empty()) {
@@ -2976,7 +3664,17 @@ bool applySettings() {
     const bool devChanged = (g_edit.micDevice != g_cfg.micDevice) ||
                             (g_edit.outDevice != g_cfg.outDevice);
 
+    const bool crewChanged = g_edit.crewMode != g_cfg.crewMode || g_edit.crewJoin != g_cfg.crewJoin ||
+                             g_edit.crewRole != g_cfg.crewRole || g_edit.crewCode != g_cfg.crewCode;
     g_settingsNote.clear();
+    if (crewChanged) {
+        // ask the server straight away rather than at the next retry; a new code needs a new OPEN
+        if (g_crew.aboard && g_crew.role == xr::CREW_ROLE_PILOT && g_edit.crewMode == "pilot" &&
+            g_edit.crewCode != g_cfg.crewCode)
+            sendCrew(xr::CREW_CLOSE);
+        g_crew.askedAt = -1000.f;
+        g_crew.problem.clear();
+    }
     g_cfg = g_edit;
     if (!xr::saveSettings(g_cfg, g_cfgPath)) {
         // applied all the same -- the settings are live -- but the next start would not have them
@@ -3011,6 +3709,7 @@ bool applySettings() {
 // The ImGui window's Apply, from the flight loop (requestApply).
 void runApply() {
     g_edit = g_applyWanted;
+    const bool trafficWas = g_cfg.uiTraffic;
     if (!applySettings()) {
         logMsg("settings not saved: %s", g_settingsNote.c_str());
 #ifdef XRADIO_UI_IMGUI
@@ -3021,6 +3720,7 @@ void runApply() {
     }
 #ifdef XRADIO_UI_IMGUI
     xr::ui2::host::applyDisplay(g_cfg);
+    if (g_cfg.uiTraffic != trafficWas) xr::ui2::host::showTraffic(g_cfg.uiTraffic);
 #endif
 }
 
@@ -3092,9 +3792,13 @@ void drawSettings(XPLMWindowID win, void*) {
                                isMic ? g_micList : g_outList, "system default");
                 break;
             }
-            case xr::Kind::KeyBind:
-                xr::ui::keybind(g_ui, f.label, xr::keyName(*(int*)f.ptr), g_captureKey);
+            case xr::Kind::KeyBind: {
+                // 0.7: two of them now (PTT, intercom) -- the key pressed goes to the row that was clicked
+                int* key = (int*)f.ptr;
+                bool capturing = g_captureKey == key;
+                if (xr::ui::keybind(g_ui, f.label, xr::keyName(*key), capturing)) g_captureKey = key;
                 break;
+            }
         }
     }
 
@@ -3318,11 +4022,10 @@ void drawSettings(XPLMWindowID win, void*) {
     // from. Keyed on the wanted height alone, a pilot who drags the window
     // short while a tall tab is open never gets the content back -- the tab
     // has not changed size, so the same answer is refused for ever.
-    static int g_grownTo = 0, g_grownFrom = 0;
-    if (g_ui.clipped && (wantHeight != g_grownTo || (t - b) != g_grownFrom)) {
+    if (g_ui.clipped && (wantHeight != g_settingsGrownTo || (t - b) != g_settingsGrownFrom)) {
         const int want = wantHeight;
-        g_grownTo = want;
-        g_grownFrom = t - b;
+        g_settingsGrownTo = want;
+        g_settingsGrownFrom = t - b;
         if (want > t - b) {
             int sl, st, sr, sb;
             XPLMGetScreenBoundsGlobal(&sl, &st, &sr, &sb);
@@ -3358,13 +4061,18 @@ int settingsClick(XPLMWindowID win, int x, int y, XPLMMouseStatus status, void*)
 }
 
 void settingsKey(XPLMWindowID, char key, XPLMKeyFlags flags, char vk, void*, int losingFocus) {
-    if (losingFocus) { g_ui.focus = -1; g_keyQueue.clear(); g_captureKey = false; return; }
+    if (losingFocus) { g_ui.focus = -1; g_keyQueue.clear(); g_captureKey = nullptr; return; }
     if (!(flags & xplm_DownFlag)) return;
     if (g_captureKey) {
-        // Whatever was pressed becomes the PTT key; Escape means "none".
+        // Whatever was pressed becomes that row's key; Escape means "none". One key does one thing:
+        // given to the PTT, it is taken off the intercom, and the other way round.
         const int k = (unsigned char)vk;
-        g_edit.pttKey = (k == XPLM_VK_ESCAPE || k == 0) ? 0 : k;
-        g_captureKey = false;
+        *g_captureKey = (k == XPLM_VK_ESCAPE || k == 0) ? 0 : k;
+        if (*g_captureKey) {
+            if (g_captureKey != &g_edit.pttKey && g_edit.pttKey == *g_captureKey) g_edit.pttKey = 0;
+            if (g_captureKey != &g_edit.intercomKey && g_edit.intercomKey == *g_captureKey) g_edit.intercomKey = 0;
+        }
+        g_captureKey = nullptr;
         return;
     }
     // Everything, Enter and Escape included, goes through the queue so the
@@ -3543,14 +4251,6 @@ const struct { const char* name; const char* desc; } kTowerCmds[] = {
 // ---------------------------------------------------------------------------
 // Phase U: what the new window shows (filled every frame) and what it can ask for
 // ---------------------------------------------------------------------------
-uint32_t standbyKhz(int which) {
-    XPLMDataRef r = XPLMFindDataRef(which == 2 ? "sim/cockpit2/radios/actuators/com2_standby_frequency_hz_833" : "sim/cockpit2/radios/actuators/com1_standby_frequency_hz_833");
-    return r ? (uint32_t)XPLMGetDatai(r) : 0;
-}
-void setStandbyKhz(int which, uint32_t khz) {
-    XPLMDataRef r = XPLMFindDataRef(which == 2 ? "sim/cockpit2/radios/actuators/com2_standby_frequency_hz_833" : "sim/cockpit2/radios/actuators/com1_standby_frequency_hz_833");
-    if (r) XPLMSetDatai(r, (int)khz);
-}
 uint32_t g_guardPrevKhz = 0;
 
 xr::ui2::Actions makeActions() {
@@ -3577,6 +4277,30 @@ xr::ui2::Actions makeActions() {
     a.importSimbrief = []() { importSimbrief(); };
     a.writeFms = []() { return writeOfpFms(); };
     a.checkUpdate = []() {};
+    // 0.7
+    a.icPtt = [](bool down) { setIntercom(down); };
+    a.setIntercomVolume = [](float v) {
+        g_cfg.intercomVolume = std::max(0.f, std::min(1.f, v));
+        xr::voice::setIntercomVolume(g_cfg.intercomVolume);
+        xr::ui2::state().edit.intercomVolume = g_cfg.intercomVolume;   // a later Apply keeps it
+        g_saveAt = g_elapsed + 2.f;                                     // saved once the slider rests
+    };
+    a.tunePreset = [](int slot, int which) { tunePreset(slot, which); };
+    a.storePreset = [](int slot) { defer("store a quick-tune slot", [slot] { storePreset(slot); xr::ui2::state().edit.presets = g_cfg.presets; }); };
+    a.kick = [](uint32_t sid, int minutes) { sendAdmin(xr::ADMIN_KICK, sid, (uint16_t)std::max(0, minutes)); };
+    a.mute = [](uint32_t sid, bool on) { sendAdmin(on ? xr::ADMIN_MUTE : xr::ADMIN_UNMUTE, sid); };
+    a.lanSearch = []() { startLanSearch(); };
+    a.join = [](const std::string& address, unsigned port) {
+        // join it as if typed into Connect to: hosting off, the address and port in, applied by the flight loop
+        Settings want = g_cfg;
+        want.hostEnabled = false;
+        want.host = address;
+        want.port = std::to_string(port);
+        requestApply(want);
+        xr::ui2::state().editLoaded = false;          // the form shows what was applied
+    };
+    a.micTest = [](bool down) { if (down) xr::voice::startMicTest(); else xr::voice::stopMicTest(); };
+    a.toggleTraffic = []() { toggleTrafficWindow(); };
     return a;
 }
 
@@ -3623,20 +4347,22 @@ xr::ui2::Model buildModel() {
         m.conn.skyLine = !xr::weather::available() ? "my own (X-Plane 11 cannot share weather)" : someoneElseIsTheSky() ? (g_cfg.followWeather ? "the flight's" : "the flight's (not following)") : g_cfg.shareWeather ? "mine, shared with the flight" : "my own";
     }
     const std::vector<uint32_t> speakers = xr::voice::activeSpeakers();
+    const std::vector<uint32_t> icSpeakers = xr::voice::activeIntercomSpeakers();
     float bestSignal = 0.f;
     std::string who;
     for (uint32_t sid : speakers) {
-        auto it = g_remote.find(sid);
-        if (who.empty()) who = it != g_remote.end() ? it->second.callsign : std::to_string(sid);
+        if (who.empty()) who = speakerName(sid);
         bestSignal = std::max(bestSignal, xr::voice::signalQualityOf(sid));
     }
     m.txWho = who;
     m.pttDown = g_pttDown; m.pttDownAt = g_pttDownAt;
     for (int i = 0; i < 2; ++i) {
         xr::ui2::Com& c = m.com[i];
-        c.which = i + 1; c.activeKhz = comKhz(i + 1); c.standbyKhz = standbyKhz(i + 1); c.powered = comPowered(i + 1);
+        // as crew aboard somebody's aircraft, its radios
+        c.which = i + 1; c.activeKhz = comKhzEff(i + 1); c.powered = comPoweredEff(i + 1);
+        c.standbyKhz = crewAboardOther() ? (i ? g_crew.panel.com2StbyKhz : g_crew.panel.com1StbyKhz) : standbyKhz(i + 1);
         for (const auto& st : g_atcList) if (st.freqKhz && st.freqKhz == c.activeKhz) { c.stationName = st.callsign; break; }
-        const bool txHere = txCom() == i + 1;
+        const bool txHere = txComEff() == i + 1;
         c.tx = g_pttDown && txHere;
         c.rx = !speakers.empty() && txHere;
         c.signal = c.rx ? bestSignal : 0.f;
@@ -3660,10 +4386,19 @@ xr::ui2::Model buildModel() {
         m.atis.emplace_back(at.icao + " information " + std::string(1, at.letter), at.text);
     }
     const double myLat = dd(g_ref.lat), myLon = dd(g_ref.lon);
+    const float myAltFt = (float)(dd(g_ref.elev) * 3.28084);
+    m.ownHeading = fd(g_ref.psi);
+    m.ownAltFt = myAltFt;
     for (const auto& kv : g_remote) {
         const Remote& r = kv.second;
         xr::ui2::Pilot q;
         q.sid = r.sid; q.callsign = r.callsign; q.type = r.acIcao; q.distNm = distanceNm(myLat, myLon, r.lat, r.lon);
+        // 0.7: where it is from us, for the traffic scope
+        q.bearingDeg = bearingDeg(myLat, myLon, r.lat, r.lon);
+        q.relAltFt = r.altMslM * 3.28084f - myAltFt;
+        q.onTcas = xr::xpdrTransmitting(r.xpdrMode);
+        q.vsFpm = r.vsMs * 196.85f;
+        q.trackDeg = r.track;
         q.altFt = r.altMslM * 3.28084f; q.gsKt = r.gsMs * 1.94384f; q.squawk = r.squawk; q.ai = r.ai; q.drawn = r.drawn;
         q.talking = std::find(speakers.begin(), speakers.end(), r.sid) != speakers.end();
         q.signal = q.talking ? xr::voice::signalQualityOf(r.sid) : 0.f;
@@ -3717,9 +4452,91 @@ xr::ui2::Model buildModel() {
     const xr::update::Info up = xr::update::latest();
     m.update.newer = up.newer; m.update.latest = up.latest; m.update.url = up.url; m.update.current = xr::brand::version();
     m.towerActive = xr::tower::active(); m.towerStatus = xr::tower::statusLine();
+
+    // --- 0.7 ---
+    // the shared cockpit
+    m.crew.mode = g_cfg.crewMode;
+    m.crew.aboard = g_crew.aboard;
+    m.crew.role = xr::cockpit::roleName(g_crew.role);
+    m.crew.aircraft = g_crew.aircraft;
+    m.crew.problem = g_crew.problem;
+    m.crew.icDown = g_icDown;
+    m.crew.icVolume = g_cfg.intercomVolume;
+    for (const CrewSeat& seat : g_crew.seats) {
+        xr::ui2::CrewSeatView v;
+        v.callsign = seat.callsign; v.role = xr::cockpit::roleName(seat.role);
+        v.me = seat.sid == g_sessionId.load();
+        v.talking = (v.me && (g_icDown || g_pttDown)) ||
+                    std::find(icSpeakers.begin(), icSpeakers.end(), seat.sid) != icSpeakers.end() ||
+                    std::find(speakers.begin(), speakers.end(), seat.sid) != speakers.end();
+        m.crew.seats.push_back(v);
+    }
+    if (!icSpeakers.empty()) m.crew.icWho = speakerName(icSpeakers.front());
+    // who is coming in, with what the radio and the transponder say about them
+    for (const xr::voice::SpeakerInfo& si : xr::voice::speakers()) {
+        xr::ui2::SpeakerView v;
+        v.callsign = speakerName(si.sid);
+        v.intercom = si.intercom;
+        v.freqText = freqLabel(si.freqKhz);
+        v.signal = si.quality;
+        v.atc = isAtcStation(v.callsign);
+        auto it = g_remote.find(si.sid);
+        if (it != g_remote.end()) {
+            v.distNm = distanceNm(myLat, myLon, it->second.lat, it->second.lon);
+            v.squawk = it->second.squawk;
+            v.xpdr = xpdrModeName(it->second.xpdrMode);
+        }
+        m.speakers.push_back(v);
+    }
+    for (const auto& pr : presets()) m.presets.push_back({pr.label, pr.khz});
+    // the connection
+    m.tele.have = g_connected && g_rtt.haveRtt();
+    m.tele.rttMs = g_rtt.rttMs(); m.tele.jitterMs = g_rtt.jitterMs();
+    m.tele.lossPct = g_rtt.lossPct(g_elapsed); m.tele.voiceLossPct = g_voiceLossPct;
+    // hosting: who is in
+    {
+        const xr::relay::Status st = xr::relay::status();
+        m.hostMax = st.maxPilots;
+        for (const xr::relay::PilotInfo& pi : st.pilots) {
+            xr::ui2::HostPilot hp;
+            hp.sid = pi.sid; hp.callsign = pi.callsign; hp.address = pi.host;
+            hp.muted = pi.muted; hp.atc = pi.atc; hp.crew = pi.crewOf != 0;
+            hp.me = pi.sid == g_sessionId.load();
+            m.hostPilots.push_back(hp);
+        }
+    }
+    // the flights on this network
+    {
+        std::lock_guard<std::mutex> lk(g_lanMx);
+        for (const LanFlight& f : g_lanFound) {
+            xr::ui2::LanFlightView v;
+            v.address = f.address; v.name = f.name; v.version = f.version; v.port = f.port;
+            v.pilots = f.pilots; v.maxPilots = f.maxPilots; v.password = f.password; v.hosted = f.hosted;
+            v.sameVersion = f.sameVersion;
+            m.lan.push_back(v);
+        }
+    }
+    m.lanBusy = g_lanBusy.load();
+    m.lanSearched = g_lanAt > -100.f;
+    // the microphone test, and the level whenever the microphone is in use
+    const xr::voice::MicTest mt = xr::voice::micTest();
+    m.micTest.state = mt == xr::voice::MicTest::Recording ? 1 : mt == xr::voice::MicTest::Playing ? 2 : 0;
+    m.micTest.seconds = xr::voice::micTestSeconds();
+    if (g_icDown || mt == xr::voice::MicTest::Recording) m.voice.micLevel = xr::voice::micLevel();
     return m;
 }
 #endif
+
+// 0.7: the traffic scope window, from the menu, a command or the Display settings.
+void toggleTrafficWindow() {
+#ifdef XRADIO_UI_IMGUI
+    const bool on = !xr::ui2::host::trafficVisible();
+    xr::ui2::host::showTraffic(on);
+    g_cfg.uiTraffic = on;
+#else
+    logMsg("the traffic scope is part of the ImGui window; this build has the text window only");
+#endif
+}
 
 void menuHandler(void*, void* item) {
     intptr_t which = (intptr_t)item;
@@ -3746,6 +4563,10 @@ void menuHandler(void*, void* item) {
         xr::tower::groundView();
     } else if (which == 8) {
         xr::tower::towerView();
+    } else if (which == 9) {
+        toggleTrafficWindow();
+    } else if (which == 10) {
+        startLanSearch();
     }
 }
 
@@ -3790,6 +4611,8 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     xr::ui2::host::init(makeActions(), g_cfg);
     // Tower mode's windows exist only here: a build without ImGui runs Tower mode (camera, link, traffic) headless
     xr::ui2::host::initTower(makeTowerActions(), g_cfg.towerLayout);
+    // 0.7: the traffic scope -- after the tower's six, so the windows keep their numbers
+    xr::ui2::host::initTraffic(g_cfg.uiTrafficWin, g_cfg.uiTraffic);
 #endif
 
     // ICAO Doc 8643 (XPMP2 ships it in Resources/) to tell a real designator from a made-up one
@@ -3817,6 +4640,18 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
 
     g_cmdPtt = XPLMCreateCommand("xradio/ptt", "XRadio: push to talk");
     XPLMRegisterCommandHandler(g_cmdPtt, pttHandler, 1, nullptr);
+    // 0.7
+    g_cmdIntercom = XPLMCreateCommand("xradio/intercom", "XRadio: intercom push to talk (shared cockpit)");
+    XPLMRegisterCommandHandler(g_cmdIntercom, intercomHandler, 1, nullptr);
+    g_cmdTraffic = XPLMCreateCommand("xradio/traffic_window", "XRadio: show / hide the traffic scope");
+    XPLMRegisterCommandHandler(g_cmdTraffic, trafficWindowHandler, 1, nullptr);
+    for (int i = 0; i < 8; ++i) {
+        char name[48], desc[80];
+        snprintf(name, sizeof(name), "xradio/preset_%d", i + 1);
+        snprintf(desc, sizeof(desc), "XRadio: tune quick-tune slot %d on COM1", i + 1);
+        g_cmdPreset[i] = XPLMCreateCommand(name, desc);
+        XPLMRegisterCommandHandler(g_cmdPreset[i], presetHandler, 1, (void*)(intptr_t)i);
+    }
     XPLMRegisterKeySniffer(pttKeySniffer, 0 /* after windows */, nullptr);
     for (size_t i = 0; i < sizeof(kTowerCmds) / sizeof(kTowerCmds[0]); ++i) {
         XPLMCommandRef r = XPLMCreateCommand(kTowerCmds[i].name, kTowerCmds[i].desc);
@@ -3834,6 +4669,8 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     XPLMAppendMenuItem(g_menu, "Tower: show / hide windows", (void*)6, 0);
     XPLMAppendMenuItem(g_menu, "Tower: view from the apron", (void*)7, 0);
     XPLMAppendMenuItem(g_menu, "Tower: back to the cab",    (void*)8, 0);
+    XPLMAppendMenuItem(g_menu, "Traffic scope window",      (void*)9, 0);
+    XPLMAppendMenuItem(g_menu, "Find flights on this network", (void*)10, 0);
 
     XPLMCreateFlightLoop_t fl{};
     fl.structSize   = sizeof(fl);
@@ -3887,6 +4724,9 @@ PLUGIN_API void XPluginStop(void) {
         if (!o.empty()) g_cfg.uiOverlayPos = o;
         g_cfg.uiTab = std::to_string(xr::ui2::host::currentTab());
         g_cfg.towerLayout = xr::ui2::host::towerLayout();
+        const std::string tw = xr::ui2::host::trafficGeometry();
+        if (!tw.empty()) g_cfg.uiTrafficWin = tw;
+        g_cfg.uiTraffic = xr::ui2::host::trafficVisible();
         xr::saveSettings(g_cfg, g_cfgPath);
     }
     xr::ui2::host::shutdown();
@@ -3910,6 +4750,11 @@ PLUGIN_API void XPluginStop(void) {
     if (g_settingsWin) { XPLMDestroyWindow(g_settingsWin); g_settingsWin = nullptr; }
     if (g_noticeWin)   { XPLMDestroyWindow(g_noticeWin);   g_noticeWin = nullptr; }
     if (g_cmdPtt) { XPLMUnregisterCommandHandler(g_cmdPtt, pttHandler, 1, nullptr); }
+    if (g_cmdIntercom) XPLMUnregisterCommandHandler(g_cmdIntercom, intercomHandler, 1, nullptr);
+    if (g_cmdTraffic) XPLMUnregisterCommandHandler(g_cmdTraffic, trafficWindowHandler, 1, nullptr);
+    for (int i = 0; i < 8; ++i)
+        if (g_cmdPreset[i]) XPLMUnregisterCommandHandler(g_cmdPreset[i], presetHandler, 1, (void*)(intptr_t)i);
+    if (g_lanThread.joinable()) g_lanThread.join();
     XPLMUnregisterKeySniffer(pttKeySniffer, 0, nullptr);
     if (g_menu)   { XPLMDestroyMenu(g_menu); g_menu = nullptr; }
     xr::crashlog::uninstall();

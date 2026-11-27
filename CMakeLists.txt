@@ -381,6 +381,8 @@ if(XRADIO_BUILD_TESTS)
     xradio_test_exe(settings_test  tools/harness/settings_test.cpp)
     xradio_test_exe(hosting_test   tools/harness/hosting_test.cpp)
     xradio_test_exe(tower_test     tools/harness/tower_test.cpp)
+    # 0.7: the shared cockpit end to end, against fake pilots (tools/fake_client.py --crew-open / --crew-join)
+    xradio_test_exe(crew_harness   tools/harness/crew_harness.cpp)
     # the new window's logic (and the tower windows'), without ImGui or X-Plane
     add_executable(ui_logic_test tools/harness/ui_logic_test.cpp plugin/src/ui2/model.cpp plugin/src/ui2/tower_model.cpp plugin/src/ui2/i18n.cpp)
     target_include_directories(ui_logic_test PRIVATE plugin/src)
@@ -416,6 +418,15 @@ if(XRADIO_BUILD_TESTS)
     if(XRADIO_SANITIZE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
         target_compile_options(radio_test PRIVATE -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer)
         target_link_options(radio_test    PRIVATE -fsanitize=address,undefined)
+    endif()
+
+    # 0.7: the shared cockpit's panel logic, the quick-tune slots and the round trip (cockpit.h): pure logic.
+    add_executable(cockpit_test tools/harness/cockpit_test.cpp)
+    target_include_directories(cockpit_test PRIVATE plugin/src)
+    target_compile_features(cockpit_test PRIVATE cxx_std_17)
+    if(XRADIO_SANITIZE AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(cockpit_test PRIVATE -g -O1 -fsanitize=address,undefined -fno-omit-frame-pointer)
+        target_link_options(cockpit_test    PRIVATE -fsanitize=address,undefined)
     endif()
 
     # Which aircraft is loaded (acftype.h) and the pilot's own TCAS (tcasread.h): pure logic, no X-Plane.

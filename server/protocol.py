@@ -14,6 +14,10 @@ reasoning behind each.
 import struct
 
 MAGIC = 0x31435258  # b"XRC1" little-endian
+# The XRadio release this server belongs to: what it tells the LAN search. Kept
+# equal to plugin/src/brand.h's by tools/release.py, and checked against it by
+# tools/check_sizes.py -- the built-in server answers with brand.h's.
+XRADIO_VERSION = "0.6.1"
 PROTO_VERSION = 6   # v6: ATC stations, injected AI traffic, flight plans, ATIS, the radio model
 # The oldest client a server still lets in: a v5 pilot (XRadio 0.5) flies in a
 # v6 flight on what v5 knew -- v5 headers, v5-sized records, no v6-only packets.
@@ -39,6 +43,10 @@ PT_ATIS = 15         # ATC -> server (publish); server -> pilot who tunes it
 PT_ATC_LIST = 16     # server -> everyone: the stations online and the ATIS frequencies
 PT_AIRCRAFT = 17     # pilot -> server (echoed back as the receipt) -> ATC stations: the loaded aircraft
 PT_TCAS = 18         # pilot -> server -> ATC stations: the pilot's own TCAS advisory
+# 0.7, new types an older peer drops -- see protocol.h
+PT_CREW = 19         # shared cockpit: open, join, leave, who is aboard, the radio panel (docs/crew.md)
+PT_ADMIN = 20        # kick, mute, the pilot limit; needs the server's admin token, no login
+PT_DISCOVER = 21     # anyone -> server, no login: is there a flight here? (the LAN search)
 
 # AIRCRAFT.source
 AS_DEFAULT, AS_DETECTED, AS_MAPPED, AS_MANUAL = 0, 1, 2, 3
@@ -55,7 +63,31 @@ GUARD_KHZ = 121500
 def is_guard(freq_khz: int) -> bool:
     return freq_khz == GUARD_KHZ
 
+
+# 0.7: the cockpit intercom, as PT_VOICE / PT_TEXT on a frequency no radio can
+# tune. Relayed to the sender's crew only, with no range: it is a wire.
+INTERCOM_KHZ = 1
+
+
+def is_intercom(freq_khz: int) -> bool:
+    return freq_khz == INTERCOM_KHZ
+
+
 RJ_PASSWORD, RJ_VERSION = 1, 2
+RJ_KICKED, RJ_FULL = 3, 4     # 0.7: removed by the host; the flight is full
+
+# PT_CREW (0.7, docs/crew.md)
+CREW_OPEN, CREW_CLOSE, CREW_JOIN, CREW_LEAVE = 1, 2, 3, 4
+CREW_STATE, CREW_REFUSED, CREW_PANEL, CREW_TUNE = 5, 6, 7, 8
+CREW_ROLE_NONE, CREW_ROLE_PILOT, CREW_ROLE_COPILOT, CREW_ROLE_OBSERVER = 0, 1, 2, 3
+CREW_NO_SUCH, CREW_NOT_OPEN, CREW_BAD_CODE, CREW_FULL, CREW_CLOSED, CREW_BUSY = 1, 2, 3, 4, 5, 6
+MAX_CREW = 4                  # the pilot and three more
+CP_COM1_POWER, CP_COM2_POWER = 1 << 0, 1 << 1
+
+# PT_ADMIN (0.7)
+ADMIN_KICK, ADMIN_MUTE, ADMIN_UNMUTE, ADMIN_LIMIT = 1, 2, 3, 4
+MAX_PING_ECHO = 16            # a pong echoes at most this much of its ping
+DF_PASSWORD, DF_HOSTED = 1 << 0, 1 << 1   # DISCOVER.flags
 
 LF_WEATHER_SOURCE = 1 << 0    # LoginPayload.flags: "my weather is the flight's"
 LF_ATC = 1 << 1               # v6: an ATC station -- never traffic, listed in PT_ATC_LIST, gets flight plans
@@ -164,6 +196,17 @@ ATC_ENTRY = struct.Struct("<I16s8sIBB2s2d2fHH")
 AIRCRAFT = struct.Struct("<8s12s4s32sHHIcBH")
 # timeMs, level, sense, message, reserved, vsTargetMs, vsMs, intruderSid -- see TcasPayload
 TCAS = struct.Struct("<IBbBBffI")
+# 0.7
+PING = struct.Struct("<II")               # seq, timeMs -- echoed in the pong
+# op, role, reason, count, aircraftSid, callsign, code, fromSid, reserved -- see CrewPayload
+CREW = struct.Struct("<BBBBI16s16sII")
+CREW_MEMBER = struct.Struct("<I16sBBH")   # sid, callsign, role, flags, reserved
+# com1, com2, com1 standby, com2 standby, txSel, rxMask, flags, reserved, com1Vol, com2Vol -- see CrewPanel
+CREW_PANEL_REC = struct.Struct("<4I4B2f")
+# op, result, minutes, targetSid, value, target, token -- see AdminPayload
+ADMIN = struct.Struct("<BBHII16s32s")
+# protoVer, port, pilots, maxPilots, flags, reserved, name, version, nonce, reserved2 -- see DiscoverPayload
+DISCOVER = struct.Struct("<HHHHB3s28s16sII")
 
 # The flight's shared sky: time, then X-Plane 12's region weather whole --
 # three cloud layers and thirteen altitude levels, the sim's own counts.
@@ -183,6 +226,10 @@ assert ATIS_HDR.size == 16
 assert ATC_ENTRY.size == 64
 assert AIRCRAFT.size == 68
 assert TCAS.size == 20
+assert PING.size == 8
+assert CREW.size == 48 and CREW_MEMBER.size == 24 and CREW_PANEL_REC.size == 28
+assert ADMIN.size == 60
+assert DISCOVER.size == 64
 
 
 def pack(ptype: int, session_id: int, payload: bytes = b"", version: int = PROTO_VERSION) -> bytes:
@@ -272,6 +319,56 @@ def unpack_tcas(payload: bytes):
     t, level, sense, message, _r, vst, vs, intr = TCAS.unpack_from(payload, 0)
     return {"time_ms": t, "level": level, "sense": sense, "message": message, "vs_target_ms": vst, "vs_ms": vs,
             "intruder_sid": intr}
+
+
+def crew(op: int, callsign: str = "", code: str = "", role: int = CREW_ROLE_NONE, reason: int = 0,
+         count: int = 0, aircraft_sid: int = 0, from_sid: int = 0) -> bytes:
+    """A CREW payload (0.7): open, close, join, leave -- or, from the server, state and refusals."""
+    return CREW.pack(op, role, reason, count, aircraft_sid, pad(callsign, 16), pad(code, 16), from_sid, 0)
+
+
+def unpack_crew(payload: bytes):
+    """The dict form of a CREW payload with what follows it (members, or a panel); None if too short."""
+    if len(payload) < CREW.size:
+        return None
+    op, role, reason, count, aircraft_sid, cs, code, from_sid, _r = CREW.unpack_from(payload, 0)
+    d = {"op": op, "role": role, "reason": reason, "count": count, "aircraft_sid": aircraft_sid,
+         "callsign": cstr(cs), "code": cstr(code), "from_sid": from_sid, "members": [], "panel": None}
+    off = CREW.size
+    if op == CREW_STATE:
+        for _ in range(count):
+            if off + CREW_MEMBER.size > len(payload):
+                break
+            sid, mcs, mrole, _f, _rr = CREW_MEMBER.unpack_from(payload, off)
+            d["members"].append((sid, cstr(mcs), mrole))
+            off += CREW_MEMBER.size
+    elif op in (CREW_PANEL, CREW_TUNE) and len(payload) >= off + CREW_PANEL_REC.size:
+        d["panel"] = CREW_PANEL_REC.unpack_from(payload, off)
+    return d
+
+
+def crew_panel(com1=0, com2=0, com1_stby=0, com2_stby=0, tx_sel=0, rx_mask=0xFF, flags=0,
+               com1_vol=-1.0, com2_vol=-1.0) -> bytes:
+    """A CrewPanel record (0.7). The defaults are the "leave it alone" values a CREW_TUNE uses."""
+    return CREW_PANEL_REC.pack(com1, com2, com1_stby, com2_stby, tx_sel, rx_mask, flags, 0, com1_vol, com2_vol)
+
+
+def admin(op: int, token: str, target_sid: int = 0, target: str = "", minutes: int = 0, value: int = 0) -> bytes:
+    """An ADMIN payload (0.7): kick, mute, unmute or the pilot limit, with the server's admin token."""
+    return ADMIN.pack(op, 0, minutes, target_sid, value, pad(target, 16), pad(token, 32))
+
+
+def discover_probe(nonce: int) -> bytes:
+    """The LAN search's question: a DISCOVER record with only the nonce set, full size."""
+    return DISCOVER.pack(0, 0, 0, 0, 0, b"\x00" * 3, pad("", 28), pad("", 16), nonce & 0xFFFFFFFF, 0)
+
+
+def unpack_discover(payload: bytes):
+    if len(payload) < DISCOVER.size:
+        return None
+    proto, port, pilots, max_pilots, flags, _r, name, version, nonce, _r2 = DISCOVER.unpack_from(payload, 0)
+    return {"proto": proto, "port": port, "pilots": pilots, "max_pilots": max_pilots, "flags": flags,
+            "name": cstr(name), "version": cstr(version), "nonce": nonce}
 
 
 def cstr(raw: bytes) -> str:

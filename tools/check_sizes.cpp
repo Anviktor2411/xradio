@@ -6,6 +6,7 @@
 #include <cstring>
 #include "protocol.h"
 #include "radio.h"
+#include "version.h"
 
 namespace {
 using xr::radio::Node;
@@ -101,6 +102,12 @@ int main() {
     printf("ATC_ENTRY %zu\n",     sizeof(xr::AtcEntry));
     printf("AIRCRAFT %zu\n",      sizeof(xr::AircraftPayload));
     printf("TCAS %zu\n",          sizeof(xr::TcasPayload));
+    printf("PING %zu\n",          sizeof(xr::PingPayload));
+    printf("CREW %zu\n",          sizeof(xr::CrewPayload));
+    printf("CREW_MEMBER %zu\n",   sizeof(xr::CrewMember));
+    printf("CREW_PANEL_REC %zu\n", sizeof(xr::CrewPanel));
+    printf("ADMIN %zu\n",         sizeof(xr::AdminPayload));
+    printf("DISCOVER %zu\n",      sizeof(xr::DiscoverPayload));
     // Not a struct, but the same class of mistake: a packet budget or an
     // entry cap that drifts apart between the two servers shows up as
     // traffic that thins out for clients of one of them.
@@ -127,6 +134,26 @@ int main() {
     printf("MAX_TRAFFIC_ENTRIES_V5 %d\n", xr::kMaxTrafficEntriesV5);
     printf("AL_DUCTING %d\n",     (int)xr::AL_DUCTING);
     printf("AE_POSITION %d\n",    (int)xr::AE_POSITION);
+    // 0.7
+    printf("PT_CREW %d\n",        (int)xr::PT_CREW);
+    printf("PT_ADMIN %d\n",       (int)xr::PT_ADMIN);
+    printf("PT_DISCOVER %d\n",    (int)xr::PT_DISCOVER);
+    printf("INTERCOM_KHZ %u\n",   (unsigned)xr::kIntercomKhz);
+    printf("RJ_KICKED %d\n",      (int)xr::RJ_KICKED);
+    printf("RJ_FULL %d\n",        (int)xr::RJ_FULL);
+    printf("CREW_OPS %d %d %d %d %d %d %d %d\n", (int)xr::CREW_OPEN, (int)xr::CREW_CLOSE, (int)xr::CREW_JOIN,
+           (int)xr::CREW_LEAVE, (int)xr::CREW_STATE, (int)xr::CREW_REFUSED, (int)xr::CREW_PANEL, (int)xr::CREW_TUNE);
+    printf("CREW_ROLES %d %d %d %d\n", (int)xr::CREW_ROLE_NONE, (int)xr::CREW_ROLE_PILOT, (int)xr::CREW_ROLE_COPILOT,
+           (int)xr::CREW_ROLE_OBSERVER);
+    printf("CREW_REASONS %d %d %d %d %d %d\n", (int)xr::CREW_NO_SUCH, (int)xr::CREW_NOT_OPEN, (int)xr::CREW_BAD_CODE,
+           (int)xr::CREW_FULL, (int)xr::CREW_CLOSED, (int)xr::CREW_BUSY);
+    printf("MAX_CREW %d\n",       xr::kMaxCrew);
+    printf("CP_POWER %d %d\n",    (int)xr::CP_COM1_POWER, (int)xr::CP_COM2_POWER);
+    printf("ADMIN_OPS %d %d %d %d\n", (int)xr::ADMIN_KICK, (int)xr::ADMIN_MUTE, (int)xr::ADMIN_UNMUTE,
+           (int)xr::ADMIN_LIMIT);
+    printf("MAX_PING_ECHO %d\n",  xr::kMaxPingEcho);
+    printf("DF_FLAGS %d %d\n",    (int)xr::DF_PASSWORD, (int)xr::DF_HOSTED);
+    printf("XRADIO_VERSION %s\n", xr::brand::version());
     radioCases();
     return 0;
 }

@@ -83,12 +83,93 @@ void drawCom(Model& m, const Actions& a, int i) {
     ImGui::PopID();
 }
 
+// 0.7: the quick-tune slots -- click for COM1, right-click for COM2, Ctrl+click to keep COM1 in the slot.
+void drawPresets(Model& m, const Actions& a) {
+    const Palette& p = palette();
+    muted(tr("Quick-tune"));
+    for (int i = 0; i < 8; ++i) {
+        ImGui::SameLine();
+        ImGui::PushID(i);
+        const bool have = i < (int)m.presets.size();
+        char label[40];
+        if (have) snprintf(label, sizeof label, "%s##p", m.presets[(size_t)i].label.c_str());
+        else snprintf(label, sizeof label, "%d##p", i + 1);
+        if (!have) ImGui::PushStyleColor(ImGuiCol_Text, p.muted);
+        const bool clicked = ImGui::SmallButton(label);
+        const bool right = ImGui::IsItemClicked(ImGuiMouseButton_Right);
+        if (!have) ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", have ? (fmtKhz(m.presets[(size_t)i].khz) + "   " + tr("click: COM1, right-click: COM2, Ctrl+click: keep COM1 here")).c_str()
+                                         : tr("Ctrl+click: keep COM1 here"));
+        if (clicked && ImGui::GetIO().KeyCtrl) { if (a.storePreset) a.storePreset(i); }
+        else if (clicked && have && a.tunePreset) a.tunePreset(i, 1);
+        else if (right && have && a.tunePreset) a.tunePreset(i, 2);
+        ImGui::PopID();
+    }
+}
+
+// 0.7: the shared cockpit -- who is aboard, the intercom's button and volume.
+void drawCrew(Model& m, const Actions& a) {
+    const Palette& p = palette();
+    const CrewView& c = m.crew;
+    if (c.mode == "off" && !c.aboard) return;
+    ImGui::BeginChild("crew", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
+    heading(tr("Shared cockpit"));
+    ImGui::SameLine();
+    if (c.aboard) {
+        if (c.role == "pilot") ImGui::TextColored(p.ok, "%s", c.seats.size() > 1 ? tr("crew aboard") : tr("open to a crew"));
+        else ImGui::TextColored(p.ok, "%s %s %s %s", tr("aboard"), c.aircraft.c_str(), tr("as"), tr(c.role.c_str()));
+    } else if (!c.problem.empty()) {
+        ImGui::TextColored(p.warn, "%s", c.problem.c_str());
+    } else {
+        muted(c.mode == "pilot" ? tr("opening the cockpit...") : tr("joining..."));
+    }
+    for (const CrewSeatView& s : c.seats) {
+        light(p.rx, s.talking, 4.f); ImGui::SameLine();
+        ImGui::TextColored(s.me ? p.accent : p.text, "%s", s.callsign.c_str()); ImGui::SameLine();
+        muted(tr(s.role.c_str())); ImGui::SameLine();
+        ImGui::Dummy(ImVec2(8, 0)); ImGui::SameLine();
+    }
+    ImGui::NewLine();
+    const bool can = c.aboard && c.seats.size() > 1;
+    ImGui::BeginDisabled(!can);
+    ImGui::Button(c.icDown ? tr("Intercom: talking") : tr("Intercom (hold)"), ImVec2(170, 0));
+    if (ImGui::IsItemActivated() && a.icPtt) { g_st.icHeld = true; a.icPtt(true); }
+    if (ImGui::IsItemDeactivated() && a.icPtt && g_st.icHeld) { g_st.icHeld = false; a.icPtt(false); }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (!c.icWho.empty()) { ImGui::TextColored(p.rx, "%s %s", c.icWho.c_str(), tr("on the intercom")); ImGui::SameLine(); }
+    ImGui::SetNextItemWidth(140);
+    float v = c.icVolume * 100.f;
+    if (ImGui::SliderFloat(tr("Intercom volume"), &v, 0.f, 100.f, "%.0f %%") && a.setIntercomVolume) a.setIntercomVolume(v / 100.f);
+    ImGui::EndChild();
+}
+
+// 0.7: who is coming in, with what the radio and the transponder say about them.
+void drawSpeakers(const Model& m) {
+    const Palette& p = palette();
+    for (const SpeakerView& s : m.speakers) {
+        if (s.intercom) {
+            ImGui::TextColored(p.rx, "%s", s.callsign.c_str()); ImGui::SameLine(); muted(tr("on the intercom"));
+            continue;
+        }
+        ImGui::TextColored(s.atc ? p.atc : p.rx, "%s", s.callsign.c_str());
+        ImGui::SameLine(); muted(s.freqText.c_str());
+        ImGui::SameLine(); signalBarsWidget(signalBars(s.signal), 5, p.rx);
+        ImGui::SameLine(); muted(signalWords(s.signal).c_str());
+        if (s.distNm >= 0) { ImGui::SameLine(); ImGui::Text("%.0f nm", s.distNm); }
+        if (s.squawk) { ImGui::SameLine(); ImGui::TextColored(s.squawk == 7700 || s.squawk == 7600 || s.squawk == 7500 ? p.err : p.muted, "%04u %s", s.squawk, s.xpdr.c_str()); }
+    }
+}
+
 void drawRadio(Model& m, const Actions& a) {
     const Palette& p = palette();
     drawCom(m, a, 0);
     drawCom(m, a, 1);
     bool guard = m.guard;
     if (ImGui::Checkbox(tr("Guard 121.500 on COM2"), &guard) && a.setGuard) a.setGuard(guard);
+    drawPresets(m, a);
+    drawCrew(m, a);
     ImGui::Separator();
     // the big push-to-talk indicator
     ImGui::BeginChild("ptt", ImVec2(0, 0), ImGuiChildFlags_AutoResizeY | ImGuiChildFlags_Borders);
@@ -100,6 +181,7 @@ void drawRadio(Model& m, const Actions& a) {
     else if (someone) ImGui::TextColored(p.rx, "%s %s", m.txWho.c_str(), tr("is transmitting"));
     else muted(tr("Nobody is transmitting"));
     popFont(g_st.fonts.heading);
+    if (!m.pttDown) drawSpeakers(m);
     if (m.pttDown) {
         ImGui::SameLine(); meter(m.voice.micLevel, p.tx, 140.f);
         const std::string stuck = stuckMicText(m.elapsed - m.pttDownAt, 30.0);
@@ -329,6 +411,18 @@ void drawFlightPlan(Model& m, const Actions& a) {
 }
 
 // ---------------------------------------------------------------- Host / Connect
+// After an item: put the next one, `width` wide, on the same line if it fits, else on a line of its own --
+// Estonian labels run longer, and everything does at a large UI scale.
+static void sameLineIfFits(float width) {
+    ImGui::SameLine();
+    if (ImGui::GetContentRegionAvail().x < width) ImGui::NewLine();
+}
+
+// How wide a checkbox with this label is.
+static float checkboxWidth(const char* label) {
+    return ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize(label, nullptr, true).x;
+}
+
 void drawHost(Model& m, const Actions& a) {
     const Palette& p = palette();
     if (!g_st.editLoaded) { g_st.edit = m.settings; g_st.editLoaded = true; }
@@ -342,10 +436,17 @@ void drawHost(Model& m, const Actions& a) {
     ImGui::SameLine(); ImGui::SetNextItemWidth(120);
     char pw[64]; snprintf(pw, sizeof pw, "%s", e.password.c_str());
     if (ImGui::InputText(tr("Password"), pw, sizeof pw, ImGuiInputTextFlags_Password)) { e.password = pw; g_st.editDirty = true; }
+    // 0.7: whether the network search finds it and how many may join -- no restart for either. Beside the
+    // switches above when there is room, so Connect and its Apply stay where they were.
     if (ImGui::Checkbox(tr("Ask the router to open the port"), &e.hostUpnp)) g_st.editDirty = true;
+    sameLineIfFits(checkboxWidth(tr("Findable on this network")));
+    if (ImGui::Checkbox(tr("Findable on this network"), &e.hostVisible)) g_st.editDirty = true;
     if (ImGui::Checkbox(tr("Rare tropospheric ducting (realism)"), &e.hostDucting)) g_st.editDirty = true;
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("%s", tr("On a warm, still evening the flight's shared weather may let VHF reach far past the horizon over the sea"));
+    sameLineIfFits(160.f + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize(tr("Most pilots (0 = no limit)"), nullptr, true).x);
+    ImGui::SetNextItemWidth(160);
+    if (ImGui::SliderFloat(tr("Most pilots (0 = no limit)"), &e.hostMaxPilots, 0.f, 32.f, "%.0f")) g_st.editDirty = true;
     const HostInfo& h = m.host;
     if (h.running) {
         ImGui::TextColored(p.ok, "%s: %s %u  ·  %d %s", tr("Running"), tr("Port"), h.port, h.clients, tr("connected"));
@@ -361,7 +462,45 @@ void drawHost(Model& m, const Actions& a) {
         else if (h.doubleNat) ImGui::TextColored(p.warn, "%s", tr("Hosting over the internet cannot work from here (double NAT)"));
         else if (!h.error.empty()) ImGui::TextColored(p.warn, "%s: %s", tr("Port not opened"), h.error.c_str());
         if (!h.lanAddress.empty()) { muted(tr("on your network")); ImGui::SameLine(); ImGui::TextUnformatted(h.lanAddress.c_str()); }
-        for (const auto& cs : h.callsigns) { ImGui::Bullet(); ImGui::TextUnformatted(cs.c_str()); }
+        // 0.7: who is in, and what the host can do about them: a list while it is only us, then a table with
+        // mute and kick, at most six pilots tall -- it scrolls past that, and Connect stays where it was.
+        bool others = false;
+        for (const HostPilot& hp : m.hostPilots) if (!hp.me) others = true;
+        const int shown = std::min((int)m.hostPilots.size(), 6);
+        const float rowH = ImGui::GetTextLineHeightWithSpacing() + 2.f * ImGui::GetStyle().CellPadding.y;
+        if (!others) {
+            for (const auto& cs : h.callsigns) { ImGui::Bullet(); ImGui::TextUnformatted(cs.c_str()); }
+        } else if (ImGui::BeginTable("hostpilots", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_ScrollY,
+                                     ImVec2(0.f, rowH * (float)(shown + 1) + 2.f))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn(tr("Callsign"), ImGuiTableColumnFlags_WidthStretch, 1.6f);
+            ImGui::TableSetupColumn(tr("from"), ImGuiTableColumnFlags_WidthStretch, 1.6f);
+            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthStretch, 2.6f);
+            ImGui::TableHeadersRow();
+            for (const HostPilot& hp : m.hostPilots) {
+                ImGui::TableNextRow();
+                ImGui::PushID((int)hp.sid);
+                ImGui::TableNextColumn(); ImGui::TextColored(hp.me ? p.accent : p.text, "%s", hp.callsign.c_str());
+                ImGui::TableNextColumn(); muted(hp.address.c_str());
+                ImGui::TableNextColumn();
+                if (hp.atc) { badge("ATC", p.atc); ImGui::SameLine(); }
+                if (hp.crew) { badge(tr("crew"), p.ai); ImGui::SameLine(); }
+                if (hp.muted) badge(tr("muted"), p.warn);
+                ImGui::TableNextColumn();
+                if (!hp.me) {
+                    if (ImGui::SmallButton(hp.muted ? tr("Unmute") : tr("Mute")) && a.mute) a.mute(hp.sid, !hp.muted);
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(tr("Kick")) && a.kick) a.kick(hp.sid, 0);
+                    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("out of the flight; they may come back"));
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton(tr("Kick 30 min")) && a.kick) a.kick(hp.sid, 30);
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+        if (m.hostMax > 0) { muted(tr("Most pilots")); ImGui::SameLine(); ImGui::Text("%d / %d", h.clients, m.hostMax); }
     } else muted(tr("Not hosting"));
     ImGui::Separator();
     heading(tr("Connect to"));
@@ -378,6 +517,27 @@ void drawHost(Model& m, const Actions& a) {
         if (g_st.editDirty && a.applySettings) { a.applySettings(e); g_st.editDirty = false; setNote(tr("Saved"), m.elapsed); }
         else if (a.reconnect) a.reconnect();
     }
+    // 0.7: the flights on this network, a click away
+    ImGui::SameLine();
+    ImGui::BeginDisabled(m.lanBusy);
+    if (ImGui::Button(m.lanBusy ? tr("searching...") : tr("Find flights on this network")) && a.lanSearch) a.lanSearch();
+    ImGui::EndDisabled();
+    if (!m.lan.empty()) {
+        for (const LanFlightView& f : m.lan) {
+            ImGui::PushID((f.address + ":" + std::to_string(f.port)).c_str());
+            ImGui::BeginDisabled(!f.sameVersion);
+            if (ImGui::SmallButton(tr("Join")) && a.join) a.join(f.address, f.port);
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextColored(p.text, "%s", f.name.c_str()); ImGui::SameLine();
+            muted((f.address + ":" + std::to_string(f.port)).c_str()); ImGui::SameLine();
+            if (f.maxPilots) ImGui::Text("%d/%d %s", f.pilots, f.maxPilots, tr("pilots")); else ImGui::Text("%d %s", f.pilots, tr("pilots"));
+            if (f.password) { ImGui::SameLine(); badge(tr("password"), p.warn); }
+            if (f.hosted) { ImGui::SameLine(); badge("X-Plane", p.ai); }
+            if (!f.sameVersion) { ImGui::SameLine(); ImGui::TextColored(p.err, "v%s", f.version.c_str()); }
+            ImGui::PopID();
+        }
+    } else if (m.lanSearched && !m.lanBusy) muted(tr("no flight answered on this network"));
     ImGui::Separator();
     heading(tr("Connection"));
     light(m.conn.connected ? p.ok : (m.conn.connecting ? p.warn : p.err), true); ImGui::SameLine();
@@ -394,6 +554,12 @@ void drawHost(Model& m, const Actions& a) {
     if (!m.conn.tcas.empty()) ImGui::TextColored(m.conn.tcas.rfind("RA", 0) == 0 ? p.err : p.warn, "TCAS %s", m.conn.tcas.c_str());
     if (m.conn.connected) {
         ImGui::Text("%s: %.1f s  ·  %d %s  ·  %d pilots, %d AI", tr("last packet"), m.conn.lastPacketS, m.conn.packetsPerS, tr("packets/s"), m.conn.peers, m.conn.aiCount);
+        // 0.7: the round trip, its jitter, what is lost on the way
+        const std::string tele = telemetryText(m.tele);
+        if (!tele.empty()) {
+            const bool bad = m.tele.rttMs > 250.0 || m.tele.lossPct > 5.0 || m.tele.voiceLossPct > 5.0;
+            ImGui::TextColored(bad ? p.warn : p.muted, "%s: %s", tr("round trip"), tele.c_str());
+        }
         ImGui::Text("%s: v%u (protocol %u)", tr("Server version"), m.conn.protoServer, m.conn.protoLocal);
     }
     if (!m.conn.versionMismatch.empty()) { ImGui::TextColored(p.err, "%s", m.conn.versionMismatch.c_str()); muted(tr("Everyone must run the same XRadio version")); }
@@ -437,10 +603,14 @@ void drawField(const FieldRef& f, Model& m, const Actions& a) {
         }
         case Kind::KeyBind: {
             int& v = *(int*)f.ptr;
-            const bool isPtt = std::string(f.key) == "pttkey";
-            bool& cap = isPtt ? g_st.capturingPtt : g_st.capturingTower;
+            const std::string key = f.key;
+            bool& cap = key == "pttkey" ? g_st.capturingPtt : key == "intercomkey" ? g_st.capturingIc : g_st.capturingTower;
             ImGui::TextUnformatted(tr(f.label)); ImGui::SameLine();
-            if (ImGui::Button(cap ? tr("press a key") : (v > 0 ? keyName(v).c_str() : tr("none")), ImVec2(150, 0))) { cap = !cap; if (isPtt) g_st.capturingTower = false; else g_st.capturingPtt = false; }
+            if (ImGui::Button(cap ? tr("press a key") : (v > 0 ? keyName(v).c_str() : tr("none")), ImVec2(150, 0))) {
+                const bool now = !cap;
+                g_st.capturingPtt = g_st.capturingTower = g_st.capturingIc = false;
+                cap = now;
+            }
             if (cap) { ImGui::SameLine(); ImGui::TextColored(p.warn, "..."); }
             ImGui::SameLine(); if (ImGui::SmallButton("x")) { v = 0; g_st.editDirty = true; cap = false; }
             break;
@@ -453,8 +623,8 @@ void drawSettings(Model& m, const Actions& a) {
     const Palette& p = palette();
     if (!g_st.editLoaded) { g_st.edit = m.settings; g_st.editLoaded = true; }
     Settings& e = g_st.edit;
-    const char* groups[7] = {tr("Audio"), tr("Controls"), tr("Display"), tr("Traffic"), tr("Language"), tr("Tower"), "SimBrief"};
-    for (int i = 0; i < 7; ++i) {
+    const char* groups[8] = {tr("Audio"), tr("Controls"), tr("Display"), tr("Traffic"), tr("Language"), tr("Tower"), "SimBrief", tr("Crew")};
+    for (int i = 0; i < 8; ++i) {
         if (i) ImGui::SameLine();
         if (ImGui::RadioButton(groups[i], g_st.settingsGroup == i)) g_st.settingsGroup = i;
         if (probesOn()) probeLast("group:" + std::to_string(i));
@@ -466,15 +636,23 @@ void drawSettings(Model& m, const Actions& a) {
     if (g == 0) {
         for (auto& f : fields) if (f.tab == 1 && f.kind != Kind::KeyBind) drawField(f, m, a);
         ImGui::Separator();
-        if (ImGui::Button(tr("Mic test: hold"), ImVec2(140, 0))) {}
+        // 0.7: a real microphone test -- recorded here, played back through the codec and the radio,
+        // sent to nobody (it used to key the transmitter, so the whole frequency heard the test)
+        if (ImGui::Button(m.micTest.state == 1 ? tr("Recording...") : m.micTest.state == 2 ? tr("Playing back...") : tr("Mic test: hold"), ImVec2(140, 0))) {}
         const bool held = ImGui::IsItemActive();
-        if (held != g_st.micTest) { g_st.micTest = held; if (a.keyPtt) a.keyPtt(held); }
+        if (held != g_st.micTest) { g_st.micTest = held; if (a.micTest) a.micTest(held); }
         ImGui::SameLine(); ImGui::TextUnformatted(tr("Level")); ImGui::SameLine(); meter(m.voice.micLevel, p.ok, 160.f);
         ImGui::SameLine(); if (ImGui::SmallButton("refresh devices") && a.refreshDevices) a.refreshDevices();
+        if (m.micTest.state) { ImGui::SameLine(); ImGui::Text("%.1f s", m.micTest.seconds); }
+        muted(tr("Hold, say something, let go: you hear yourself as the others will. Nothing is sent."));
         muted(m.voice.status.c_str());
     } else if (g == 1) {
         for (auto& f : fields) if (f.kind == Kind::KeyBind) drawField(f, m, a);
         muted("Also: bind xradio/ptt and xradio/tower/* in X-Plane's keyboard or joystick settings.");
+        ImGui::Separator();
+        // 0.7: the quick-tune slots; also Ctrl+click on a slot on the Radio tab, and xradio/preset_1..8
+        for (auto& f : fields) if (std::string(f.key) == "presets") drawField(f, m, a);
+        muted(tr("Up to eight, NAME=118.100 each, separated by ;  -- also the commands xradio/preset_1..8."));
     } else if (g == 2) {
         ImGui::SetNextItemWidth(200);
         if (ImGui::SliderFloat(tr("UI scale"), &e.uiScale, 0.75f, 2.f, "%.2f")) g_st.editDirty = true;
@@ -483,6 +661,8 @@ void drawSettings(Model& m, const Actions& a) {
         ImGui::SameLine(); if (ImGui::RadioButton(tr("Light"), e.uiTheme == "light")) { e.uiTheme = "light"; g_st.editDirty = true; }
         if (ImGui::Checkbox(tr("Cockpit overlay"), &e.uiOverlay)) g_st.editDirty = true;
         if (ImGui::Checkbox("Notices in the corner while the window is closed", &e.popUps)) g_st.editDirty = true;
+        if (ImGui::Checkbox(tr("Traffic scope window"), &e.uiTraffic)) g_st.editDirty = true;
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("also the command xradio/traffic_window"));
     } else if (g == 3) {
         for (auto& f : fields) if (f.tab == 2 || (f.tab == 4 && (std::string(f.key) == "showai" || std::string(f.key) == "aimax" || std::string(f.key) == "atccue"))) drawField(f, m, a);
     } else if (g == 4) {
@@ -491,10 +671,36 @@ void drawSettings(Model& m, const Actions& a) {
         muted("The radio itself stays English.");
     } else if (g == 5) {
         for (auto& f : fields) if (f.tab == 5) drawField(f, m, a);
-    } else {
+    } else if (g == 6) {
         for (auto& f : fields) if (std::string(f.key) == "simbriefuser") drawField(f, m, a);
         muted(tr("Kept only in XRadio's settings file. The latest OFP is fetched through SimBrief's official API, and only when you press Import."));
         if (ImGui::Button(tr("Plan on SimBrief")) && a.openUrl) a.openUrl(kSimbriefNewFlightUrl);
+    } else {
+        // 0.7: the shared cockpit (docs/crew.md)
+        ImGui::TextUnformatted(tr("Shared cockpit")); ImGui::SameLine();
+        if (ImGui::RadioButton(tr("off"), e.crewMode == "off")) { e.crewMode = "off"; g_st.editDirty = true; }
+        ImGui::SameLine(); if (ImGui::RadioButton(tr("my cockpit takes a crew"), e.crewMode == "pilot")) { e.crewMode = "pilot"; g_st.editDirty = true; }
+        ImGui::SameLine(); if (ImGui::RadioButton(tr("I join a cockpit"), e.crewMode == "join")) { e.crewMode = "join"; g_st.editDirty = true; }
+        if (e.crewMode == "join") {
+            char cs[16]; snprintf(cs, sizeof cs, "%s", e.crewJoin.c_str());
+            ImGui::SetNextItemWidth(140);
+            if (ImGui::InputTextWithHint(tr("Pilot to join (callsign)"), "ESNA12", cs, sizeof cs, ImGuiInputTextFlags_CharsUppercase)) { e.crewJoin = cs; g_st.editDirty = true; }
+            ImGui::TextUnformatted(tr("Role")); ImGui::SameLine();
+            if (ImGui::RadioButton(tr("copilot"), e.crewRole != "observer")) { e.crewRole = "copilot"; g_st.editDirty = true; }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("talks on the aircraft's radios, may retune them"));
+            ImGui::SameLine(); if (ImGui::RadioButton(tr("observer"), e.crewRole == "observer")) { e.crewRole = "observer"; g_st.editDirty = true; }
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", tr("hears the radios, talks on the intercom only"));
+            if (ImGui::Checkbox(tr("My radios follow the aircraft's"), &e.crewSyncRadios)) g_st.editDirty = true;
+        }
+        if (e.crewMode != "off") {
+            char code[16]; snprintf(code, sizeof code, "%s", e.crewCode.c_str());
+            ImGui::SetNextItemWidth(140);
+            if (ImGui::InputText(tr("Crew code"), code, sizeof code)) { e.crewCode = code; g_st.editDirty = true; }
+            muted(e.crewMode == "pilot" ? tr("Crew who join must give this code; empty lets anyone in the flight join.")
+                                        : tr("The code the pilot set, if they set one."));
+        }
+        for (auto& f : fields) if (std::string(f.key) == "intercomkey") drawField(f, m, a);
+        muted(tr("Also: bind xradio/intercom in X-Plane's keyboard or joystick settings."));
     }
     ImGui::EndChild();
     ImGui::BeginDisabled(!g_st.editDirty);
@@ -536,9 +742,9 @@ void drawWizard(Model& m, const Actions& a) {
     } else if (w.step == 1) {
         auto fields = describe(e);
         for (auto& f : fields) if (f.kind == Kind::Choice) drawField(f, m, a);
-        if (ImGui::Button(tr("Mic test: hold"), ImVec2(140, 0))) {}
+        if (ImGui::Button(m.micTest.state == 2 ? tr("Playing back...") : tr("Mic test: hold"), ImVec2(140, 0))) {}
         const bool held = ImGui::IsItemActive();
-        if (held != g_st.micTest) { g_st.micTest = held; if (a.keyPtt) a.keyPtt(held); }
+        if (held != g_st.micTest) { g_st.micTest = held; if (a.micTest) a.micTest(held); }
         ImGui::SameLine(); meter(m.voice.micLevel, p.ok, 160.f);
         muted(m.voice.status.c_str());
     } else if (w.step == 2) {
@@ -588,7 +794,14 @@ bool overlayWantsMouse() { return g_overlayWantsMouse; }
 
 void noteKey(int vk, bool down) {
     if (!down || vk <= 0) return;
-    if (g_st.capturingPtt) { g_st.edit.pttKey = vk; g_st.capturingPtt = false; g_st.editDirty = true; }
+    // One key does one thing: given to the PTT it is taken off the intercom, and the other way round.
+    if (g_st.capturingPtt) {
+        g_st.edit.pttKey = vk; g_st.capturingPtt = false; g_st.editDirty = true;
+        if (g_st.edit.intercomKey == vk) g_st.edit.intercomKey = 0;
+    } else if (g_st.capturingIc) {
+        g_st.edit.intercomKey = vk; g_st.capturingIc = false; g_st.editDirty = true;
+        if (g_st.edit.pttKey == vk) g_st.edit.pttKey = 0;
+    }
     else if (g_st.capturingTower) { g_st.edit.towerKey = vk; g_st.capturingTower = false; g_st.editDirty = true; }
 }
 
@@ -644,6 +857,105 @@ void drawMain(Model& m, const Actions& a) {
     ImGui::EndChild();
 }
 
+// ---------------------------------------------------------------- 0.7: the traffic scope
+// A small TCAS-style picture of the other pilots: range rings, our aircraft in the middle, each target with
+// its height above or below us in hundreds of feet. Heading up or north up; click a target for its details.
+void drawTraffic(Model& m, const Actions& a, float width, float height) {
+    (void)a; (void)width; (void)height;
+    const Palette& p = palette();
+    setLanguage(m.settings.uiLang);
+    static const float kRanges[] = {2.f, 5.f, 10.f, 20.f, 40.f, 80.f};
+    if (g_st.scopeRangeNm < 0.f) {
+        g_st.scopeRangeNm = 20.f;
+        for (float r : kRanges) if (r <= m.settings.scopeRangeNm + 0.5f) g_st.scopeRangeNm = r;
+    }
+    // the radios and the connection, in one line
+    ImGui::TextColored(m.com[0].powered ? p.text : p.muted, "COM1 %s", fmtKhz(m.com[0].activeKhz).c_str());
+    ImGui::SameLine(); ImGui::TextColored(m.com[1].powered ? p.text : p.muted, "COM2 %s", fmtKhz(m.com[1].activeKhz).c_str());
+    ImGui::SameLine();
+    const bool busy = m.pttDown || !m.txWho.empty();
+    light(m.pttDown ? p.tx : p.rx, busy, 5.f); ImGui::SameLine();
+    if (m.pttDown) ImGui::TextColored(p.tx, "TX");
+    else if (!m.txWho.empty()) ImGui::TextColored(p.rx, "%s", m.txWho.c_str());
+    else muted("-");
+    if (m.crew.aboard && m.crew.seats.size() > 1) {
+        ImGui::SameLine(); light(m.crew.icDown ? p.tx : p.rx, m.crew.icDown || !m.crew.icWho.empty(), 5.f);
+        ImGui::SameLine(); ImGui::TextColored(m.crew.icDown ? p.tx : p.muted, "IC");
+    }
+    if (m.tele.have) {
+        ImGui::SameLine();
+        ImGui::TextColored(m.tele.rttMs > 250.0 || m.tele.lossPct > 5.0 ? p.warn : p.muted, "%.0f ms", m.tele.rttMs);
+    }
+    // range and orientation
+    int ri = 0;
+    for (int i = 0; i < 6; ++i) if (kRanges[i] <= g_st.scopeRangeNm + 0.01f) ri = i;
+    if (ImGui::SmallButton(" - ") && ri > 0) g_st.scopeRangeNm = kRanges[ri - 1];
+    ImGui::SameLine(); ImGui::Text("%.0f nm", g_st.scopeRangeNm);
+    ImGui::SameLine(); if (ImGui::SmallButton(" + ") && ri < 5) g_st.scopeRangeNm = kRanges[ri + 1];
+    ImGui::SameLine(); if (ImGui::SmallButton(g_st.scopeNorthUp ? "N up" : "HDG up")) g_st.scopeNorthUp = !g_st.scopeNorthUp;
+    int inRange = 0;
+    for (const Pilot& q : m.pilots) if (q.distNm >= 0 && q.distNm <= g_st.scopeRangeNm) ++inRange;
+    ImGui::SameLine(); muted((std::to_string(inRange) + " " + tr("in range")).c_str());
+
+    const ImVec2 avail = ImGui::GetContentRegionAvail();
+    const float detailsH = ImGui::GetTextLineHeightWithSpacing() * 1.3f;
+    const float radius = std::max(30.f, std::min(avail.x, avail.y - detailsH) * 0.5f - 6.f);
+    const ImVec2 o = ImGui::GetCursorScreenPos();
+    const ImVec2 c(o.x + avail.x * 0.5f, o.y + radius + 4.f);
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    dl->AddCircle(c, radius, col(p.muted, 0.7f), 64, 1.2f);
+    dl->AddCircle(c, radius * 0.5f, col(p.muted, 0.35f), 48, 1.f);
+    char rl[16]; snprintf(rl, sizeof rl, "%.0f", g_st.scopeRangeNm * 0.5f);
+    dl->AddText(ImVec2(c.x + 3.f, c.y - radius * 0.5f), col(p.muted, 0.8f), rl);
+    const double up = g_st.scopeNorthUp ? 0.0 : m.ownHeading;
+    // our aircraft: a chevron along our heading
+    {
+        const double h = (m.ownHeading - up) * 3.14159265358979323846 / 180.0;
+        auto rot = [&](float x, float y) {
+            return ImVec2(c.x + (float)(x * std::cos(h) - y * std::sin(h)), c.y + (float)(x * std::sin(h) + y * std::cos(h)));
+        };
+        dl->AddTriangleFilled(rot(0.f, -9.f), rot(6.f, 7.f), rot(-6.f, 7.f), col(p.accent, 0.95f));
+    }
+    if (g_st.scopeNorthUp) dl->AddText(ImVec2(c.x - 4.f, o.y), col(p.muted, 0.9f), "N");
+    const Pilot* hovered = nullptr;
+    const ImVec2 mouse = ImGui::GetIO().MousePos;
+    for (const Pilot& q : m.pilots) {
+        if (q.distNm < 0) continue;
+        const ScopePoint pt = scopePoint(q.bearingDeg, q.distNm, up, g_st.scopeRangeNm, radius);
+        if (!pt.inside) continue;
+        const ImVec2 at(c.x + pt.x, c.y + pt.y);
+        const int level = trafficLevel(q.distNm, q.relAltFt, g_st.scopeRangeNm);
+        ImVec4 colour = q.emergency ? p.err : q.talking ? p.rx : level == 2 ? p.warn : (q.onTcas ? p.text : p.muted);
+        const float sz = 5.5f;
+        const ImVec2 d0(at.x, at.y - sz), d1(at.x + sz, at.y), d2(at.x, at.y + sz), d3(at.x - sz, at.y);
+        if (level == 2 || q.talking) dl->AddQuadFilled(d0, d1, d2, d3, col(colour, 0.95f));
+        else dl->AddQuad(d0, d1, d2, d3, col(colour, 0.95f), 1.5f);
+        const std::string alt = relAltText(q.relAltFt);
+        const float aw = ImGui::CalcTextSize(alt.c_str()).x;
+        const float ay = q.relAltFt >= 0.f ? at.y - sz - ImGui::GetTextLineHeight() : at.y + sz;
+        dl->AddText(ImVec2(at.x - aw * 0.5f, ay), col(colour, 0.95f), alt.c_str());
+        if (std::fabs(q.vsFpm) >= 500.f)       // climbing or descending: the arrow TCAS draws
+            dl->AddText(ImVec2(at.x + sz + 2.f, at.y - ImGui::GetTextLineHeight() * 0.5f), col(colour, 0.95f), q.vsFpm > 0 ? "^" : "v");
+        if (g_st.scopeRangeNm <= 10.f || q.sid == g_st.scopeSelected)
+            dl->AddText(ImVec2(at.x + sz + 10.f, at.y - ImGui::GetTextLineHeight() * 0.5f), col(p.muted, 0.9f), q.callsign.c_str());
+        const float dx = mouse.x - at.x, dy = mouse.y - at.y;
+        if (dx * dx + dy * dy < 81.f) hovered = &q;
+    }
+    ImGui::InvisibleButton("scope", ImVec2(std::max(1.f, avail.x), radius * 2.f + 8.f));
+    if (ImGui::IsItemClicked() ) g_st.scopeSelected = hovered ? hovered->sid : 0;
+    const Pilot* show = hovered;
+    if (!show) for (const Pilot& q : m.pilots) if (q.sid == g_st.scopeSelected) show = &q;
+    if (show) {
+        ImGui::TextColored(show->talking ? p.rx : p.text, "%s", show->callsign.c_str()); ImGui::SameLine();
+        ImGui::Text("%s  %.1f nm  %s %s  %.0f kt  %04u", show->type.c_str(), show->distNm, relAltText(show->relAltFt).c_str(),
+                    show->vsFpm > 300.f ? "^" : show->vsFpm < -300.f ? "v" : "", show->gsKt, show->squawk);
+    } else if (m.pilots.empty()) {
+        muted(m.conn.connected ? tr("nobody else is in this flight") : tr("not connected"));
+    } else {
+        muted(tr("click a target for its details"));
+    }
+}
+
 void drawOverlay(Model& m, const Actions& a, float width) {
     (void)a;
     const Palette& p = palette();
@@ -670,6 +982,18 @@ void drawOverlay(Model& m, const Actions& a, float width) {
     else if (!m.txWho.empty()) ImGui::TextColored(p.rx, "%s", m.txWho.c_str());
     else muted("-");
     if (m.fp.squawk) { ImGui::SameLine(); ImGui::TextColored(p.ok, "SQK %04u", m.fp.squawk); }
+    // 0.7: the intercom, when there is a crew; the round trip, when it is bad enough to matter
+    if (m.crew.aboard && m.crew.seats.size() > 1) {
+        ImGui::SameLine();
+        const bool ic = m.crew.icDown || !m.crew.icWho.empty();
+        light(m.crew.icDown ? p.tx : p.rx, ic, 6.f); ImGui::SameLine();
+        if (m.crew.icDown) ImGui::TextColored(p.tx, "IC");
+        else if (!m.crew.icWho.empty()) ImGui::TextColored(p.rx, "IC %s", m.crew.icWho.c_str());
+        else muted("IC");
+    }
+    if (m.tele.have && (m.tele.rttMs > 250.0 || m.tele.lossPct > 5.0)) {
+        ImGui::SameLine(); ImGui::TextColored(p.warn, "%.0f ms", m.tele.rttMs);
+    }
     if (!collapsed) {
         const Message* lastAtc = nullptr;
         for (auto it = m.messages.rbegin(); it != m.messages.rend(); ++it) if (it->atc || it->priv) { lastAtc = &*it; break; }

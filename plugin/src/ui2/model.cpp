@@ -1,6 +1,7 @@
 #include "model.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -219,6 +220,50 @@ std::vector<ClearanceRow> clearanceRows(const FlightPlanView& fp) {
     const std::string d1 = upperTrim(fp.dest), d2 = upperTrim(fp.clearedDest);
     rows.push_back({"Destination", d1, d2, !d1.empty() && !d2.empty() && d1 != d2});
     return rows;
+}
+
+// ---------------------------------------------------------------- 0.7: the traffic scope, the connection
+ScopePoint scopePoint(double bearingDeg, double distNm, double upDeg, double rangeNm, float radiusPx) {
+    ScopePoint p;
+    if (!(rangeNm > 0.0) || !std::isfinite(bearingDeg) || !std::isfinite(distNm) || distNm < 0.0) { p.inside = false; return p; }
+    const double rel = (bearingDeg - upDeg) * 3.14159265358979323846 / 180.0;
+    double r = distNm / rangeNm;
+    p.inside = r <= 1.0;
+    if (r > 1.0) r = 1.0;                                  // held on the edge, where an arrow says "out there"
+    p.x = (float)(std::sin(rel) * r * radiusPx);
+    p.y = (float)(-std::cos(rel) * r * radiusPx);          // screen y grows downwards: ahead is up
+    return p;
+}
+
+std::string relAltText(float relFt) {
+    if (!std::isfinite(relFt)) return "";
+    const int h = (int)std::lround(relFt / 100.f);
+    if (h == 0) return "00";
+    char b[16];
+    snprintf(b, sizeof b, "%c%02d", h > 0 ? '+' : '-', std::abs(h) > 99 ? 99 : std::abs(h));
+    return b;
+}
+
+int trafficLevel(double distNm, float relAltFt, double rangeNm) {
+    if (distNm < 0.0 || distNm > rangeNm) return 0;
+    if (distNm <= 6.0 && std::fabs(relAltFt) <= 1200.f) return 2;
+    return 1;
+}
+
+std::string telemetryText(const Telemetry& t) {
+    if (!t.have) return "";
+    char b[128];
+    snprintf(b, sizeof b, "%.0f ms  jitter %.0f ms  lost %.0f %%  voice lost %.0f %%", t.rttMs, t.jitterMs, t.lossPct, t.voiceLossPct);
+    return b;
+}
+
+// Readability, as a pilot would put it: the 1-5 scale's words.
+std::string signalWords(float q) {
+    if (q >= 0.8f) return "loud and clear";
+    if (q >= 0.6f) return "clear";
+    if (q >= 0.4f) return "readable";
+    if (q >= 0.2f) return "readable with difficulty";
+    return "barely readable";
 }
 
 }  // namespace ui2

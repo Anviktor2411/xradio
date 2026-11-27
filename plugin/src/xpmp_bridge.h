@@ -77,6 +77,8 @@ std::string cslModelSource();
 // Settings: draw other aircraft at all, and how their labels behave.
 void setTrafficVisible(bool on);
 void setLabels(bool on, float maxDistNm);
+// 0.7: other pilots on X-Plane's map, and their callsigns there.
+void setMapVisible(bool on, bool labels);
 
 }  // namespace csl
 }  // namespace xr

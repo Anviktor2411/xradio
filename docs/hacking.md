@@ -9,7 +9,11 @@ platforms. (v0.6.0 added air traffic control -- `LF_ATC`/`LF_INJECTOR` logins,
 `server/server.py` and the same names in `plugin/src/server.cpp`; the plugin
 side is `handleAtcList` / `handleAtis` / `handleFlightPlan` / `sendFlightPlan`
 in `main.cpp` and the ATC tab in `settings.h`. `docs/atc.md` has the protocol.)
-platforms and two sims.
+platforms and two sims. 0.7 added the shared cockpit -- `PT_CREW`, the intercom on
+`kIntercomKhz`: `_on_crew` / `onCrew`, `_aircraft_of` / `aircraftOf`, `_crew_members` / `crewMembers` in the two
+servers, `crewTick` / `handleCrew` / `setIntercom` in `main.cpp`, `docs/crew.md` -- and whoever runs the server:
+`PT_ADMIN` (`_on_admin`, `server/admin.py`), `PT_DISCOVER` (`_on_discover`, `lanSearchWorker`), a pong that
+echoes its ping (`g_rtt` in `main.cpp`).
 
 ## The shape of it
 
@@ -45,7 +49,9 @@ docs/            this file, the server guide, the VPN guide
 | `settings.h` | every setting, its config-file key, its widget and its tab, in one table. |
 | `ui.cpp/.h` | the widget set the settings window is drawn with. Text only, on purpose. |
 | `joincode.h` | an address and port as ten letters, for reading out loud. |
-| `brand.h` | the mark at the top of each window, and the version number -- the one place it lives. |
+| `brand.h` | the mark at the top of each window. |
+| `version.h` | the version number -- the one place it lives, free of the SDK so the relay server can tell the LAN search (`tools/release.py` sets it, and `server/protocol.py`'s copy with it). |
+| `cockpit.h` | 0.7: the plain logic behind the shared cockpit's radio panel (what a copilot's knob asks for, what a tune changes), the quick-tune slots and the connection's round trip. No X-Plane; `tools/harness/cockpit_test.cpp`. |
 | `mathconst.h` | `xr::kPi`, because `M_PI` is not standard C++ and MSVC knows it. |
 
 ## Threads

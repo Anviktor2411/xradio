@@ -60,6 +60,19 @@ std::string status() { return "not built in"; }
 Stats stats() { return {}; }
 void testCapture(const int16_t*, int) {}
 void testRender(int16_t* out, int count) { if (out) memset(out, 0, sizeof(int16_t) * (size_t)count); }
+void testSeed(uint32_t) {}
+void setIntercomTransmit(bool) {}
+bool intercomTransmitting() { return false; }
+void setIntercomVolume(float) {}
+std::vector<uint32_t> activeIntercomSpeakers() { return {}; }
+std::vector<SpeakerInfo> speakers() { return {}; }
+void setSquelchTail(bool) {}
+void setPttClick(bool) {}
+void setCrackle(bool) {}
+bool startMicTest() { return false; }
+void stopMicTest() {}
+MicTest micTest() { return MicTest::Idle; }
+float micTestSeconds() { return 0.f; }
 }  // namespace voice
 }  // namespace xr
 
@@ -197,6 +210,7 @@ std::chrono::steady_clock::time_point g_lastTx;   // main thread only
 float             g_micIdleS = 600.f;
 
 std::atomic<bool>  g_tx{false};
+std::atomic<bool>  g_txIc{false};       // 0.7: the intercom's push-to-talk
 std::atomic<bool>  g_sidetone{false};
 std::atomic<bool>  g_filter{true};
 std::atomic<float> g_hiss{0.35f};
@@ -208,6 +222,12 @@ std::atomic<float> g_volume{1.f};
 std::atomic<uint32_t> g_com1Khz{0}, g_com2Khz{0};
 std::atomic<float>    g_com1Vol{1.f}, g_com2Vol{1.f};
 std::atomic<float>    g_guardVol{1.f};
+// 0.7
+std::atomic<float>    g_icVol{0.8f};          // the intercom's own knob
+std::atomic<bool>     g_squelchTail{true};    // squelch burst and click
+std::atomic<bool>     g_pttClick{false};      // a click in our own headset as we key and unkey
+std::atomic<bool>     g_crackle{false};       // static crashes on a weak signal
+std::atomic<int>      g_clickPending{0};      // +1 keyed, -1 unkeyed: the playback thread plays it
 
 // How far up the knob is for the radio this frequency is on. A frequency
 // neither radio has (or 0) plays at full: better heard than silently lost.
@@ -222,6 +242,19 @@ float radioGain(uint32_t freqKhz) {
 std::atomic<uint64_t> g_nEncoded{0}, g_nReceived{0}, g_nPlayed{0}, g_nConcealed{0};
 
 std::vector<int16_t> g_capAccum;     // capture thread only
+
+// 0.7: the microphone test. The main thread moves the state; the capture thread
+// records (through a codec of its own, so it sounds as it will on the air) and the
+// playback thread plays it back. g_loopMx guards the recording; the playback side
+// only ever try_locks it.
+enum LoopState : int { LOOP_IDLE = 0, LOOP_RECORDING, LOOP_PLAYING };
+std::atomic<int>     g_loop{LOOP_IDLE};
+std::mutex           g_loopMx;
+std::vector<int16_t> g_loopPcm;      // decoded, as the others would hear it
+size_t               g_loopPos = 0;  // playback position, playback thread
+std::vector<int16_t> g_loopAccum;    // capture thread only
+OpusEncoder*         g_loopEnc = nullptr;
+OpusDecoder*         g_loopDec = nullptr;
 std::string          g_status = "off";
 std::string          g_capName, g_playName;
 std::string          g_wantMic, g_wantOut;      // names the user picked, "" = default
@@ -331,6 +364,18 @@ constexpr int   kClickLen     = 96;       // 2 ms step, the filter turns it into
 constexpr int   kOpenBurst    = 960;      // 20 ms of noise as the squelch opens
 constexpr int   kCloseTail    = 5280;     // 110 ms of noise after the carrier drops
 constexpr int   kSettle       = 1440;     // 30 ms: let the filters ring down
+// 0.7: static crashes. None above this share of the way to the horizon (1 - quality),
+// up to this many a second at its edge, each this loud before the filter at full noise
+// setting, ringing down in a fraction of a millisecond -- short enough that the audio
+// filter passes it as a crack rather than a thump.
+constexpr float kCrackleFrom  = 0.35f;
+constexpr float kCracklePerS  = 30.f;
+constexpr float kCrackleAmp   = 24000.f;
+constexpr float kCrackleDecay = 0.80f;
+// The click in our own headset as the PTT relay closes and opens: a few milliseconds of a
+// decaying tone, through the radio's audio filter when it is on.
+constexpr int   kPttClickLen  = 240;      // 5 ms
+constexpr float kPttClickAmp  = 7000.f;
 
 struct Radio {
     Biquad hp1, hp2, lp1, lp2;            // 4th order each side
@@ -341,6 +386,11 @@ struct Radio {
     float  clickSign = 1.f;
     float  hetPhase = 0.f, wobble = 0.f, garblePhase = 0.f;
     uint32_t noise = 0x12345678u;
+    // 0.7
+    bool   tailOn = true;                 // the squelch's burst and clicks (setSquelchTail)
+    bool   crackleOn = false;             // static crashes (setCrackle)
+    float  crack = 0.f;                   // the static crash ringing down right now
+    uint32_t crackRng = 0x2545F491u;      // its own random numbers: switching it on leaves the hiss as it was
 
     void design() {
         // Butterworth pair for a 4th-order slope: 24 dB/octave.
@@ -357,6 +407,10 @@ struct Radio {
     float white() {
         noise = noise * 1664525u + 1013904223u;
         return (float)(noise >> 16) / 32768.f - 1.f;
+    }
+    float crackWhite() {
+        crackRng = crackRng * 1664525u + 1013904223u;
+        return (float)(crackRng >> 16) / 32768.f - 1.f;
     }
 
     // The transmitter: modulation limiter, then overdrive. Speech only. Each
@@ -378,8 +432,14 @@ struct Radio {
 
     // Called once per callback with what the mixer found.
     void gate(bool carrier) {
-        if (carrier && !open)  { open = true;  burst = kOpenBurst; click = kClickLen; clickSign = 1.f; }
-        if (!carrier && open)  { open = false; tail = kCloseTail; }
+        if (carrier && !open) {
+            open = true;
+            if (tailOn) { burst = kOpenBurst; click = kClickLen; clickSign = 1.f; }
+        }
+        if (!carrier && open) {
+            open = false;
+            if (tailOn) tail = kCloseTail;
+        }
         if (carrier || tail || burst || click) settle = kSettle;
     }
     bool active() const { return open || tail > 0 || burst > 0 || click > 0 || settle > 0; }
@@ -414,6 +474,26 @@ struct Radio {
             x *= 0.5f + 0.5f * sinf(garblePhase);
         }
         if (noiseAmp > 0.f) x += white() * noiseAmp;
+        // 0.7: static crashes -- the impulses of a weak signal, none on a strong
+        // one, a few a second at the edge of coverage, and now and then through
+        // an open squelch. The audio filter turns each into a crackle.
+        if (crackleOn && (carrier || squelchOpen) && hiss > 0.f) {
+            const float w = carrier ? 1.f - quality : 0.6f;
+            if (w > kCrackleFrom) {
+                const float t = (w - kCrackleFrom) / (1.f - kCrackleFrom);
+                const float perSecond = kCracklePerS * t * t;
+                const float roll = 0.5f + 0.5f * crackWhite();
+                if (roll < perSecond / (float)kSampleRate) {
+                    const float mag = 0.4f + 0.6f * (0.5f + 0.5f * crackWhite());
+                    crack = (crackWhite() < 0.f ? -1.f : 1.f) * kCrackleAmp * hiss * mag;
+                }
+            }
+        }
+        if (crack != 0.f) {
+            x += crack;
+            crack *= kCrackleDecay;
+            if (crack < 1.f && crack > -1.f) crack = 0.f;
+        }
 
         if (carrier && hetAmp > 0.f) {
             // Two AM carriers a little apart beat against each other.
@@ -439,6 +519,32 @@ void captureCb(ma_device*, void*, const void* in, ma_uint32 n);
 void playbackCb(ma_device*, void* out, const void*, ma_uint32 n);
 
 // --- capture side ----------------------------------------------------------
+// The microphone test's recording: 20 ms at a time through its own codec, kept
+// decoded, until it is let go or full.
+void recordLoop(const int16_t* in, int count) {
+    if (g_loop.load() != LOOP_RECORDING || !g_loopEnc || !g_loopDec) {
+        g_loopAccum.clear();
+        return;
+    }
+    g_loopAccum.insert(g_loopAccum.end(), in, in + count);
+    while (g_loopAccum.size() >= (size_t)kFrameSamples) {
+        uint8_t buf[kMaxOpusBytes];
+        int16_t pcm[kFrameSamples];
+        const int len = opus_encode(g_loopEnc, g_loopAccum.data(), kFrameSamples, buf, sizeof(buf));
+        g_loopAccum.erase(g_loopAccum.begin(), g_loopAccum.begin() + kFrameSamples);
+        const int got = len > 0 ? opus_decode(g_loopDec, buf, len, pcm, kFrameSamples, 0) : 0;
+        if (got <= 0) memset(pcm, 0, sizeof(pcm));
+        std::lock_guard<std::mutex> lk(g_loopMx);
+        g_loopPcm.insert(g_loopPcm.end(), pcm, pcm + kFrameSamples);
+        if (g_loopPcm.size() >= (size_t)(kMicTestMaxS * kSampleRate)) {
+            g_loopPos = 0;
+            g_loop.store(LOOP_PLAYING);      // full: it plays back by itself
+            g_loopAccum.clear();
+            break;
+        }
+    }
+}
+
 void capture(const int16_t* in, int count) {
     int peak = 0;
     for (int i = 0; i < count; ++i) {
@@ -446,13 +552,17 @@ void capture(const int16_t* in, int count) {
         if (a > peak) peak = a;
     }
     g_micLevel.store((float)peak / 32767.f);
+    recordLoop(in, count);
 
-    if (!g_tx.load() || !g_enc) {
+    // The radio's PTT or the intercom's: either one encodes, the radio wins.
+    const bool radio = g_tx.load();
+    const bool intercom = !radio && g_txIc.load();
+    if (!(radio || intercom) || !g_enc) {
         g_capAccum.clear();
         return;
     }
 
-    if (g_sidetone.load()) {
+    if (radio && g_sidetone.load()) {
         std::lock_guard<std::mutex> lk(g_mx);
         g_sidechain.insert(g_sidechain.end(), in, in + count);
         while (g_sidechain.size() > kSidechainMax) g_sidechain.pop_front();
@@ -466,7 +576,7 @@ void capture(const int16_t* in, int count) {
         if (len <= 0) continue;
 
         std::lock_guard<std::mutex> lk(g_mx);
-        g_out.push_back({g_seq++, std::vector<uint8_t>(buf, buf + len)});
+        g_out.push_back({g_seq++, std::vector<uint8_t>(buf, buf + len), intercom});
         if (g_out.size() > (size_t)kMaxOutQueue) g_out.pop_front();
         g_nEncoded.fetch_add(1);
     }
@@ -521,11 +631,15 @@ float levelOf(uint32_t sid) {
     return it == g_quality.end() ? levelFromQuality(1.f) : it->second.levelDbm;
 }
 
-void render(int16_t* out, int count) {
+// The radio: every station coming in on a COM, through the receiver. The
+// intercom, the microphone test and the PTT click are added on top (render()).
+void renderRadio(int16_t* out, int count) {
     memset(out, 0, sizeof(int16_t) * (size_t)count);
     const float vol  = g_volume.load();
     const bool  fx   = g_filter.load();
     const float hiss = g_hiss.load();
+    g_radio.tailOn    = g_squelchTail.load();
+    g_radio.crackleOn = g_crackle.load();
 
     // Half duplex: while keyed you hear only your own sidetone, if enabled --
     // through the transmitter and the audio filter, as a headset would.
@@ -562,6 +676,7 @@ void render(int16_t* out, int count) {
     float top = -1e9f;                           // the strongest level on the air, dBm
     for (auto& kv : g_speakers) {
         Speaker& sp = *kv.second;
+        if (isIntercom(sp.freqKhz)) continue;    // a wire, not a radio: render() mixes it
         const float q = qualityOf(kv.first);
         if (fx && q < sq) {
             sp.packets.clear(); sp.pcm.clear(); sp.pcmPos = 0; sp.playing = false;
@@ -580,6 +695,7 @@ void render(int16_t* out, int count) {
     float whine = 0.f;
     for (auto& kv : g_speakers) {
         Speaker& sp = *kv.second;
+        if (isIntercom(sp.freqKhz)) continue;
         if (fx && qualityOf(kv.first) < sq) continue;
         if (!sp.playing && (int)sp.packets.size() < kPrebuffer) continue;
         const float down = top - levelOf(kv.first);
@@ -593,6 +709,7 @@ void render(int16_t* out, int count) {
     float best = 0.f;                            // strongest signal actually heard
     for (auto& kv : g_speakers) {
         Speaker& sp = *kv.second;
+        if (isIntercom(sp.freqKhz)) continue;
         const float q = qualityOf(kv.first);
         if (fx && q < sq) continue;
         if (!sp.playing) {
@@ -660,6 +777,92 @@ void render(int16_t* out, int count) {
         const float speech = carrier ? mix[(size_t)i] : 0.f;
         float v = g_radio.receiver(speech, carrier, best, hiss, squelchOpen,
                                    carriers >= 2 ? hetAmp : 0.f, garble && carriers >= 2) * vol;
+        out[i] = (int16_t)(v > 32767.f ? 32767.f : (v < -32768.f ? -32768.f : v));
+    }
+}
+
+// --- 0.7: what is heard on top of the radio ----------------------------------
+// The intercom: crew in the same cockpit, clean but for the headset's band, at
+// its own volume. Returns true if anybody was on it.
+Biquad g_icHp, g_icLp;                    // playback thread
+Radio  g_loopRadio;                       // the microphone test's own receiver chain, playback thread
+float  g_loopEnv = 0.f;                   // ...and transmitter limiter
+int    g_clickLeft = 0;                   // the PTT click being played, playback thread
+float  g_clickSignNow = 1.f, g_clickPhase = 0.f;
+
+bool mixIntercom(float* acc, int count, bool fx) {
+    std::unique_lock<std::mutex> lk(g_mx, std::try_to_lock);
+    if (!lk.owns_lock()) return false;
+    const float gain = g_icVol.load();
+    bool any = false;
+    for (auto& kv : g_speakers) {
+        Speaker& sp = *kv.second;
+        if (!isIntercom(sp.freqKhz)) continue;
+        if (!sp.playing) {
+            if ((int)sp.packets.size() < kPrebuffer) continue;
+            sp.playing = true;
+        }
+        for (int i = 0; i < count; ++i) {
+            if (sp.pcmPos >= sp.pcm.size() && !refill(sp)) break;
+            acc[i] += (float)sp.pcm[sp.pcmPos++] * gain;
+            any = true;
+        }
+    }
+    lk.unlock();
+    if (any && fx)                        // a headset, not a hi-fi: 200 Hz - 5 kHz
+        for (int i = 0; i < count; ++i) acc[i] = g_icLp.run(g_icHp.run(acc[i]));
+    return any;
+}
+
+// The microphone test playing back, through a radio of its own: what the
+// others hear of you on a strong signal.
+bool mixLoop(float* acc, int count, bool fx) {
+    if (g_loop.load() != LOOP_PLAYING) return false;
+    std::unique_lock<std::mutex> lk(g_loopMx, std::try_to_lock);
+    if (!lk.owns_lock()) return false;
+    int i = 0;
+    for (; i < count && g_loopPos < g_loopPcm.size(); ++i) {
+        float v = (float)g_loopPcm[g_loopPos++];
+        if (fx) v = Radio::amplifier(g_loopRadio.filter(Radio::transmitter(g_loopEnv, v)));
+        acc[i] += v;
+    }
+    if (g_loopPos >= g_loopPcm.size()) g_loop.store(LOOP_IDLE);
+    return i > 0;
+}
+
+// The PTT relay in our own headset: a short decaying tick as we key, a lower
+// one as we let go.
+bool mixPttClick(float* acc, int count, bool fx) {
+    const int want = g_clickPending.exchange(0);
+    if (want != 0 && g_pttClick.load()) {
+        g_clickLeft = kPttClickLen;
+        g_clickSignNow = want > 0 ? 1.f : -1.f;
+        g_clickPhase = 0.f;
+    }
+    if (g_clickLeft <= 0) return false;
+    const float hz = g_clickSignNow > 0.f ? 1900.f : 1300.f;
+    for (int i = 0; i < count && g_clickLeft > 0; ++i, --g_clickLeft) {
+        const float env = (float)g_clickLeft / (float)kPttClickLen;
+        g_clickPhase += 2.f * (float)kPi * hz / (float)kSampleRate;
+        float v = kPttClickAmp * env * env * sinf(g_clickPhase);
+        if (fx) v = g_loopRadio.filter(v);
+        acc[i] += v;
+    }
+    return true;
+}
+
+void render(int16_t* out, int count) {
+    renderRadio(out, count);
+    const bool fx = g_filter.load();
+    static std::vector<float> extra;
+    extra.assign((size_t)count, 0.f);
+    bool any = mixIntercom(extra.data(), count, fx);
+    any = mixLoop(extra.data(), count, fx) || any;
+    any = mixPttClick(extra.data(), count, fx) || any;
+    if (!any) return;
+    const float vol = g_volume.load();
+    for (int i = 0; i < count; ++i) {
+        const float v = (float)out[i] + extra[(size_t)i] * vol;
         out[i] = (int16_t)(v > 32767.f ? 32767.f : (v < -32768.f ? -32768.f : v));
     }
 }
@@ -838,6 +1041,30 @@ bool init(Mode mode, std::string* err) {
 
     g_radio = Radio();
     g_radio.design();
+    // 0.7: the microphone test's codec and receiver, the intercom's headset band
+    g_loopEnc = opus_encoder_create(kSampleRate, 1, OPUS_APPLICATION_VOIP, &e);
+    if (e != OPUS_OK) g_loopEnc = nullptr;
+    if (g_loopEnc) {
+        opus_encoder_ctl(g_loopEnc, OPUS_SET_BITRATE(kBitrate));
+        opus_encoder_ctl(g_loopEnc, OPUS_SET_COMPLEXITY(5));
+        opus_encoder_ctl(g_loopEnc, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE));
+    }
+    g_loopDec = opus_decoder_create(kSampleRate, 1, &e);
+    if (e != OPUS_OK) g_loopDec = nullptr;
+    g_loopRadio = Radio();
+    g_loopRadio.design();
+    g_loopEnv = 0.f;
+    designHighpass(g_icHp, 200.f, 0.7071f);
+    designLowpass(g_icLp, 5000.f, 0.7071f);
+    g_icHp.reset(); g_icLp.reset();
+    g_loop.store(LOOP_IDLE);
+    {
+        std::lock_guard<std::mutex> lk(g_loopMx);
+        g_loopPcm.clear();
+        g_loopPos = 0;
+    }
+    g_clickPending.store(0);
+    g_clickLeft = 0;
 
     if (mode == Mode::NoDevices) {
         g_status = "codec only";
@@ -915,6 +1142,8 @@ void releaseMicrophone() {
 
 void shutdown() {
     g_tx.store(false);
+    g_txIc.store(false);
+    g_loop.store(LOOP_IDLE);
     closeMic();
     g_mic.store(MIC_NONE);
     {
@@ -923,6 +1152,13 @@ void shutdown() {
     }
     if (g_ctxOk)  { ma_context_uninit(&g_ctx); g_ctxOk = false; }
     if (g_enc)    { opus_encoder_destroy(g_enc); g_enc = nullptr; }
+    if (g_loopEnc) { opus_encoder_destroy(g_loopEnc); g_loopEnc = nullptr; }
+    if (g_loopDec) { opus_decoder_destroy(g_loopDec); g_loopDec = nullptr; }
+    {
+        std::lock_guard<std::mutex> lk(g_loopMx);
+        g_loopPcm.clear();
+        g_loopPos = 0;
+    }
     std::lock_guard<std::mutex> lk(g_mx);
     g_speakers.clear();
     g_quality.clear();
@@ -940,14 +1176,69 @@ bool haveMicrophone() {
 }
 
 void setTransmitting(bool on) {
-    const bool rising = on && !g_tx.load();
-    if (rising && g_enc) opus_encoder_ctl(g_enc, OPUS_RESET_STATE);
+    const bool was = g_tx.load();
+    const bool rising = on && !was;
+    // a fresh stream unless the intercom was already sending one
+    if (rising && g_enc && !g_txIc.load()) opus_encoder_ctl(g_enc, OPUS_RESET_STATE);
+    if (rising && g_loop.load() != LOOP_IDLE) g_loop.store(LOOP_IDLE);   // the radio ends the microphone test
     g_tx.store(on);
     g_lastTx = std::chrono::steady_clock::now();
     if (rising) requestMic();
-    if (!on) g_micLevel.store(0.f);
+    if (on != was) g_clickPending.store(on ? 1 : -1);
+    if (!on && !g_txIc.load()) g_micLevel.store(0.f);
 }
 bool transmitting() { return g_tx.load(); }
+
+void setIntercomTransmit(bool on) {
+    const bool rising = on && !g_txIc.load();
+    if (rising && g_enc && !g_tx.load()) opus_encoder_ctl(g_enc, OPUS_RESET_STATE);
+    if (rising && g_loop.load() != LOOP_IDLE) g_loop.store(LOOP_IDLE);
+    g_txIc.store(on);
+    g_lastTx = std::chrono::steady_clock::now();
+    if (rising) requestMic();
+    if (!on && !g_tx.load()) g_micLevel.store(0.f);
+}
+bool intercomTransmitting() { return g_txIc.load(); }
+void setIntercomVolume(float v) { g_icVol.store(v < 0.f ? 0.f : (v > 1.f ? 1.f : v)); }
+void setSquelchTail(bool on) { g_squelchTail.store(on); }
+void setPttClick(bool on)    { g_pttClick.store(on); }
+void setCrackle(bool on)     { g_crackle.store(on); }
+
+bool startMicTest() {
+    if (g_tx.load() || g_txIc.load() || !g_loopEnc || !g_loopDec) return false;
+    {
+        std::lock_guard<std::mutex> lk(g_loopMx);
+        g_loopPcm.clear();
+        g_loopPos = 0;
+    }
+    g_loop.store(LOOP_RECORDING);
+    requestMic();
+    return true;
+}
+
+void stopMicTest() {
+    const int st = g_loop.load();
+    if (st == LOOP_RECORDING) {
+        std::lock_guard<std::mutex> lk(g_loopMx);
+        g_loopPos = 0;
+        g_loop.store(g_loopPcm.empty() ? LOOP_IDLE : LOOP_PLAYING);
+    } else if (st == LOOP_PLAYING) {
+        g_loop.store(LOOP_IDLE);
+    }
+}
+
+MicTest micTest() {
+    const int st = g_loop.load();
+    return st == LOOP_RECORDING ? MicTest::Recording : st == LOOP_PLAYING ? MicTest::Playing : MicTest::Idle;
+}
+
+float micTestSeconds() {
+    std::lock_guard<std::mutex> lk(g_loopMx);
+    const int st = g_loop.load();
+    if (st == LOOP_RECORDING) return (float)g_loopPcm.size() / (float)kSampleRate;
+    if (st == LOOP_PLAYING) return (float)(g_loopPcm.size() - std::min(g_loopPos, g_loopPcm.size())) / (float)kSampleRate;
+    return 0.f;
+}
 
 void onIncomingFrame(uint32_t sid, uint16_t seq, const uint8_t* data, int len,
                      uint32_t freqKhz) {
@@ -992,7 +1283,7 @@ void tick() {
     // pilot -- a headset gets its music profile back, the in-use indicator
     // goes out. The next PTT opens it again. Done before g_mx is taken:
     // closing waits for the capture callback, which takes g_mx itself.
-    if (g_tx.load()) {
+    if (g_tx.load() || g_txIc.load() || g_loop.load() == LOOP_RECORDING) {
         g_lastTx = now;
     } else if (g_mic.load() == MIC_OPEN &&
                std::chrono::duration<float>(now - g_lastTx).count() > g_micIdleS) {
@@ -1064,10 +1355,39 @@ std::vector<uint32_t> activeSpeakers() {
     const float sq = g_squelch.load();
     std::lock_guard<std::mutex> lk(g_mx);
     for (auto& kv : g_speakers) {
+        if (isIntercom(kv.second->freqKhz)) continue;   // the radio's; activeIntercomSpeakers() has the rest
         // A station the squelch keeps out is not heard, so it is not shown
         // either: a real radio gives no sign of a signal too weak to open it.
         if (fx && qualityOf(kv.first) < sq) continue;
         if (kv.second->playing || !kv.second->packets.empty()) out.push_back(kv.first);
+    }
+    return out;
+}
+
+std::vector<uint32_t> activeIntercomSpeakers() {
+    std::vector<uint32_t> out;
+    std::lock_guard<std::mutex> lk(g_mx);
+    for (auto& kv : g_speakers)
+        if (isIntercom(kv.second->freqKhz) && (kv.second->playing || !kv.second->packets.empty()))
+            out.push_back(kv.first);
+    return out;
+}
+
+std::vector<SpeakerInfo> speakers() {
+    std::vector<SpeakerInfo> out;
+    const bool  fx = g_filter.load();
+    const float sq = g_squelch.load();
+    std::lock_guard<std::mutex> lk(g_mx);
+    for (auto& kv : g_speakers) {
+        const Speaker& sp = *kv.second;
+        if (!sp.playing && sp.packets.empty()) continue;
+        const bool ic = isIntercom(sp.freqKhz);
+        if (!ic && fx && qualityOf(kv.first) < sq) continue;
+        SpeakerInfo i;
+        i.sid = kv.first; i.freqKhz = sp.freqKhz; i.intercom = ic;
+        i.quality = ic ? 1.f : qualityOf(kv.first);
+        i.levelDbm = ic ? 0.f : levelOf(kv.first);
+        out.push_back(i);
     }
     return out;
 }
@@ -1103,6 +1423,7 @@ Stats stats() {
 
 void testCapture(const int16_t* samples, int count) { capture(samples, count); }
 void testRender(int16_t* out, int count)            { render(out, count); }
+void testSeed(uint32_t seed) { g_radio.noise = seed ? seed : 1u; g_radio.crackRng = seed ^ 0x2545F491u; }
 
 }  // namespace voice
 }  // namespace xr

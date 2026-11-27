@@ -53,6 +53,10 @@ MAX_AI_PER_INJECTOR = MAX_ENTRIES_TOTAL
 # The ATC list goes out with the roster: whenever a station joins or leaves,
 # and this often besides.
 ATC_LIST_INTERVAL_S = ROSTER_INTERVAL_S
+# 0.7. How many kicked addresses are remembered at once; the oldest goes first.
+MAX_BANS = 64
+# What the LAN search is told the flight is called when nobody said (--name).
+DEFAULT_NAME = "XRadio server"
 
 
 @dataclass
@@ -103,6 +107,16 @@ class Session:
     agl_known: bool = False     # the report carried it; a v5-sized one does not
     svc_range_nm: int = 0       # a station's service volume as it asked, 0 = by facility
     svc_ceiling_ft: int = 0
+    # 0.7
+    muted: bool = False         # the host muted them: nothing they say on the radio is relayed
+    crew_open: bool = False     # their cockpit takes a crew (docs/crew.md)
+    crew_code: str = ""         # ...who must give this code, if it is not empty
+    crew_of: int = 0            # aboard this pilot's aircraft as crew (their session), 0 = their own
+    crew_role: int = 0          # P.CREW_ROLE_COPILOT / OBSERVER, while aboard
+    panel: bytes = None         # a pilot's last CREW_PANEL, as relayed, for crew who join later
+    tx_holder: int = 0          # a crewed aircraft has one transmitter: who keyed it last...
+    tx_holder_at: float = 0.0   # ...and when
+    crew_tx_freq: int = 0       # the frequency its transmitter was last keyed on, by whoever
 
     @property
     def alt_ft(self) -> float:
@@ -351,8 +365,20 @@ def ducting_from(w) -> bool:
 
 
 class XRadioServer(asyncio.DatagramProtocol):
-    def __init__(self, password: str = "", ducting: bool = False):
+    def __init__(self, password: str = "", ducting: bool = False, admin_token: str = "",
+                 max_pilots: int = 0, visible: bool = True, name: str = "", hosted: bool = False,
+                 port: int = 0):
         self.password = password       # empty: anyone may join
+        # 0.7. Whoever runs the server: PT_ADMIN with this token kicks, mutes and
+        # sets the pilot limit; empty, nobody can. The limit (0 = none), whether
+        # the LAN search gets an answer, and what it is told the flight is called.
+        self.admin_token = admin_token
+        self.max_pilots = max(0, int(max_pilots))
+        self.visible = visible
+        self.name = name or DEFAULT_NAME
+        self.hosted = hosted
+        self.port = port               # 0: read from the socket once it is bound
+        self.bans: dict[str, float] = {}   # kicked address -> until when (monotonic)
         # Tropospheric ducting (docs/radio.md): off unless whoever runs the
         # server asks for it. When on, the flight's shared weather decides --
         # warm and still, then a third of the hours -- and the ATC list tells
@@ -386,6 +412,10 @@ class XRadioServer(asyncio.DatagramProtocol):
     # -- asyncio plumbing ---------------------------------------------------
     def connection_made(self, transport):
         self.transport = transport
+        if not self.port:
+            sockname = transport.get_extra_info("sockname")
+            if sockname:
+                self.port = sockname[1]
         LOG.info("listening on %s", transport.get_extra_info("sockname"))
 
     def datagram_received(self, data: bytes, addr: tuple):
@@ -425,6 +455,13 @@ class XRadioServer(asyncio.DatagramProtocol):
     def _dispatch(self, ptype, version, sid, payload, addr):
         if ptype == P.PT_LOGIN:
             return self._on_login(payload, addr, version)
+        # 0.7: the two that need no session -- the LAN search, and whoever
+        # holds the admin token (an admin tool should not join the flight to
+        # run it, and appear in everyone's roster while it does).
+        if ptype == P.PT_DISCOVER:
+            return self._on_discover(payload, addr, version)
+        if ptype == P.PT_ADMIN:
+            return self._on_admin(payload, addr, version)
 
         s = self.sessions.get(addr)
         if s is None:
@@ -444,7 +481,9 @@ class XRadioServer(asyncio.DatagramProtocol):
         elif ptype == P.PT_VOICE:
             self._on_voice(s, payload)
         elif ptype == P.PT_PING:
-            self._send(addr, P.PT_PONG, s.sid)
+            # 0.7: whatever the ping carries comes back, so the client can match
+            # the answer and time the round trip; an empty ping, an empty pong.
+            self._send(addr, P.PT_PONG, s.sid, payload[:P.MAX_PING_ECHO])
         elif ptype == P.PT_WEATHER:
             self._on_weather(s, payload)
         elif ptype == P.PT_AI_TRAFFIC:
@@ -457,6 +496,8 @@ class XRadioServer(asyncio.DatagramProtocol):
             self._on_aircraft(s, payload)
         elif ptype == P.PT_TCAS:
             self._on_tcas(s, payload)
+        elif ptype == P.PT_CREW:
+            self._on_crew(s, payload)
         elif ptype == P.PT_LOGOUT:
             self._drop(s, "logout")
 
@@ -469,12 +510,32 @@ class XRadioServer(asyncio.DatagramProtocol):
             LOG.warning("rejecting %s: protocol v%s", addr, proto_ver)
             self._send(addr, P.PT_LOGIN_REJECT, 0, P.LOGIN_REJECT.pack(P.RJ_VERSION, 0), version)
             return
+        # 0.7: an address the host kicked stays out for as long as they said,
+        # and is told so, with the minutes left.
+        now = time.monotonic()
+        until = self.bans.get(addr[0])
+        if until is not None:
+            if now < until:
+                LOG.warning("rejecting %s: kicked, %d s left", addr, int(until - now))
+                self._send(addr, P.PT_LOGIN_REJECT, 0,
+                           P.LOGIN_REJECT.pack(P.RJ_KICKED, min(0xFFFF, int(math.ceil((until - now) / 60.0)))),
+                           version)
+                return
+            del self.bans[addr[0]]
         if self.password and P.cstr(password_raw) != self.password:
             LOG.warning("rejecting %s: wrong password", addr)
             self._send(addr, P.PT_LOGIN_REJECT, 0, P.LOGIN_REJECT.pack(P.RJ_PASSWORD, 0), version)
             return
         if proto_ver < 6:
             flags &= P.LF_WEATHER_SOURCE    # the station and injector bits are v6's
+        # 0.7: as many as the host allows -- a program driving traffic is not
+        # a pilot, and somebody logging in again is not one more.
+        if self.max_pilots and not (flags & P.LF_INJECTOR):
+            here = sum(1 for x in self.sessions.values() if not x.injector and x.addr != addr)
+            if here >= self.max_pilots:
+                LOG.warning("rejecting %s: the flight is full (%d)", addr, self.max_pilots)
+                self._send(addr, P.PT_LOGIN_REJECT, 0, P.LOGIN_REJECT.pack(P.RJ_FULL, 0), version)
+                return
 
         callsign = _clean(P.cstr(callsign_raw), 15)
         ac_icao = _clean(P.cstr(icao_raw), 7)
@@ -819,6 +880,8 @@ class XRadioServer(asyncio.DatagramProtocol):
         # being left to wonder whether the message landed.
         to = _clean(P.cstr(to_raw), 15)
         if to:
+            if s.muted:
+                return                  # 0.7: muted by the host, direct messages included
             target = next((x for x in self.sessions.values() if x.callsign == to), None)
             if target is not None:
                 out = P.TEXT_HDR.pack(0, s.sid, P.pad(s.callsign, 16),
@@ -833,23 +896,46 @@ class XRadioServer(asyncio.DatagramProtocol):
                 self._send(s.addr, P.PT_TEXT, s.sid, out)
             return
 
+        # 0.7: the cockpit intercom -- the crew, nobody else, at any distance.
+        if P.is_intercom(want_freq):
+            crew = self._crew_members(self._aircraft_of(s))
+            if len(crew) > 1:
+                out = P.TEXT_HDR.pack(P.INTERCOM_KHZ, s.sid, P.pad(s.callsign, 16), len(text), P.pad("", 16)) + text
+                for m in crew:
+                    if m is not s:
+                        self._send(m.addr, P.PT_TEXT, m.sid, out)
+            return
+        if s.muted:
+            return
+        # 0.7: crew aboard somebody's aircraft transmit on its radios, as it --
+        # a copilot does; an observer has no transmitter.
+        a = self._aircraft_of(s)
+        if a is not s and s.crew_role != P.CREW_ROLE_COPILOT:
+            return
+
         # Text does not need the PTT held down, so it is sent on whichever
         # radio the client names -- but only if that radio is really tuned
         # there, so nobody can transmit on a frequency they are not on.
         freq = 0
         if s.ai:
             freq = want_freq
-        elif want_freq and want_freq in (s.com1, s.com2):
+        elif want_freq and want_freq in (a.com1, a.com2):
             freq = want_freq
         elif want_freq == 0:
-            freq = s.tx_freq() or s.com1
+            freq = a.tx_freq() or a.com1
         if freq == 0:
             return
-        out_payload = P.TEXT_HDR.pack(freq, s.sid, P.pad(s.callsign, 16),
+        out_payload = P.TEXT_HDR.pack(freq, a.sid, P.pad(a.callsign, 16),
                                       len(text), P.pad("", 16)) + text
-        for peer in self._listeners(s, freq):
+        for peer in self._listeners(a, freq):
             self._send(peer.addr, P.PT_TEXT, peer.sid, out_payload)
-        LOG.info("text %s on %.3f: %s", s.callsign, freq / 1000.0,
+        if a.crew_open:
+            # ...and the crew read it in the cockpit, from whoever typed it
+            crew_out = P.TEXT_HDR.pack(freq, s.sid, P.pad(s.callsign, 16), len(text), P.pad("", 16)) + text
+            for m in self._crew_members(a):
+                if m is not s:
+                    self._send(m.addr, P.PT_TEXT, m.sid, crew_out)
+        LOG.info("text %s on %.3f: %s", a.callsign, freq / 1000.0,
                  text.decode("utf-8", "replace"))
 
     def _on_voice(self, s: Session, payload):
@@ -861,6 +947,23 @@ class XRadioServer(asyncio.DatagramProtocol):
             return
         s = self._speaker(s, from_sid)
 
+        # 0.7: the cockpit intercom -- the crew, nobody else, at any distance,
+        # and never muted: a cockpit's own wire is nobody else's business.
+        if P.is_intercom(want_freq):
+            crew = self._crew_members(self._aircraft_of(s))
+            if len(crew) > 1:
+                out = P.VOICE_HDR.pack(P.INTERCOM_KHZ, s.sid, seq, len(opus)) + opus
+                for m in crew:
+                    if m is not s:
+                        self._send(m.addr, P.PT_VOICE, m.sid, out)
+            return
+        if s.muted:
+            return
+        # 0.7: crew aboard somebody's aircraft transmit on its radios, as it.
+        a = self._aircraft_of(s)
+        if a is not s and s.crew_role != P.CREW_ROLE_COPILOT:
+            return                      # an observer has no transmitter
+
         # Same rule as text: the client names the radio it is keying and must
         # really be tuned there. Relying on tx_radio from the last position
         # report would drop the first ~200 ms of every transmission.
@@ -869,20 +972,38 @@ class XRadioServer(asyncio.DatagramProtocol):
             freq = want_freq
             # so the [TX] flag on the aircraft follows its voice like a pilot's
             s.com1, s.tx_radio = freq, P.TX_COM1
-        elif want_freq and want_freq in (s.com1, s.com2):
+        elif want_freq and want_freq in (a.com1, a.com2):
             freq = want_freq
         elif want_freq == 0:
-            freq = s.tx_freq()
+            freq = a.tx_freq()
         if freq == 0:
             return
 
         now = time.monotonic()
-        if now - s.last_voice > 1.0:
-            LOG.info("voice %s keyed on %.3f", s.callsign, freq / 1000.0)
-        s.last_voice = now
-        out_payload = P.VOICE_HDR.pack(freq, s.sid, seq, len(opus)) + opus
-        for peer in self._listeners(s, freq):
+        out_seq = seq
+        if a.crew_open:
+            # One aircraft, one transmitter: whoever keyed it first holds it
+            # until they let go, and everyone else outside hears one stream
+            # from the aircraft, numbered by the server so it never runs
+            # backwards when the voice behind it changes.
+            if a.tx_holder and a.tx_holder != s.sid and now - a.tx_holder_at < TX_HOLD_S:
+                return
+            a.tx_holder, a.tx_holder_at = s.sid, now
+            a.voice_seq_out = (a.voice_seq_out + 1) & 0xFFFF
+            out_seq = a.voice_seq_out
+            a.crew_tx_freq = freq
+        if now - a.last_voice > 1.0:
+            LOG.info("voice %s keyed on %.3f", a.callsign, freq / 1000.0)
+        a.last_voice = now
+        out_payload = P.VOICE_HDR.pack(freq, a.sid, out_seq, len(opus)) + opus
+        for peer in self._listeners(a, freq):
             self._send(peer.addr, P.PT_VOICE, peer.sid, out_payload)
+        if a.crew_open:
+            # ...and the rest of the crew hear it in the cockpit, from whoever is talking
+            crew_out = P.VOICE_HDR.pack(freq, s.sid, seq, len(opus)) + opus
+            for m in self._crew_members(a):
+                if m is not s:
+                    self._send(m.addr, P.PT_VOICE, m.sid, crew_out)
 
     def _listeners(self, sender: Session, freq_khz: int):
         """Everyone except the sender who has freq tuned and can receive it --
@@ -894,19 +1015,185 @@ class XRadioServer(asyncio.DatagramProtocol):
         they have it tuned. It is the one frequency you can call somebody on
         without already knowing where they are listening, which is the whole
         reason it exists.
+
+        0.7: crew aboard an aircraft hear what its radios hear, from where it
+        is; the sender's own crew are left out -- they hear it in the cockpit.
         """
         guard = P.is_guard(freq_khz)
+        aboard = {m.sid for m in self._crew_members(sender)} if sender.crew_open else set()
         for peer in self.sessions.values():
-            if peer.sid == sender.sid:
+            if peer.sid == sender.sid or peer.sid in aboard:
                 continue
             if sender.ai and peer.sid == sender.owner:
                 continue                # the program driving it said it; it knows
-            if not guard and not peer.listening_on(freq_khz):
+            rx = self._aircraft_of(peer)
+            if not guard and not rx.listening_on(freq_khz):
                 continue
-            if sender.has_position and peer.has_position and \
-                    not in_radio_range(sender, peer, freq_khz, self.ducting):
+            if sender.has_position and rx.has_position and \
+                    not in_radio_range(sender, rx, freq_khz, self.ducting):
                 continue
             yield peer
+
+    # -- 0.7: the shared cockpit (docs/crew.md) --------------------------------
+    def _aircraft_of(self, s: Session) -> Session:
+        """The aircraft a session is in: its own, or the pilot's it is crew aboard."""
+        if s.crew_of:
+            pilot = self.by_sid.get(s.crew_of)
+            if pilot is not None:
+                return pilot
+        return s
+
+    def _crew_members(self, pilot: Session) -> list:
+        """Everyone in this pilot's cockpit, the pilot first, then by session."""
+        if not pilot.crew_open:
+            return [pilot]
+        return [pilot] + sorted((x for x in self.sessions.values() if x.crew_of == pilot.sid),
+                                key=lambda x: x.sid)
+
+    def _send_crew_state(self, pilot: Session):
+        """Who is aboard, to everyone aboard."""
+        if not pilot.crew_open:
+            return
+        crew = self._crew_members(pilot)
+        members = b"".join(P.CREW_MEMBER.pack(m.sid, P.pad(m.callsign, 16),
+                                              P.CREW_ROLE_PILOT if m is pilot else m.crew_role, 0, 0)
+                           for m in crew)
+        for to in crew:
+            role = P.CREW_ROLE_PILOT if to is pilot else to.crew_role
+            self._send(to.addr, P.PT_CREW, to.sid,
+                       P.crew(P.CREW_STATE, pilot.callsign, role=role, count=len(crew),
+                              aircraft_sid=pilot.sid) + members)
+
+    def _crew_refuse(self, s: Session, reason: int, callsign: str = ""):
+        self._send(s.addr, P.PT_CREW, s.sid, P.crew(P.CREW_REFUSED, callsign, reason=reason))
+
+    def _crew_leave(self, s: Session):
+        """s gets off the aircraft it is crew aboard; the ones left are told."""
+        pilot = self.by_sid.get(s.crew_of)
+        s.crew_of, s.crew_role = 0, 0
+        if pilot is not None:
+            self._send_crew_state(pilot)
+
+    def _crew_close(self, pilot: Session):
+        """The pilot takes no crew any more: everyone aboard is put off, and told."""
+        for m in self._crew_members(pilot)[1:]:
+            m.crew_of, m.crew_role = 0, 0
+            self._crew_refuse(m, P.CREW_CLOSED, pilot.callsign)
+        pilot.crew_open, pilot.crew_code, pilot.panel = False, "", None
+        pilot.tx_holder = 0
+
+    def _on_crew(self, s: Session, payload):
+        d = P.unpack_crew(payload)
+        if d is None or s.atc or s.injector or s.proto < 6:
+            return
+        op = d["op"]
+        if op == P.CREW_OPEN:
+            if s.crew_of:
+                self._crew_leave(s)     # off somebody else's aircraft, into your own
+            s.crew_open, s.crew_code = True, _clean(d["code"], 15)
+            self._send_crew_state(s)
+            LOG.info("%s opens the cockpit to a crew%s", s.callsign, " (with a code)" if s.crew_code else "")
+        elif op == P.CREW_CLOSE:
+            if s.crew_open:
+                self._crew_close(s)
+                self._send(s.addr, P.PT_CREW, s.sid, P.crew(P.CREW_STATE))
+        elif op == P.CREW_JOIN:
+            role = d["role"] if d["role"] in (P.CREW_ROLE_COPILOT, P.CREW_ROLE_OBSERVER) else P.CREW_ROLE_OBSERVER
+            want = _clean(d["callsign"], 15)
+            target = next((x for x in self.sessions.values()
+                           if x.callsign == want and x is not s and not x.atc and not x.injector), None)
+            if s.crew_open:
+                return self._crew_refuse(s, P.CREW_BUSY, want)
+            if target is None:
+                return self._crew_refuse(s, P.CREW_NO_SUCH, want)
+            if not target.crew_open:
+                return self._crew_refuse(s, P.CREW_NOT_OPEN, want)
+            if target.crew_code and _clean(d["code"], 15) != target.crew_code:
+                return self._crew_refuse(s, P.CREW_BAD_CODE, want)
+            if s.crew_of != target.sid and len(self._crew_members(target)) >= P.MAX_CREW:
+                return self._crew_refuse(s, P.CREW_FULL, want)
+            if s.crew_of and s.crew_of != target.sid:
+                self._crew_leave(s)
+            s.crew_of, s.crew_role = target.sid, role
+            self._send_crew_state(target)
+            if target.panel:
+                self._send(s.addr, P.PT_CREW, s.sid, target.panel)
+            LOG.info("%s joins %s's cockpit as %s", s.callsign, target.callsign,
+                     "copilot" if role == P.CREW_ROLE_COPILOT else "observer")
+        elif op == P.CREW_LEAVE:
+            if s.crew_of:
+                self._crew_leave(s)
+                self._send(s.addr, P.PT_CREW, s.sid, P.crew(P.CREW_STATE))
+        elif op == P.CREW_PANEL:
+            if s.crew_open and d["panel"] is not None:
+                rec = payload[P.CREW.size:P.CREW.size + P.CREW_PANEL_REC.size]
+                s.panel = P.crew(P.CREW_PANEL, s.callsign, role=P.CREW_ROLE_PILOT, aircraft_sid=s.sid) + rec
+                for m in self._crew_members(s)[1:]:
+                    self._send(m.addr, P.PT_CREW, m.sid, s.panel)
+        elif op == P.CREW_TUNE:
+            pilot = self.by_sid.get(s.crew_of) if s.crew_of else None
+            if pilot is not None and s.crew_role == P.CREW_ROLE_COPILOT and d["panel"] is not None:
+                rec = payload[P.CREW.size:P.CREW.size + P.CREW_PANEL_REC.size]
+                self._send(pilot.addr, P.PT_CREW, pilot.sid,
+                           P.crew(P.CREW_TUNE, s.callsign, role=s.crew_role, aircraft_sid=pilot.sid,
+                                  from_sid=s.sid) + rec)
+
+    # -- 0.7: whoever runs the server ------------------------------------------
+    def _on_admin(self, payload, addr, version):
+        """Kick, mute, unmute, the pilot limit -- with the admin token, or
+        nothing at all: a wrong token gets no answer to learn from."""
+        if len(payload) < P.ADMIN.size:
+            return
+        op, _res, minutes, target_sid, value, target_raw, token_raw = P.ADMIN.unpack_from(payload, 0)
+        if not self.admin_token or P.cstr(token_raw) != self.admin_token:
+            return
+        sender = self.sessions.get(addr)
+        ok = False
+        if op == P.ADMIN_LIMIT:
+            self.max_pilots = max(0, min(int(value), 999))
+            ok = True
+            LOG.info("the pilot limit is now %s", self.max_pilots or "none")
+        elif op in (P.ADMIN_KICK, P.ADMIN_MUTE, P.ADMIN_UNMUTE):
+            if target_sid:
+                t = self.by_sid.get(target_sid)
+            else:
+                want = _clean(P.cstr(target_raw), 15)
+                t = next((x for x in self.sessions.values() if x.callsign == want), None) if want else None
+            if t is not None and t is not sender:
+                if op == P.ADMIN_KICK:
+                    self._kick(t, minutes)
+                else:
+                    t.muted = op == P.ADMIN_MUTE
+                    why = (b"the host has muted you: nothing you say on the radio reaches anyone"
+                           if t.muted else b"the host has unmuted you")
+                    self._send(t.addr, P.PT_TEXT, t.sid,
+                               P.TEXT_HDR.pack(0, 0, P.pad("XRADIO", 16), len(why), P.pad(t.callsign, 16)) + why)
+                    LOG.info("%s %s by the host", t.callsign, "muted" if t.muted else "unmuted")
+                ok = True
+        reply = P.ADMIN.pack(op, 1 if ok else 0, minutes, target_sid, value, target_raw, P.pad("", 32))
+        self._send(addr, P.PT_ADMIN, sender.sid if sender is not None else 0, reply,
+                   version if sender is None else 0)
+
+    def _kick(self, t: Session, minutes: int):
+        """Told why, dropped -- and with minutes, the address kept out that long."""
+        self._send(t.addr, P.PT_LOGIN_REJECT, 0, P.LOGIN_REJECT.pack(P.RJ_KICKED, minutes))
+        if minutes:
+            self.bans[t.addr[0]] = time.monotonic() + minutes * 60.0
+            while len(self.bans) > MAX_BANS:
+                del self.bans[min(self.bans, key=self.bans.get)]
+        self._drop(t, f"kicked by the host{f' for {minutes} min' if minutes else ''}")
+
+    def _on_discover(self, payload, addr, version):
+        """The LAN search: what this flight is, in a record the size of the
+        question -- so nobody can use the server to send more than they did."""
+        if not self.visible or len(payload) < P.DISCOVER.size:
+            return
+        nonce = P.DISCOVER.unpack_from(payload, 0)[8]
+        pilots = sum(1 for x in self.sessions.values() if not x.injector)
+        flags = (P.DF_PASSWORD if self.password else 0) | (P.DF_HOSTED if self.hosted else 0)
+        out = P.DISCOVER.pack(P.PROTO_VERSION, self.port & 0xFFFF, min(pilots, 0xFFFF), min(self.max_pilots, 0xFFFF),
+                              flags, b"\x00" * 3, P.pad(self.name, 28), P.pad(P.XRADIO_VERSION, 16), nonce, 0)
+        self._send(addr, P.PT_DISCOVER, 0, out, version)
 
     # -- periodic work ------------------------------------------------------
     async def run_traffic_loop(self):
@@ -919,6 +1206,7 @@ class XRadioServer(asyncio.DatagramProtocol):
                 now = time.monotonic()
                 if self._roster_dirty or now - self._last_roster >= ROSTER_INTERVAL_S:
                     self._broadcast_roster(now)
+                    self._broadcast_crews()
                 if self._atc_dirty or now - self._last_atc >= ATC_LIST_INTERVAL_S:
                     self._broadcast_atc_list(now)
             except Exception:
@@ -974,7 +1262,20 @@ class XRadioServer(asyncio.DatagramProtocol):
             for icao in [k for k, a in self.atis.items() if a["owner"] == s.sid]:
                 del self.atis[icao]
             self._atc_dirty = True
+        # 0.7: a pilot who goes takes the cockpit with them; crew who go leave a seat
+        if s.crew_open:
+            self._crew_close(s)
+        if s.crew_of:
+            pilot = self.by_sid.get(s.crew_of)
+            s.crew_of = 0
+            if pilot is not None:
+                self._send_crew_state(pilot)
         LOG.info("drop %s (sid=%d): %s", s.callsign, s.sid, why)
+
+    def _broadcast_crews(self):
+        """Every cockpit's crew list again, with the roster: one lost on the way heals by itself."""
+        for pilot in sorted((x for x in self.sessions.values() if x.crew_open), key=lambda x: x.sid):
+            self._send_crew_state(pilot)
 
     def _broadcast_roster(self, now: float):
         """Everyone in the flight, to everyone in the flight.
@@ -1008,11 +1309,13 @@ class XRadioServer(asyncio.DatagramProtocol):
         # What can be seen: pilots, and the aircraft injectors drive. An ATC
         # station is not an aircraft, and an injector does not need its own
         # aircraft back.
-        visible = [s for s in live if not s.atc] + list(self.ai.values())
+        # 0.7: crew aboard somebody's aircraft are not an aircraft of their own,
+        # and they do not see the one they are sitting in.
+        visible = [s for s in live if not s.atc and not s.crew_of] + list(self.ai.values())
         for me in live:
             others = []
             for other in visible:
-                if other.sid == me.sid or (other.ai and other.owner == me.sid):
+                if other.sid == me.sid or (other.ai and other.owner == me.sid) or other.sid == me.crew_of:
                     continue
                 if distance_nm(me, other) > TRAFFIC_RANGE_NM:
                     continue
@@ -1033,14 +1336,16 @@ class XRadioServer(asyncio.DatagramProtocol):
         # gets the entries it knows, which are shorter.
         v6 = me.proto >= 6
         per = MAX_ENTRIES_PER_PACKET if v6 else P.MAX_TRAFFIC_ENTRIES_V5
+        ears = self._aircraft_of(me)    # crew listen on the radios of the aircraft they are in
         for first in range(0, max(len(others), 1), per):
             chunk = others[first:first + per]
             parts = [P.TRAFFIC_HDR.pack(len(chunk), 0)]
             for o in chunk:
                 tx_active = 0
                 if now - o.last_voice < TX_HOLD_S:
-                    f = o.tx_freq()
-                    tx_active = 1 if (f and me.listening_on(f)) else 0
+                    # a crewed aircraft is keyed by whoever holds its transmitter
+                    f = o.crew_tx_freq if o.crew_open else o.tx_freq()
+                    tx_active = 1 if (f and ears.listening_on(f)) else 0
                 fields = (o.sid, P.pad(o.callsign, 16), P.pad(o.ac_icao, 8),
                           o.lat, o.lon, o.alt_m, o.heading, o.pitch, o.roll,
                           o.gs_ms, o.gear, o.flap,
@@ -1111,7 +1416,9 @@ class Dashboard:
         source = s.by_sid.get(s._weather_sid)
         lines = [
             f"XRadio relay server  ·  port {self.port}  ·  up {uptime}  ·  "
-            f"{'password required' if s.password else 'no password'}",
+            f"{'password required' if s.password else 'no password'}"
+            + (f"  ·  max {s.max_pilots} pilots" if s.max_pilots else "")
+            + ("  ·  hidden from the LAN search" if not s.visible else ""),
             f"pilots {len(s.sessions)}  ·  packets in {self.rate_in:.0f}/s, out "
             f"{self.rate_out:.0f}/s  ·  sky from {source.callsign if source else 'nobody yet'}"
             + ("  ·  DUCTING: VHF reaches far over the sea" if s.ducting else ""),
@@ -1128,6 +1435,11 @@ class Dashboard:
             radio = ("voice" if now - p.last_voice < TX_HOLD_S
                      else ("keyed" if p.tx_radio else ""))
             kind = "ATC" if p.atc else (f"AI x{sum(1 for a in s.ai.values() if a.owner == p.sid)}" if p.injector else p.ac_icao)
+            if p.muted:
+                radio = "MUTED"
+            elif p.crew_of:
+                pilot = s.by_sid.get(p.crew_of)
+                radio = ("crew>" + pilot.callsign) if pilot else radio
             lines.append(
                 f"{p.callsign:<9}{kind:<6}{pos:<22}{p.alt_ft:>7.0f} "
                 f"{p.gs_ms * 1.94384:>4.0f}  {self._mhz(p.com1):<8}{self._mhz(p.com2):<8}"
@@ -1155,6 +1467,16 @@ async def main():
                     default=os.environ.get("XRADIO_DUCTING", "") not in ("", "0"),
                     help="realism: let the flight's shared weather bring rare tropospheric ducting, "
                          "when VHF reaches far past the horizon over the sea (default: off)")
+    ap.add_argument("--admin-token", default=os.environ.get("XRADIO_ADMIN_TOKEN", ""),
+                    help="lets server/admin.py (or anything with this token) kick and mute pilots and set the "
+                         "pilot limit; empty (the default): nobody can")
+    ap.add_argument("--max-pilots", type=int, default=int(os.environ.get("XRADIO_MAX_PILOTS", "0")),
+                    help="the most pilots the flight takes; 0 (the default): no limit")
+    ap.add_argument("--hidden", action="store_true",
+                    default=os.environ.get("XRADIO_HIDDEN", "") not in ("", "0"),
+                    help="do not answer XRadio's search for flights on the local network")
+    ap.add_argument("--name", default=os.environ.get("XRADIO_NAME", ""),
+                    help=f"what the local-network search calls this flight (default: {DEFAULT_NAME!r})")
     ap.add_argument("--dashboard", action="store_true",
                     help="show a live picture of the flight in this terminal instead of a log")
     ap.add_argument("--log", metavar="FILE",
@@ -1180,11 +1502,17 @@ async def main():
         )
 
     loop = asyncio.get_running_loop()
-    server = XRadioServer(password=args.password, ducting=args.ducting)
+    server = XRadioServer(password=args.password, ducting=args.ducting, admin_token=args.admin_token,
+                          max_pilots=args.max_pilots, visible=not args.hidden, name=args.name,
+                          port=args.port)
     if args.password:
         LOG.info("a flight password is required to join")
     if args.ducting:
         LOG.info("tropospheric ducting is on: warm, still weather from the flight's sky can carry VHF far over the sea")
+    if args.admin_token:
+        LOG.info("admin token set: server/admin.py can kick and mute pilots")
+    if args.max_pilots:
+        LOG.info("at most %d pilots", args.max_pilots)
     transport, _ = await loop.create_datagram_endpoint(
         lambda: server, local_addr=(args.host, args.port))
     disable_udp_reset(transport)

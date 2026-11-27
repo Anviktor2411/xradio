@@ -70,8 +70,11 @@ struct Ctx {
     int heightFor(int rowY) const { return top - rowY + kRowH + 10; }
     void endInput() { clicked = false; keys.clear(); }
 
+    // A row below the window's bottom edge is not drawn (draw() clips it), so it cannot be clicked either:
+    // the Save and Cancel buttons are held on screen right above such rows, and a hidden row taking their
+    // click is a settings window that will neither save nor close.
     bool rowHit() const {
-        return clicked && clickY >= y - 6 && clickY <= y + 15;
+        return clicked && y >= bottom + 4 && clickY >= y - 6 && clickY <= y + 15;
     }
     void nextRow() { y -= kRowH; }
 };

@@ -220,6 +220,44 @@ jobs:
       - name: The radio model
         run: ASAN_OPTIONS=detect_leaks=0 ./build-tests/radio_test
 
+      # 0.7: the shared cockpit's panel logic (what a copilot's knob asks for, what a tune changes), the
+      # quick-tune slots and the round trip -- plain logic, no X-Plane.
+      - name: The shared cockpit's logic, quick-tune, the round trip
+        run: ASAN_OPTIONS=detect_leaks=0 ./build-tests/cockpit_test
+
+      # 0.7: the whole plugin as copilot in a fake pilot's cockpit (aboard, the panel in step, a knob turned,
+      # the intercom there and back, a transmission as the aircraft), then as the pilot of its own with a fake
+      # copilot who joins with the code and retunes COM2. Against both servers: server.py, and the C++ relay
+      # a pilot hosting from the plugin runs.
+      - name: The shared cockpit, end to end
+        run: |
+          crew_run() {   # crew_run <label> <port> <server command...>
+            label=$1; port=$2; shift 2
+            "$@" > /tmp/crew_srv_$label.log 2>&1 &
+            srv=$!
+            sleep 1
+            python3 tools/fake_client.py --port $port --callsign PIC001 --lat 57.86 --lon 27.03 --speed-kt 0 \
+              --com1 124300 --com2 121500 --crew-open --parrot --intercom-parrot > /tmp/crew_pic_$label.log 2>&1 &
+            pic=$!
+            python3 tools/fake_client.py --port $port --callsign COP001 --lat 57.86 --lon 27.04 --speed-kt 0 \
+              --crew-join CREWHN --crew-code ABC --crew-tune com2=118.500 > /tmp/crew_cop_$label.log 2>&1 &
+            cop=$!
+            sleep 1
+            echo "=== against $label ==="
+            ASAN_OPTIONS=detect_leaks=0 ./build-tests/crew_harness 127.0.0.1 $port; rc=$?
+            if [ $rc -ne 0 ]; then
+              echo "--- server ---"; tail -30 /tmp/crew_srv_$label.log
+              echo "--- PIC001 ---"; grep -E "crew|intercom|voice" /tmp/crew_pic_$label.log | tail -20
+              echo "--- COP001 ---"; grep -E "crew" /tmp/crew_cop_$label.log | tail -20
+            fi
+            kill "$srv" "$pic" "$cop" 2>/dev/null || true
+            wait "$srv" "$pic" "$cop" 2>/dev/null || true
+            return $rc
+          }
+          crew_run python 49410 python3 server/server.py --port 49410; a=$?
+          crew_run cpp 49411 ./build-tests/xradio_server 49411; b=$?
+          exit $(( a || b ))
+
       # Tower mode's windows clicked through in ImGui contexts of their own, without X-Plane
       # or OpenGL: Clear in Delivery, the command line, strips dragged between bays, the radar,
       # the light gun, the banner's Retry -- each checked to ask tower.cpp for the right thing.

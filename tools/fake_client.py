@@ -39,6 +39,12 @@ def _disable_udp_reset(sock):
         pass
 
 
+def P_parse_khz(text):
+    """'118.500' or '118500' -> kHz."""
+    text = text.strip()
+    return int(round(float(text) * 1000)) if "." in text else int(text)
+
+
 def run(args):
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     _disable_udp_reset(sock)
@@ -98,6 +104,9 @@ def run(args):
     stop = threading.Event()
     voice_rx = [0]
     voice_tx = [0]
+    # 0.7: the shared cockpit -- as the pilot (--crew-open) or as crew (--crew-join)
+    crew = {"aboard": False, "panel": None, "ic_rx": 0, "ic_tx": 0, "com2": args.com2, "panel_due": 0.0,
+            "asked": 0.0, "tuned": False, "joined_at": 0.0, "sids": set(), "echo": [], "echo_last": 0.0}
     rx_texts = []                       # texts from others, for --script's waitfor and placeholders
     # the state the position packets report; --script moves it (`me`: the receiver has a local `st` of its own)
     me = {"lat": args.lat, "lon": args.lon, "alt_m": args.alt_ft / 3.28084, "gs_ms": args.speed_kt * 0.514444,
@@ -138,16 +147,60 @@ def run(args):
             elif ptype == P.PT_VOICE:
                 freq, from_sid, seq, olen = P.VOICE_HDR.unpack_from(payload, 0)
                 opus = payload[P.VOICE_HDR.size:P.VOICE_HDR.size + olen]
+                # 0.7: the intercom, counted on its own and echoed back with --intercom-parrot
+                if P.is_intercom(freq):
+                    crew["ic_rx"] += 1
+                    if crew["ic_rx"] == 1 or crew["ic_rx"] % 50 == 0:
+                        print(f"  intercom: {crew['ic_rx']} frames from sid {from_sid}", flush=True)
+                    if args.intercom_parrot and opus:
+                        crew["ic_tx"] += 1
+                        sock.sendto(P.pack(P.PT_VOICE, sid, P.VOICE_HDR.pack(
+                            P.INTERCOM_KHZ, sid, crew["ic_tx"] & 0xFFFF, len(opus)) + opus), dest)
+                    continue
                 voice_rx[0] += 1
                 if voice_rx[0] == 1 or voice_rx[0] % 50 == 0:
                     print(f"  voice: {voice_rx[0]} frames from sid {from_sid} "
                           f"on {freq / 1000:.3f} ({olen} bytes)", flush=True)
-                if args.parrot and opus:
+                if args.parrot and opus and from_sid in crew["sids"]:
+                    # 0.7: our own crew on the aircraft's radio. One aircraft has
+                    # one transmitter and they are holding it, so say it again
+                    # once they let go (the main loop replays it).
+                    crew["echo"].append(opus)
+                    crew["echo_last"] = time.monotonic()
+                elif args.parrot and opus:
                     # Send the same frame back as our own transmission, so a
                     # client can test its whole receive path against itself.
                     voice_tx[0] += 1
                     sock.sendto(P.pack(P.PT_VOICE, sid, P.VOICE_HDR.pack(
                         me["com1"], sid, voice_tx[0] & 0xFFFF, len(opus)) + opus), dest)
+            # --- 0.7: the shared cockpit ---
+            elif ptype == P.PT_CREW:
+                d = P.unpack_crew(payload)
+                if d is None:
+                    continue
+                if d["op"] == P.CREW_STATE:
+                    seats = ", ".join(f"{n} {['', 'pilot', 'copilot', 'observer'][min(r, 3)]}" for _s, n, r in d["members"])
+                    crew["aboard"] = d["count"] > 0
+                    crew["sids"] = {m_sid for m_sid, _n, _r in d["members"] if m_sid != sid}
+                    print(f"  crew: aboard {d['callsign'] or '-'} [{seats}]" if d["count"] else "  crew: in no cockpit", flush=True)
+                elif d["op"] == P.CREW_REFUSED:
+                    crew["aboard"] = False
+                    print(f"  crew: refused, reason {d['reason']} ({d['callsign']})", flush=True)
+                elif d["op"] == P.CREW_PANEL and d["panel"]:
+                    c1, c2, s1, s2, tx = d["panel"][:5]
+                    if (c1, c2, s1, s2, tx) != crew.get("panel"):
+                        crew["panel"] = (c1, c2, s1, s2, tx)
+                        print(f"  crew: panel COM1 {c1 / 1000:.3f} COM2 {c2 / 1000:.3f} "
+                              f"standby {s1 / 1000:.3f}/{s2 / 1000:.3f} tx COM{tx}", flush=True)
+                elif d["op"] == P.CREW_TUNE and d["panel"]:
+                    # we are the aircraft: a copilot turns our knob
+                    c1, c2, s1, s2, tx = d["panel"][:5]
+                    if c1:
+                        me["com1"] = c1
+                    if c2:
+                        crew["com2"] = c2
+                    print(f"  crew: tune from {d['callsign']}: COM1 {c1 / 1000:.3f} COM2 {c2 / 1000:.3f}", flush=True)
+                    crew["panel_due"] = 0.0
             # --- v6 ---
             elif ptype == P.PT_ATC_LIST:
                 count, _ = P.ATC_LIST_HDR.unpack_from(payload, 0)
@@ -329,6 +382,49 @@ def run(args):
                 sock.sendto(P.pack(P.PT_ATIS, sid, P.atis(args.atis_freq, args.callsign.split("_")[0],
                                                           args.atis_letter, args.atis)), dest)
 
+            # 0.7: --parrot, for what our own crew said on the aircraft's radio: after a 0.6 s pause,
+            # the same frames again at the pace they were spoken, as our own transmission.
+            if crew["echo"] and time.monotonic() - crew["echo_last"] > 0.6:
+                frames, crew["echo"] = crew["echo"], []
+
+                def replay(frames=frames):
+                    for opus in frames:
+                        voice_tx[0] += 1
+                        sock.sendto(P.pack(P.PT_VOICE, sid, P.VOICE_HDR.pack(
+                            me["com1"], sid, voice_tx[0] & 0xFFFF, len(opus)) + opus), dest)
+                        time.sleep(0.02)
+                    print(f"  voice: said our crew's {len(frames)} frames again on {me['com1'] / 1000:.3f}", flush=True)
+                threading.Thread(target=replay, daemon=True).start()
+
+            # 0.7: the shared cockpit. A pilot opens it and keeps the crew's panel in step; crew keep
+            # asking to join until they are aboard, then (--crew-tune) turn one of the aircraft's knobs.
+            now = time.time()
+            if args.crew_open is not None:
+                if not crew["aboard"] and now - crew["asked"] > 2.0:
+                    sock.sendto(P.pack(P.PT_CREW, sid, P.crew(P.CREW_OPEN, code=args.crew_open)), dest)
+                    crew["asked"] = now
+                if crew["aboard"] and now >= crew["panel_due"]:
+                    panel = P.crew_panel(me["com1"], crew["com2"], 119700, 121800, P.TX_COM1,
+                                         P.RX_COM1 | (P.RX_COM2 if crew["com2"] else 0),
+                                         P.CP_COM1_POWER | P.CP_COM2_POWER, 0.8, 0.8)
+                    sock.sendto(P.pack(P.PT_CREW, sid, P.crew(P.CREW_PANEL) + panel), dest)
+                    crew["panel_due"] = now + 1.0
+            if args.crew_join:
+                if not crew["aboard"] and now - crew["asked"] > 2.0:
+                    role = P.CREW_ROLE_OBSERVER if args.crew_role == "observer" else P.CREW_ROLE_COPILOT
+                    sock.sendto(P.pack(P.PT_CREW, sid, P.crew(P.CREW_JOIN, args.crew_join.upper(), code=args.crew_code,
+                                                              role=role)), dest)
+                    crew["asked"] = now
+                if crew["aboard"] and not crew["joined_at"]:
+                    crew["joined_at"] = now
+                if args.crew_tune and crew["aboard"] and not crew["tuned"] and now - crew["joined_at"] > 2.0:
+                    which, _, freq = args.crew_tune.partition("=")
+                    khz = P_parse_khz(freq)
+                    want = P.crew_panel(com1=khz) if which.lower() == "com1" else P.crew_panel(com2=khz)
+                    sock.sendto(P.pack(P.PT_CREW, sid, P.crew(P.CREW_TUNE) + want), dest)
+                    crew["tuned"] = True
+                    print(f"  crew: asked the aircraft to tune {which.upper()} to {khz / 1000:.3f}", flush=True)
+
             # Text names its own frequency and does not need the PTT held.
             if args.talk and time.time() >= next_text:
                 msg = f"{args.callsign} position report".encode()
@@ -401,4 +497,14 @@ if __name__ == "__main__":
     ap.add_argument("--tcas-for", type=float, default=20.0)
     ap.add_argument("--direct", default="", metavar="'CALLSIGN message'",
                     help="send one direct message after logging in")
+    # 0.7: the shared cockpit (docs/crew.md)
+    ap.add_argument("--crew-open", nargs="?", const="", default=None, metavar="CODE",
+                    help="0.7: open this aircraft's cockpit to a crew (optionally with a code) and send them the panel")
+    ap.add_argument("--crew-join", default="", metavar="CALLSIGN", help="0.7: sit in this pilot's cockpit")
+    ap.add_argument("--crew-role", default="copilot", choices=["copilot", "observer"])
+    ap.add_argument("--crew-code", default="", help="0.7: the code the pilot set")
+    ap.add_argument("--crew-tune", default="", metavar="COM2=118.500",
+                    help="0.7: as crew, ask the aircraft to tune this once aboard")
+    ap.add_argument("--intercom-parrot", action="store_true",
+                    help="0.7: send every intercom frame back on the intercom")
     run(ap.parse_args())

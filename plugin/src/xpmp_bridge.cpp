@@ -68,6 +68,7 @@ int  cslModelCount() { return 0; }
 std::string cslModelSource() { return ""; }
 void setTrafficVisible(bool) {}
 void setLabels(bool, float) {}
+void setMapVisible(bool, bool) {}
 
 #else
 // ---------------------------------------------------------------------------
@@ -372,6 +373,13 @@ void setLabels(bool on, float maxDistNm) {
     if (!g_ready) return;
     XPMPEnableAircraftLabels(on);
     if (on) XPMPSetAircraftLabelDist(maxDistNm, true);
+}
+
+// 0.7: the other pilots on X-Plane's own map (XPMP2 draws the layer), with or
+// without their callsigns.
+void setMapVisible(bool on, bool labels) {
+    if (!g_ready) return;
+    XPMPEnableMap(on, labels);
 }
 
 void upsert(const RemoteState& s) {

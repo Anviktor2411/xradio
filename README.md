@@ -224,7 +224,14 @@ bash tools/check_windows_build.sh     # ~20s: compile everything for Windows
 python3 tools/test_server.py          # server: protocol and routing, ATC (v6) included
 bash tools/check_simbrief.sh          # SimBrief: parser, .fms writer, a live fetch against tools/fake_simbrief.py
 python3 tools/check_win_imports.py build/XRadio/win_x64/XRadio.xpl   # Windows: no DLL a pilot's PC lacks
+./build-tests/cockpit_test            # 0.7: the shared cockpit's panel logic, quick-tune, the round trip
+./build-tests/crew_harness 127.0.0.1 49410   # 0.7: the plugin as copilot and as pilot, against fake pilots
 ```
+
+`crew_harness` needs a server and two fake pilots on that port — the CI step
+*The shared cockpit, end to end* starts them:
+`python3 tools/fake_client.py --port 49410 --callsign PIC001 --com1 124300 --com2 121500 --crew-open --parrot --intercom-parrot`
+and `python3 tools/fake_client.py --port 49410 --callsign COP001 --crew-join CREWHN --crew-code ABC --crew-tune com2=118.500`.
 
 `check_portability.sh` catches the mistakes that pass on Linux and macOS and
 fail on Windows ten minutes later — `M_PI` (POSIX, not standard C++, and MSVC
@@ -700,6 +707,16 @@ server, port, callsign or aircraft type causes a reconnect.
 | Squelch | how strong a signal has to be before the receiver opens for it, like the knob on the radio. Turned up, a distant station is kept out; all the way down the squelch is open — constant static, and the faintest station gets through |
 | Cockpit noise | how much of the other pilot's cockpit comes through their microphone. It goes through their transmitter's limiter like the voice does, so it sits under the words and swells up between them |
 | Radio sound | the whole VHF radio character — limiter, overdrive, squelch, 300–2700 Hz filter, distance fading, the blocked squeal. Off = clean audio |
+| Click when keying | 0.7: a short click in your own headset as the PTT closes and opens |
+| Squelch burst and click | 0.7: the burst of noise and the click as the squelch opens and closes. Off: a transmission just starts and stops |
+| Static crackle on weak signals | 0.7: static crashes on a signal near the edge of coverage, more of them towards the horizon, none on a strong one; scaled by *Radio noise* |
+| Intercom volume | 0.7: the cockpit intercom's own knob (`docs/crew.md`) |
+| Push-to-talk key / Intercom key | a keyboard key for each; or bind `xradio/ptt` and `xradio/intercom` to joystick buttons |
+
+The **Mic test** button records while you hold it and plays it back when you
+let go — through the codec and the whole radio chain, so you hear yourself as
+the others will. Nothing is sent (before 0.7 the button keyed the transmitter,
+so the whole frequency heard the test).
 
 The audio tab also shows a live mic level meter and the voice status line, so
 you can hold the PTT and confirm the right microphone is being heard before
@@ -713,6 +730,11 @@ you go looking for someone to talk to.
 | Port to host on | the UDP port friends connect to. 49100 unless something else is using it |
 | Ask the router to open it | UPnP: opens the port automatically so nobody touches a router config page. Off if you have forwarded the port yourself, or if your router's UPnP is switched off |
 | Rare tropospheric ducting (realism) | off by default. On a warm, still evening the flight's shared weather may let VHF reach far past the horizon over the sea, as it really does now and then; the radio log says when it begins and ends. Changing it does not restart the server (`docs/radio.md`) |
+| Most pilots | 0.7: the most pilots the flight takes, 0 for no limit. The next one is told the flight is full. No restart |
+| Findable on this network | 0.7: answer XRadio's *Find flights on this network* search. No restart |
+
+While hosting, the Host / Connect tab lists everyone in the flight with
+**Mute**, **Kick** and **Kick 30 min** beside each (0.7, `docs/server.md`).
 
 **Traffic**
 
@@ -722,6 +744,23 @@ you go looking for someone to talk to.
 | Callsign labels | the floating name tags |
 | Label range | how far away labels stay readable, 1–100 nm |
 | Traffic range | how far away aircraft are drawn, 5–200 nm |
+| Traffic on X-Plane's map | 0.7: the other pilots on the sim's own map (XPMP2's layer) |
+| Traffic on TCAS | 0.7: off keeps them out of TCAS and the nav displays altogether, still drawn outside |
+| Traffic scope range | 0.7: the traffic scope window's starting range |
+
+**Shared cockpit** (0.7, on the Connection tab; the window has a *Crew* group)
+
+| setting | what it does |
+|---|---|
+| Shared cockpit | `off`; `pilot`: your cockpit takes a crew; `join`: you sit in another pilot's |
+| Pilot to join | their callsign |
+| Role | `copilot` talks on the aircraft's radios and may retune them; `observer` listens and talks on the intercom |
+| Crew code | the pilot sets one, crew give the same; empty lets anyone in the flight join |
+| My radios follow the aircraft's | as crew, your sim's radio panel follows the aircraft's |
+
+**Quick-tune** (0.7): up to eight slots, `TWR=118.100;GND=121.800;...` — a row
+of buttons on the Radio tab (click for COM1, right-click for COM2, Ctrl+click
+to keep COM1 in the slot) and the commands `xradio/preset_1` … `xradio/preset_8`.
 
 The same values live in `X-Plane 12/Output/preferences/xradio.cfg`, written on
 first run:
@@ -903,6 +942,29 @@ any callsign. Packets after login must carry the session id the server issued,
 which stops blind off-path spoofing, but this is a flying-with-friends server,
 not a hardened public service. Run it on a port you are willing to expose, and
 do not reuse it for anything sensitive.
+
+### New in 0.7
+
+- **Shared cockpit**: a pilot opens their cockpit, a copilot or an observer
+  joins from their own X-Plane. A private **intercom** (its own PTT, volume
+  and key, `xradio/intercom`), the aircraft's radios for the whole crew, a
+  copilot transmitting as the aircraft, and the crew's radio panels in step
+  with the aircraft's. `docs/crew.md`
+- **Radio realism switches**: a PTT click in your own headset, the squelch's
+  burst and click on or off, static crashes on a weak signal
+- **A real microphone test**: record, play back through the codec and the
+  radio chain, nothing sent
+- **Who is coming in**: callsign, frequency, readability, distance and
+  transponder of every station you hear, on the Radio tab
+- **Quick-tune slots**, eight, with commands
+- **Traffic scope**: a small TCAS-style window of the traffic around you,
+  heading up or north up, relative altitudes, climb and descent arrows
+  (`xradio/traffic_window`); traffic on X-Plane's map and TCAS as switches
+- **Hosting controls**: mute, kick (for a while), a pilot limit, findable on
+  the local network or not; `server/admin.py` for a dedicated server
+- **Find flights on this network**: one button lists every flight on the LAN
+- **The connection's health**: round trip, jitter, packets lost and voice lost,
+  in the window and the overlay when it is bad enough to matter
 
 ## Roadmap
 
