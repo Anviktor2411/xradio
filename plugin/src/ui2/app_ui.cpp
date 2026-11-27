@@ -447,6 +447,45 @@ void drawHost(Model& m, const Actions& a) {
     sameLineIfFits(160.f + ImGui::GetStyle().ItemInnerSpacing.x + ImGui::CalcTextSize(tr("Most pilots (0 = no limit)"), nullptr, true).x);
     ImGui::SetNextItemWidth(160);
     if (ImGui::SliderFloat(tr("Most pilots (0 = no limit)"), &e.hostMaxPilots, 0.f, 32.f, "%.0f")) g_st.editDirty = true;
+    ImGui::Separator();
+    heading(tr("Connect to"));
+    char host[128]; snprintf(host, sizeof host, "%s", e.host.c_str());
+    ImGui::SetNextItemWidth(260);
+    if (ImGui::InputTextWithHint("##srv", tr("Server address or join code"), host, sizeof host)) { e.host = host; g_st.editDirty = true; }
+    ImGui::SameLine(); ImGui::SetNextItemWidth(70);
+    char cport[8]; snprintf(cport, sizeof cport, "%s", e.port.c_str());
+    if (ImGui::InputText(tr("Port"), cport, sizeof cport, ImGuiInputTextFlags_CharsDecimal)) { e.port = cport; g_st.editDirty = true; }
+    // Apply and Reconnect only ask: the plugin does the work from its flight loop, after this frame
+    const bool pressed = ImGui::Button(g_st.editDirty ? tr("Apply") : tr("Reconnect"));
+    if (probesOn()) probeLast("apply:host");
+    if (pressed) {
+        if (g_st.editDirty && a.applySettings) { a.applySettings(e); g_st.editDirty = false; setNote(tr("Saved"), m.elapsed); }
+        else if (a.reconnect) a.reconnect();
+    }
+    // 0.7: the flights on this network, a click away
+    ImGui::SameLine();
+    ImGui::BeginDisabled(m.lanBusy);
+    if (ImGui::Button(m.lanBusy ? tr("searching...") : tr("Find flights on this network")) && a.lanSearch) a.lanSearch();
+    ImGui::EndDisabled();
+    if (!m.lan.empty()) {
+        for (const LanFlightView& f : m.lan) {
+            ImGui::PushID((f.address + ":" + std::to_string(f.port)).c_str());
+            ImGui::BeginDisabled(!f.sameVersion);
+            if (ImGui::SmallButton(tr("Join")) && a.join) a.join(f.address, f.port);
+            ImGui::EndDisabled();
+            ImGui::SameLine();
+            ImGui::TextColored(p.text, "%s", f.name.c_str()); ImGui::SameLine();
+            muted((f.address + ":" + std::to_string(f.port)).c_str()); ImGui::SameLine();
+            if (f.maxPilots) ImGui::Text("%d/%d %s", f.pilots, f.maxPilots, tr("pilots")); else ImGui::Text("%d %s", f.pilots, tr("pilots"));
+            if (f.password) { ImGui::SameLine(); badge(tr("password"), p.warn); }
+            if (f.hosted) { ImGui::SameLine(); badge("X-Plane", p.ai); }
+            if (!f.sameVersion) { ImGui::SameLine(); ImGui::TextColored(p.err, "v%s", f.version.c_str()); }
+            ImGui::PopID();
+        }
+    } else if (m.lanSearched && !m.lanBusy) muted(tr("no flight answered on this network"));
+    // The flight we host, and who is in it, under Connect: it grows with every pilot and with what the router
+    // and the network have to say, and Apply has to stay where the eye -- and a click -- expects it.
+    ImGui::Separator();
     const HostInfo& h = m.host;
     if (h.running) {
         ImGui::TextColored(p.ok, "%s: %s %u  ·  %d %s", tr("Running"), tr("Port"), h.port, h.clients, tr("connected"));
@@ -502,42 +541,6 @@ void drawHost(Model& m, const Actions& a) {
         }
         if (m.hostMax > 0) { muted(tr("Most pilots")); ImGui::SameLine(); ImGui::Text("%d / %d", h.clients, m.hostMax); }
     } else muted(tr("Not hosting"));
-    ImGui::Separator();
-    heading(tr("Connect to"));
-    char host[128]; snprintf(host, sizeof host, "%s", e.host.c_str());
-    ImGui::SetNextItemWidth(260);
-    if (ImGui::InputTextWithHint("##srv", tr("Server address or join code"), host, sizeof host)) { e.host = host; g_st.editDirty = true; }
-    ImGui::SameLine(); ImGui::SetNextItemWidth(70);
-    char cport[8]; snprintf(cport, sizeof cport, "%s", e.port.c_str());
-    if (ImGui::InputText(tr("Port"), cport, sizeof cport, ImGuiInputTextFlags_CharsDecimal)) { e.port = cport; g_st.editDirty = true; }
-    // Apply and Reconnect only ask: the plugin does the work from its flight loop, after this frame
-    const bool pressed = ImGui::Button(g_st.editDirty ? tr("Apply") : tr("Reconnect"));
-    if (probesOn()) probeLast("apply:host");
-    if (pressed) {
-        if (g_st.editDirty && a.applySettings) { a.applySettings(e); g_st.editDirty = false; setNote(tr("Saved"), m.elapsed); }
-        else if (a.reconnect) a.reconnect();
-    }
-    // 0.7: the flights on this network, a click away
-    ImGui::SameLine();
-    ImGui::BeginDisabled(m.lanBusy);
-    if (ImGui::Button(m.lanBusy ? tr("searching...") : tr("Find flights on this network")) && a.lanSearch) a.lanSearch();
-    ImGui::EndDisabled();
-    if (!m.lan.empty()) {
-        for (const LanFlightView& f : m.lan) {
-            ImGui::PushID((f.address + ":" + std::to_string(f.port)).c_str());
-            ImGui::BeginDisabled(!f.sameVersion);
-            if (ImGui::SmallButton(tr("Join")) && a.join) a.join(f.address, f.port);
-            ImGui::EndDisabled();
-            ImGui::SameLine();
-            ImGui::TextColored(p.text, "%s", f.name.c_str()); ImGui::SameLine();
-            muted((f.address + ":" + std::to_string(f.port)).c_str()); ImGui::SameLine();
-            if (f.maxPilots) ImGui::Text("%d/%d %s", f.pilots, f.maxPilots, tr("pilots")); else ImGui::Text("%d %s", f.pilots, tr("pilots"));
-            if (f.password) { ImGui::SameLine(); badge(tr("password"), p.warn); }
-            if (f.hosted) { ImGui::SameLine(); badge("X-Plane", p.ai); }
-            if (!f.sameVersion) { ImGui::SameLine(); ImGui::TextColored(p.err, "v%s", f.version.c_str()); }
-            ImGui::PopID();
-        }
-    } else if (m.lanSearched && !m.lanBusy) muted(tr("no flight answered on this network"));
     ImGui::Separator();
     heading(tr("Connection"));
     light(m.conn.connected ? p.ok : (m.conn.connecting ? p.warn : p.err), true); ImGui::SameLine();
