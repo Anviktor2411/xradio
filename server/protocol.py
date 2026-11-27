@@ -17,7 +17,7 @@ MAGIC = 0x31435258  # b"XRC1" little-endian
 # The XRadio release this server belongs to: what it tells the LAN search. Kept
 # equal to plugin/src/brand.h's by tools/release.py, and checked against it by
 # tools/check_sizes.py -- the built-in server answers with brand.h's.
-XRADIO_VERSION = "0.6.1"
+XRADIO_VERSION = "0.7.0"
 PROTO_VERSION = 6   # v6: ATC stations, injected AI traffic, flight plans, ATIS, the radio model
 # The oldest client a server still lets in: a v5 pilot (XRadio 0.5) flies in a
 # v6 flight on what v5 knew -- v5 headers, v5-sized records, no v6-only packets.

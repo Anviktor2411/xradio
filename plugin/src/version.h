@@ -5,7 +5,7 @@
 namespace xr {
 namespace brand {
 
-inline const char* version() { return "0.6.1"; }
+inline const char* version() { return "0.7.0"; }
 
 }  // namespace brand
 }  // namespace xr
